@@ -1,0 +1,14 @@
+[project]
+name = "container-network"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "pyroute2>=0.9.6",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.410",
+]
