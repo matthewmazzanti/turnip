@@ -1,7 +1,7 @@
 [project]
 name = "container-network"
 version = "0.1.0"
-description = "Add your description here"
+description = "Persistent rootless container network: a routed (Cilium-style) L3 fabric over podman netns"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -14,7 +14,8 @@ dev = [
 ]
 
 [tool.pyright]
-include = ["main.py"]
+include = ["."]
+exclude = [".venv", ".direnv", "netns", "**/__pycache__", "typings"]
 stubPath = "typings"
 pythonVersion = "3.14"
 typeCheckingMode = "strict"

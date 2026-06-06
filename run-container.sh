@@ -6,8 +6,10 @@ set -euo pipefail
 #
 # The container JOINS the existing netns via `--network ns:<path>` instead of
 # getting a fresh one, so it inherits that ns's interface + address
-# (hass -> 10.88.0.12) and can reach the bridge (10.88.0.1) and the other
-# containers on br-iot.
+# (hass -> 10.0.0.12/32) and its default route via the fabric gateway
+# (10.0.0.1). Reachability to the other containers is then governed by the
+# router's nft flow matrix (see main.py): e.g. zwave<->hass and hass<->proxy on
+# tcp/443, zwave<->proxy denied.
 #
 # Usage:
 #   ./run-container.sh [netns-name] [image] [-- cmd ...]
@@ -19,7 +21,7 @@ set -euo pipefail
 #
 # Default image is nicolaka/netshoot (curl, nmap, dig, tcpdump, nc, iperf3, ...).
 #
-# Prereq: bring the network up first (creates ./netns/* + br-iot):
+# Prereq: bring the network up first (creates ./netns/* + the routed fabric):
 #   podman unshare ./.venv/bin/python main.py up
 
 NETNS_DIR="$HOME/netns"
