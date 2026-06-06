@@ -22,7 +22,7 @@ set -euo pipefail
 # Default image is nicolaka/netshoot (curl, nmap, dig, tcpdump, nc, iperf3, ...).
 #
 # Prereq: bring the network up first (creates ./netns/* + the routed fabric):
-#   podman unshare ./.venv/bin/python main.py up
+#   ./.venv/bin/python main.py up
 
 NETNS_DIR="$HOME/netns"
 
@@ -46,7 +46,7 @@ NSPATH="$NETNS_DIR/$NS"
 if ! podman unshare sh -c "[ -e '$NSPATH' ] && mountpoint -q '$NSPATH'"; then
   echo "error: '$NSPATH' is not a live netns." >&2
   echo "bring the network up first:" >&2
-  echo "  podman unshare ./.venv/bin/python main.py up" >&2
+  echo "  ./.venv/bin/python main.py up" >&2
   exit 1
 fi
 

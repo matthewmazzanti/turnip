@@ -40,14 +40,14 @@ the gateway. Edit `FABRIC_FLOWS` / `HOSTS` in `main.py` to change it.
 
 ## Usage
 
-Everything runs under **plain `podman unshare`** (not `--rootless-netns`), and
-the venv interpreter must be called by path (unshare resets the environment, so a
-bare `python3` misses pyroute2):
+Run as your **normal login user** — no `podman unshare` wrapper. `main.py` enters
+podman's rootless user+mount namespaces in-process (see `in_podman_context`); you
+just have to use the venv interpreter that has pyroute2:
 
 ```sh
-podman unshare ./.venv/bin/python main.py up       # create + wire everything
-podman unshare ./.venv/bin/python main.py verify   # report dataplane state
-podman unshare ./.venv/bin/python main.py down     # tear it all down
+./.venv/bin/python main.py up       # create + wire everything
+./.venv/bin/python main.py verify   # report dataplane state
+./.venv/bin/python main.py down     # tear it all down
 ```
 
 Attach a container to one of the namespaces (joins it via `--network ns:<path>`):
@@ -75,12 +75,22 @@ teardown — there are no per-element deletes.
 
 The two genuinely subtle pieces (both documented at length in the source):
 
+- **Entering podman's namespaces in-process.** Everything must run inside
+  podman's user+mount namespaces (the mount ns so the persistent `~/netns/*`
+  bind-mounts are visible; the user ns so we hold `CAP_NET_ADMIN` over the
+  namespaces podman owns). Instead of wrapping the script in `podman unshare`,
+  `in_podman_context` reads the rootless pause pid, forks, and `setns`es into the
+  pause process's user ns then mount ns — the login user is the *owner* of
+  podman's userns, so it gains full caps on the join. Env stays intact, so PATH /
+  `nft` / the venv resolve normally.
 - **Why a forked `setns` child for sysctls + nftables.** pyroute2 drives
   links/addrs/routes over a netlink socket bound *into* a netns, but `/proc/sys`
   (sysctls) and the nft ruleset reflect the calling *process's* netns — they
-  aren't reachable through that socket. So `main.py` forks a child, `setns`es
-  into the `router` netns, writes `/proc/sys` directly, and execs `nft -f -`
-  there. See `_run_in_netns` / `configure_dataplane`.
+  aren't reachable through that socket. So `main.py` forks a child (from within
+  the podman context), `setns`es into the `router` netns, writes `/proc/sys`
+  directly, and applies the ruleset as libnftables JSON via `nft -j -f -` (built
+  programmatically by `build_nft`, no hand-formatted text). See `_run_in_netns` /
+  `configure_dataplane`.
 - **The "virtual" gateway is made real.** A pure Cilium-style virtual gateway
   relies on a default route (via an uplink) for proxy_arp to answer. This fabric
   is self-contained (no host uplink — that needs root in the host netns), so

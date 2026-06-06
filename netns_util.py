@@ -7,30 +7,31 @@ locating/creating the persistent namespaces under $HOME/netns, opening one
 netlink socket per namespace, and the ifindex lookups every wiring step needs.
 main.py builds the routed dataplane on top of these.
 
-Run everything under PLAIN `podman unshare` (NOT --rootless-netns). podman
-unshare resets the environment, so call the venv interpreter by path -- a bare
-`python3` resolves to system Python without pyroute2:
+main.py runs as your normal login user and enters podman's rootless user+mount
+namespaces IN-PROCESS (see main.py's in_podman_context) rather than via a
+`podman unshare` wrapper. Either way the work happens INSIDE those namespaces,
+for the reasons below; the helpers here assume that context:
 
-    podman unshare ./.venv/bin/python main.py up
+    ./.venv/bin/python main.py up
 
-Why plain `podman unshare` and not --rootless-netns
----------------------------------------------------
+Why podman's rootless namespaces (and not --rootless-netns)
+-----------------------------------------------------------
 Empirically (confirmed on this host):
-- A netns created under PLAIN `podman unshare` persists across separate
-  invocations: the bind-mount lives in podman's user+mount namespace, which is
-  held alive by the rootless pause process. (A netns created under
-  --rootless-netns does NOT persist -- podman tears that namespace down, mounts
-  and all, once no container is holding it.)
+- A netns created in podman's user+mount namespace persists across separate
+  invocations: the bind-mount is held alive by the rootless pause process.
+  (A netns created under --rootless-netns does NOT persist -- podman tears that
+  namespace down, mounts and all, once no container is holding it.)
 - A netns is owned by the user namespace it was created in. `podman run` runs
   the container in podman's userns, so to `setns()` into our netns by path the
-  netns must be owned by THAT userns -- i.e. created inside `podman unshare`.
-  Creating it as the plain login user (a different userns) would block the join.
+  netns must be owned by THAT userns -- i.e. created inside podman's user+mount
+  namespace (whether via `podman unshare` or by entering it in-process).
+  Creating it as the plain login user's own userns would block the join.
 
 Where owned infrastructure lives
 --------------------------------
-`IPRoute()`/`NetNS()` act on the netns the socket is opened in. Under plain
-`podman unshare` the current netns is the (unowned) host netns, so creating an
-interface there returns EPERM. We therefore host all owned networking
+`IPRoute()`/`NetNS()` act on the netns the socket is opened in. Inside podman's
+namespaces the current netns is still the (unowned) host netns -- we enter the
+user+mount ns, not a net ns -- so creating an interface there returns EPERM. We therefore host all owned networking
 infrastructure inside an owned, persistent netns we created (the `router` netns
 in the routed model): inside a netns we created we hold CAP_NET_ADMIN, so link
 creation succeeds, and because that netns persists, so does the infrastructure.

@@ -6,16 +6,18 @@ Each container hangs off the `router` netns by its OWN /32 routed veth, and the
 router forwards between them at L3. There is no shared L2 segment, so there is no
 inter-container ARP to poison and no MAC to spoof: a container's only neighbour
 is the router, which forwards by destination IP. The plumbing this builds on
-(persistent netns under $HOME/netns, why plain `podman unshare`, the low-level
-pyroute2 choice) lives in netns_util.py -- read that first for the "why rootless"
-rationale; this file is the routed dataplane.
+(persistent netns under $HOME/netns, why podman's rootless namespaces, the
+low-level pyroute2 choice) lives in netns_util.py -- read that first for the "why
+rootless" rationale; this file is the routed dataplane.
 
-Run under PLAIN `podman unshare`, calling the venv interpreter by path (unshare
-resets the environment, so a bare `python3` misses pyroute2):
+Run as your normal login user -- NO `podman unshare` wrapper. The script enters
+podman's rootless namespaces itself (see "Entering podman's namespaces" below),
+so a plain invocation is enough; it just has to be the venv interpreter that has
+pyroute2:
 
-    podman unshare ./.venv/bin/python main.py up
-    podman unshare ./.venv/bin/python main.py verify
-    podman unshare ./.venv/bin/python main.py down
+    ./.venv/bin/python main.py up
+    ./.venv/bin/python main.py verify
+    ./.venv/bin/python main.py down
 
 Then attach containers by netns path:
 
@@ -58,32 +60,41 @@ In a full Cilium-style fabric the gateway 10.0.0.1 is *virtual*: assigned to no
 interface, and proxy_arp answers a container's ARP for it because the router has
 a default route (via its uplink) that makes 10.0.0.1 "reachable via some other
 interface" -- proxy_arp's precondition. This model is deliberately SELF-CONTAINED
-(no host uplink: in rootless `podman unshare` we sit in the unowned host netns
-and cannot create the host end of an uplink veth -- that is a separate, rootful
-job). With no uplink there is no default route, so a purely-virtual gateway would
-never answer. So we make the gateway REAL: 10.0.0.1/32 on a `dummy` (fabric0). A
-local address is answered by the normal ARP responder on whichever veth the
-request arrives on, so the gateway resolves without an uplink. We still set
-proxy_arp=1 on each fabric veth -- harmless here (containers only ARP for the
-gateway) and correct the day a rootful uplink + default route are added.
+(no host uplink: the host end of an uplink veth lives in the host netns, which is
+a separate, rootful job). With no uplink there is no default route, so a purely-
+virtual gateway would never answer. So we make the gateway REAL: 10.0.0.1/32 on a
+`dummy` (fabric0). A local address is answered by the normal ARP responder on
+whichever veth the request arrives on, so the gateway resolves without an uplink.
+We still set proxy_arp=1 on each fabric veth -- harmless here (containers only
+ARP for the gateway) and correct the day a rootful uplink + default route arrive.
 
-Sysctls and nftables: why a forked setns child (not pyroute2)
--------------------------------------------------------------
-pyroute2 drives links/addrs/routes over a netlink socket bound INTO a netns, and
-we use it for all of those. But sysctls (/proc/sys/net) and the nft ruleset are
-properties of the CALLING PROCESS's netns, not of a bound socket -- so to set
-ip_forward / proxy_arp / rp_filter / disable_ipv6 and load the nft table in
-`router`, a process must BE in the router netns. We fork a child, os.setns(
-CLONE_NEWNET) into router, then write /proc/sys directly and exec `nft -f -`
-there (see _run_in_netns). Under `podman unshare` the netns bind-mount is already
-visible (we're in podman's mount ns), so only the NET hop is needed. Forking
-keeps the parent's netns and its open pyroute2 sockets untouched.
+Entering podman's rootless namespaces (in-process)
+--------------------------------------------------
+Everything must run inside podman's user+mount namespaces: the MOUNT ns so the
+persistent $HOME/netns/* bind-mounts are visible, and the USER ns so we hold
+CAP_NET_ADMIN over the namespaces podman owns (netns_util.py explains why
+ownership must be podman's userns). Rather than wrap the whole script in `podman
+unshare`, in_podman_context() does what that wrapper does, in-process: read the
+rootless pause process's pid (bootstrapping it with `podman unshare true` if
+absent), fork a single-threaded child, and os.setns() into the pause process's
+user ns then mount ns. The login user is the OWNER of podman's userns (it created
+it), and per user_namespaces(7) a process in the parent userns whose euid matches
+the owner has all capabilities there -- so the unprivileged login user gains full
+caps on the join (and appears as uid 0 inside, via podman's uid_map). The
+dispatched command (up/verify/down) then runs entirely in that child. Keeping the
+environment intact (no `podman unshare` reset) means PATH / `nft` / the venv
+interpreter resolve normally.
 
-`nft` is the one external binary we shell out to: rendering this map/vmap ruleset
-through pyroute2's low-level nftables API would be far less legible than the CLI
-syntax the policy is naturally written in. We resolve its absolute path in the
-parent (PATH is intact there) and pass it into the child, since `podman unshare`
-resets PATH.
+Sysctls and nftables: per-netns, set from inside
+------------------------------------------------
+pyroute2 drives links/addrs/routes over a netlink socket bound INTO a netns. But
+sysctls (/proc/sys/net) and the nft ruleset are properties of the calling
+PROCESS's netns -- so to set ip_forward / proxy_arp / rp_filter / disable_ipv6
+and load the nft table in `router`, a process must BE in the router netns.
+_run_in_netns forks (from within the podman context we're already in) and
+os.setns(CLONE_NEWNET)es into router before touching them. The ruleset is built
+as libnftables JSON (build_nft) and piped to `nft -j -f -` -- structured
+construction from HOSTS/FABRIC_FLOWS, no hand-formatted ruleset text to escape.
 
 Teardown
 --------
@@ -94,6 +105,7 @@ route/sysctl/nft deletes a *live reconfiguration* would need are unnecessary for
 full teardown -- the netns is the single owner of all of it.
 """
 
+import json
 import os
 import shutil
 import socket
@@ -101,6 +113,7 @@ import subprocess
 import sys
 import traceback
 from collections.abc import Callable
+from typing import Any
 
 from pyroute2 import NetNS, netns
 
@@ -171,82 +184,102 @@ FABRIC_FLOWS = [
 ]
 
 
-# --- nftables ruleset ------------------------------------------------------
+# --- nftables ruleset (libnftables JSON) -----------------------------------
+# Reusable expression fragments, so the rules below read close to their nft
+# syntax. Verified against `nft -j list table inet fabric`.
 
-def render_nft() -> str:
-    """Render the `inet fabric` ruleset from HOSTS + FABRIC_FLOWS.
+_IP_SADDR: dict[str, Any] = {"payload": {"protocol": "ip", "field": "saddr"}}
+_IP_DADDR: dict[str, Any] = {"payload": {"protocol": "ip", "field": "daddr"}}
+_L4PROTO: dict[str, Any] = {"meta": {"key": "l4proto"}}
+_TH_DPORT: dict[str, Any] = {"payload": {"protocol": "th", "field": "dport"}}
 
-    Generated from the same tables that drive the dataplane so the policy can't
-    drift from the wiring. Loaded flush-and-reload (create-empty / delete /
-    define) so re-running `up` replaces the table atomically and idempotently.
 
-    The forward chain (policy drop) accepts in order:
-      1. established/related (conntrack return path -- so flows are one-way in
-         the maps); invalid dropped.
-      2. ICMP only between L3-authorized pairs (here: container<->gateway), for
-         PMTU etc. -- ICMP has no port and would otherwise die in the L4 map.
-      3. any-port L3 pairs (allowed_hosts: every container <-> the gateway).
-      4. service-scoped pairs (allowed_flows; `th dport` covers tcp AND udp).
-    Anything else hits policy drop. No input chain / no MAC checks: rp_filter
-    strict on each fabric veth is the spoofing pin. IPv6 is disabled router-wide
-    (see router_sysctls), and these rules match only `ip` (v4), so any stray v6
-    forward would also hit policy drop.
+def _ct_state(state: str | list[str]) -> dict[str, Any]:
+    """match `ct state <state>` (state: "new"/"invalid" or a list of states)."""
+    return {"match": {"op": "in", "left": {"ct": {"key": "state"}}, "right": state}}
+
+
+def _vmap(parts: list[dict[str, Any]], mapname: str) -> dict[str, Any]:
+    """`<concat of parts> vmap @<mapname>` as a verdict-map lookup expr."""
+    return {"vmap": {"key": {"concat": parts}, "data": f"@{mapname}"}}
+
+
+def _table(verb: str) -> dict[str, Any]:
+    return {verb: {"table": {"family": "inet", "name": "fabric"}}}
+
+
+def _rule(*expr: dict[str, Any]) -> dict[str, Any]:
+    return {"add": {"rule": {"family": "inet", "table": "fabric",
+                             "chain": "forward", "expr": list(expr)}}}
+
+
+def build_nft() -> dict[str, Any]:
+    """Build the `inet fabric` ruleset as a libnftables JSON command list.
+
+    Returns the dict fed (as JSON) to `nft -j -f -`. Replaces hand-formatted nft
+    text: the dynamic part (the map elements) is generated from HOSTS /
+    FABRIC_FLOWS, the static chain rules are plain dicts -- no escaping, no line
+    continuations, no indentation to get wrong. The structure mirrors what
+    `nft -j list` emits, so it round-trips.
+
+    Loaded flush-and-reload (add-empty-table / delete / re-add) so re-running
+    `up` replaces the table atomically and idempotently. The chain and maps are
+    declared before the rules that reference them (@allowed_*). The forward chain
+    (policy drop) accepts, in order: established/related (the conntrack return
+    path -- so flows are one-way in the maps); drops invalid; then for new conns
+    -- ICMP only between gateway-authorized pairs (PMTU etc.; ICMP has no port
+    and would otherwise die in the L4 map), any-port gateway pairs
+    (allowed_hosts), and service-scoped pairs (allowed_flows; `th dport` covers
+    tcp AND udp). Anything else hits policy drop. No MAC checks: rp_filter strict
+    on each veth is the spoof pin, and since these rules match only v4 (`ip`) and
+    v6 is disabled router-wide, any stray v6 forward also hits policy drop.
     """
     ip = {h.name: h.ip for h in HOSTS}
 
-    flow_lines: list[str] = []
+    flow_elem: list[Any] = []
     for a, b, proto, port in FABRIC_FLOWS:
-        flow_lines.append(f"            {ip[a]} . {ip[b]} . {proto} . {port} : accept")
-        flow_lines.append(f"            {ip[b]} . {ip[a]} . {proto} . {port} : accept")
-    flow_elems = ",\n".join(flow_lines)
+        for s, d in ((a, b), (b, a)):
+            flow_elem.append([{"concat": [ip[s], ip[d], proto, port]},
+                              {"accept": None}])
 
-    host_lines: list[str] = []
+    host_elem: list[Any] = []
     for h in HOSTS:
-        host_lines.append(f"            {h.ip} . {GW_IP} : accept")
-        host_lines.append(f"            {GW_IP} . {h.ip} : accept")
-    host_elems = ",\n".join(host_lines)
+        host_elem.append([{"concat": [h.ip, GW_IP]}, {"accept": None}])
+        host_elem.append([{"concat": [GW_IP, h.ip]}, {"accept": None}])
 
-    return f"""\
-table inet fabric {{}}
-delete table inet fabric
-table inet fabric {{
-    map allowed_flows {{
-        type ipv4_addr . ipv4_addr . inet_proto . inet_service : verdict
-        elements = {{
-{flow_elems}
-        }}
-    }}
-
-    map allowed_hosts {{
-        type ipv4_addr . ipv4_addr : verdict
-        elements = {{
-{host_elems}
-        }}
-    }}
-
-    chain forward {{
-        type filter hook forward priority 0; policy drop;
-
-        ct state established,related accept
-        ct state invalid drop
-
-        ct state new meta l4proto icmp \\
-            ip saddr . ip daddr vmap @allowed_hosts
-
-        ct state new ip saddr . ip daddr vmap @allowed_hosts
-
-        ct state new \\
-            ip saddr . ip daddr . meta l4proto . th dport \\
-            vmap @allowed_flows
-    }}
-}}
-"""
+    return {"nftables": [
+        # flush-and-reload the table
+        _table("add"), _table("delete"), _table("add"),
+        # chain + maps must exist before the rules reference them
+        {"add": {"chain": {"family": "inet", "table": "fabric",
+                           "name": "forward", "type": "filter",
+                           "hook": "forward", "prio": 0, "policy": "drop"}}},
+        {"add": {"map": {"family": "inet", "table": "fabric",
+                         "name": "allowed_flows", "map": "verdict",
+                         "type": ["ipv4_addr", "ipv4_addr",
+                                  "inet_proto", "inet_service"],
+                         "elem": flow_elem}}},
+        {"add": {"map": {"family": "inet", "table": "fabric",
+                         "name": "allowed_hosts", "map": "verdict",
+                         "type": ["ipv4_addr", "ipv4_addr"],
+                         "elem": host_elem}}},
+        # forward chain rules, in order
+        _rule(_ct_state(["established", "related"]), {"accept": None}),
+        _rule(_ct_state("invalid"), {"drop": None}),
+        _rule(_ct_state("new"),
+              {"match": {"op": "==", "left": _L4PROTO, "right": "icmp"}},
+              _vmap([_IP_SADDR, _IP_DADDR], "allowed_hosts")),
+        _rule(_ct_state("new"),
+              _vmap([_IP_SADDR, _IP_DADDR], "allowed_hosts")),
+        _rule(_ct_state("new"),
+              _vmap([_IP_SADDR, _IP_DADDR, _L4PROTO, _TH_DPORT], "allowed_flows")),
+    ]}
 
 
 def _find_nft() -> str:
-    """Absolute path to `nft`. Resolved in the PARENT, where PATH is intact;
-    `podman unshare` resets PATH, so the forked child can't look it up itself.
-    Falls back to common system locations (incl. NixOS's current-system path)."""
+    """Absolute path to `nft`. With the in-process model the environment is
+    intact (no `podman unshare` reset), so shutil.which normally finds it; the
+    fallbacks (incl. NixOS's current-system path) are belt-and-suspenders."""
     found = shutil.which("nft")
     if found:
         return found
@@ -258,20 +291,86 @@ def _find_nft() -> str:
         "nft binary not found (looked in PATH and common locations)")
 
 
+# --- entering podman's rootless namespaces ---------------------------------
+
+def _pause_pid() -> int:
+    """PID of podman's rootless pause process (holds the user+mount ns alive).
+
+    Read from $XDG_RUNTIME_DIR/libpod/tmp/pause.pid; if the file is missing or
+    names a dead process, bootstrap one with `podman unshare true` (a no-op that
+    spawns the pause process) and re-read. Runs in the PARENT, where the env and
+    PATH are intact, so `podman` resolves.
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    path = os.path.join(runtime, "libpod", "tmp", "pause.pid")
+
+    def read() -> int:
+        with open(path) as f:
+            return int(f.read().strip())
+
+    try:
+        pid = read()
+        if os.path.exists(f"/proc/{pid}"):
+            return pid
+    except (OSError, ValueError):
+        pass
+    subprocess.run(["podman", "unshare", "true"], check=True)
+    return read()
+
+
+def in_podman_context(fn: Callable[[], None]) -> None:
+    """Run `fn` inside podman's rootless user + mount namespaces.
+
+    Replaces wrapping the whole script in `podman unshare`: fork a single-
+    threaded child and os.setns() into the pause process's user ns (we are its
+    owner -> full caps, and map to uid 0) then its mount ns (so the persistent
+    $HOME/netns/* bind-mounts are visible). The child then runs `fn` -- the whole
+    up/verify/down body -- in that context; deeper hops into individual netns
+    (for sysctls/nft) are nested forks from here (see _run_in_netns).
+
+    setns(CLONE_NEWUSER) requires a single-threaded caller; CPython + pyroute2
+    spawn no threads, so the fork is single-threaded. The child inherits stdout,
+    so `fn`'s prints reach the terminal directly -- we just flush before
+    os._exit (which skips buffer flushing). A non-zero child exit propagates.
+    """
+    pid = _pause_pid()
+    user_fd = os.open(f"/proc/{pid}/ns/user", os.O_RDONLY)
+    mnt_fd = os.open(f"/proc/{pid}/ns/mnt", os.O_RDONLY)
+
+    child = os.fork()
+    if child == 0:
+        code = 0
+        try:
+            os.setns(user_fd, os.CLONE_NEWUSER)
+            os.setns(mnt_fd, os.CLONE_NEWNS)
+            fn()
+        except SystemExit as e:
+            code = e.code if isinstance(e.code, int) else 1
+        except BaseException:
+            traceback.print_exc()
+            code = 1
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        os._exit(code)
+    _, status = os.waitpid(child, 0)
+    if not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0):
+        sys.exit("operation failed inside podman namespace context")
+
+
 # --- in-netns execution (sysctls + nft) ------------------------------------
 
 def _run_in_netns(ns_path: str, fn: Callable[[], str]) -> str:
     """Run `fn` inside the netns at `ns_path`; return whatever it prints back.
 
-    Forks, os.setns(CLONE_NEWNET) into the target netns, runs fn(), and pipes
-    fn's returned string back to the parent. Used for the two things pyroute2
-    can't do over its socket: writing /proc/sys (per-netns) and loading nft
-    (per-netns). Only the NET hop is needed -- under `podman unshare` the netns
-    bind-mount is already visible (we're in podman's mount ns).
+    Forks (from within the podman context we're already in), os.setns(
+    CLONE_NEWNET) into the target netns, runs fn(), and pipes fn's returned
+    string back. Used for the two things pyroute2 can't do over its socket:
+    writing /proc/sys (per-netns) and loading nft (per-netns). Only the NET hop
+    is needed -- we already hold podman's user+mount ns.
 
-    Forking keeps the PARENT's netns and its open pyroute2 sockets untouched.
-    CLONE_NEWNET has no single-thread restriction (pyroute2 spawns no threads
-    anyway), so this is safe. A non-zero child exit raises.
+    Forking keeps the caller's netns and its open pyroute2 sockets untouched.
+    CLONE_NEWNET has no single-thread restriction. A non-zero child exit raises.
     """
     r, w = os.pipe()
     child = os.fork()
@@ -341,11 +440,11 @@ def configure_dataplane() -> None:
     """
     nft = _find_nft()
     sysctls = router_sysctls()
-    ruleset = render_nft()
+    ruleset = json.dumps(build_nft())
 
     def apply() -> str:
         _write_sysctls(sysctls)
-        proc = subprocess.run([nft, "-f", "-"], input=ruleset,
+        proc = subprocess.run([nft, "-j", "-f", "-"], input=ruleset,
                               text=True, capture_output=True)
         if proc.returncode != 0:
             # surface nft's diagnostic from inside the child before it exits 1
@@ -564,6 +663,9 @@ def down() -> None:
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "up"
-    {"up": up, "verify": verify, "down": down}.get(
-        cmd, lambda: sys.exit(f"usage: {sys.argv[0]} {{up|verify|down}}")
-    )()
+    fn = {"up": up, "verify": verify, "down": down}.get(cmd)
+    if fn is None:
+        sys.exit(f"usage: {sys.argv[0]} {{up|verify|down}}")
+    # Enter podman's rootless user+mount namespaces in-process, then run the
+    # command there (replaces wrapping the invocation in `podman unshare`).
+    in_podman_context(fn)
