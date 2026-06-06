@@ -80,9 +80,7 @@ namespaces -- the router netns owns fabric0, the routes, the sysctls, and the nf
 table, so dropping it is a complete teardown (see netns.remove_netns).
 """
 
-import json
 import os
-import subprocess
 import sys
 
 from pyroute2 import NetNS
@@ -101,7 +99,7 @@ from netns import (
     set_lo_up,
     write_sysctls,
 )
-from nftops import build_nft, find_nft
+from nftops import build_nft, load
 from verify import verify
 
 
@@ -138,19 +136,12 @@ def configure_dataplane() -> None:
     Both depend on the fabric veths already existing (per-veth conf.* dirs, and
     rp_filter's reverse-path lookup), so `up` calls this AFTER every connect().
     """
-    nft = find_nft()
     sysctls = router_sysctls()
-    ruleset = json.dumps(build_nft())
+    rules = build_nft()  # typed Ruleset; load() renders it inside the netns
 
     def apply() -> str:
         write_sysctls(sysctls)
-        proc = subprocess.run(
-            [nft, "-j", "-f", "-"], input=ruleset, text=True, capture_output=True
-        )
-        if proc.returncode != 0:
-            # surface nft's diagnostic from inside the child before it exits 1
-            sys.stderr.write(proc.stderr)
-            raise RuntimeError(f"nft load failed (rc={proc.returncode})")
+        load(rules)
         return ""
 
     run_in_netns(path_for(ROUTER), apply)

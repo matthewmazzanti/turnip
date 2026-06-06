@@ -4,19 +4,21 @@ nftops.py -- build the routed fabric's nftables ruleset as libnftables JSON.
 
 The fabric use-case, expressed entirely on the nftlib DSL (operands, statements,
 and the Table context) -- no raw libnftables dict literals. build_nft() returns
-the command list fed, as JSON, to `nft -j -f -`; find_nft() locates the binary.
-The actual apply (the setns hop + `nft -j -f -`) is orchestration; see
-main.configure_dataplane.
+a typed Ruleset (no raw dicts at the call site); load() is the executor that
+renders it and feeds it to `nft -j -f -`. load() must run in the target netns, so
+the caller invokes it inside the setns hop (see main.configure_dataplane).
 """
 
+import json
 import os
 import shutil
-from typing import Any
+import subprocess
+import sys
 
 from fabric import FABRIC_FLOWS, GW_IP, HOSTS
 from nftlib import (
-    Command,
-    Node,
+    Expr,
+    Ruleset,
     Table,
     accept,
     concat,
@@ -25,6 +27,8 @@ from nftlib import (
     match,
     meta,
     payload,
+    render,
+    ruleset,
     vmap,
 )
 
@@ -33,8 +37,8 @@ FLOW_KEY = ["ipv4_addr", "ipv4_addr", "inet_proto", "inet_service"]
 HOST_KEY = ["ipv4_addr", "ipv4_addr"]
 
 
-def build_nft() -> dict[str, Any]:
-    """Build the `inet fabric` ruleset as a libnftables JSON command list.
+def build_nft() -> Ruleset:
+    """Build the `inet fabric` ruleset (a typed Ruleset; render/load it to JSON).
 
     Loaded flush-and-reload (Table.reload) so re-running `up` replaces the table
     atomically and idempotently. Maps are declared before the rules that
@@ -51,13 +55,13 @@ def build_nft() -> dict[str, Any]:
     ip = {h.name: h.ip for h in HOSTS}
 
     # allowed_flows elements: each FABRIC_FLOWS tuple, both directions.
-    flow_elem: list[tuple[Node, Node]] = []
+    flow_elem: list[tuple[Expr, Expr]] = []
     for a, b, proto, port in FABRIC_FLOWS:
         for s, d in ((a, b), (b, a)):
             flow_elem.append((concat(ip[s], ip[d], proto, port), accept()))
 
     # allowed_hosts elements: every container <-> the gateway, both directions.
-    host_elem: list[tuple[Node, Node]] = []
+    host_elem: list[tuple[Expr, Expr]] = []
     for h in HOSTS:
         host_elem.append((concat(h.ip, GW_IP), accept()))
         host_elem.append((concat(GW_IP, h.ip), accept()))
@@ -66,36 +70,53 @@ def build_nft() -> dict[str, Any]:
     sd = [payload("ip", "saddr"), payload("ip", "daddr")]
 
     t = Table("inet", "fabric")
-    cmds: list[Command] = [
-        *t.reload(),
-        t.chain("forward", type="filter", hook="forward", prio=0, policy="drop"),
-        t.verdict_map("allowed_flows", FLOW_KEY, flow_elem),
-        t.verdict_map("allowed_hosts", HOST_KEY, host_elem),
-        # ct state established,related accept
-        t.rule("forward", ct_state("established", "related"), accept()),
-        # ct state invalid drop
-        t.rule("forward", ct_state("invalid"), drop()),
-        # ct state new meta l4proto icmp ip saddr . ip daddr vmap @allowed_hosts
-        t.rule(
-            "forward",
-            ct_state("new"),
-            match(meta("l4proto"), "icmp"),
-            vmap(concat(*sd), "allowed_hosts"),
-        ),
-        # ct state new ip saddr . ip daddr vmap @allowed_hosts
-        t.rule("forward", ct_state("new"), vmap(concat(*sd), "allowed_hosts")),
-        # ct state new ip saddr . ip daddr . meta l4proto . th dport
-        #     vmap @allowed_flows
-        t.rule(
-            "forward",
-            ct_state("new"),
-            vmap(
-                concat(*sd, meta("l4proto"), payload("th", "dport")),
-                "allowed_flows",
+    return ruleset(
+        [
+            *t.reload(),
+            t.chain("forward", type="filter", hook="forward", prio=0, policy="drop"),
+            t.verdict_map("allowed_flows", FLOW_KEY, flow_elem),
+            t.verdict_map("allowed_hosts", HOST_KEY, host_elem),
+            # ct state established,related accept
+            t.rule("forward", ct_state("established", "related"), accept()),
+            # ct state invalid drop
+            t.rule("forward", ct_state("invalid"), drop()),
+            # ct state new meta l4proto icmp ip saddr . ip daddr vmap @allowed_hosts
+            t.rule(
+                "forward",
+                ct_state("new"),
+                match(meta("l4proto"), "icmp"),
+                vmap(concat(*sd), "allowed_hosts"),
             ),
-        ),
-    ]
-    return {"nftables": [c.render() for c in cmds]}
+            # ct state new ip saddr . ip daddr vmap @allowed_hosts
+            t.rule("forward", ct_state("new"), vmap(concat(*sd), "allowed_hosts")),
+            # ct state new ip saddr . ip daddr . meta l4proto . th dport
+            #     vmap @allowed_flows
+            t.rule(
+                "forward",
+                ct_state("new"),
+                vmap(
+                    concat(*sd, meta("l4proto"), payload("th", "dport")),
+                    "allowed_flows",
+                ),
+            ),
+        ]
+    )
+
+
+def load(rs: Ruleset) -> None:
+    """Render `rs` and load it via `nft -j -f -`. Runs nft in the CURRENT netns,
+    so call it from inside the run_in_netns hop to land in the right namespace."""
+    nft = find_nft()
+    proc = subprocess.run(
+        [nft, "-j", "-f", "-"],
+        input=json.dumps(render(rs)),
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        # surface nft's diagnostic from inside the child before it exits nonzero
+        sys.stderr.write(proc.stderr)
+        raise RuntimeError(f"nft load failed (rc={proc.returncode})")
 
 
 def find_nft() -> str:
