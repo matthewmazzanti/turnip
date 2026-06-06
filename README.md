@@ -65,8 +65,11 @@ teardown — there are no per-element deletes.
 
 | File            | Role |
 |-----------------|------|
-| `main.py`       | The routed fabric: gateway, per-container `/32` veths, router sysctls, the nftables flow matrix, and the `up`/`verify`/`down` CLI. |
-| `netns_util.py` | Shared, model-agnostic netns plumbing (paths, ifindex lookups, ns open/create, lo-up) and the rootless `podman unshare` / pyroute2 rationale. |
+| `main.py`       | Orchestration + CLI: `create_gateway`, `connect`, `configure_dataplane`, and the `up`/`verify`/`down` dispatch. |
+| `fabric.py`     | The model: `Host`, `HOSTS`, `FABRIC_FLOWS`, and the addressing constants (`ROUTER`/`GW_IP`/…). A leaf module so the others don't import-cycle through `main`. |
+| `netns.py`      | The namespace layer: enter podman's namespaces (`in_podman_context`), netns lifecycle (`ensure_netns`/`remove_netns`), open sockets + ifindex lookups, and run-code/write-sysctls inside a netns (`run_in_netns`/`write_sysctls`). Plus the rootless / pyroute2 rationale. |
+| `nftops.py`     | Builds the nftables flow matrix as libnftables JSON (`build_nft`) and locates `nft` (`find_nft`). |
+| `verify.py`     | The `verify` command — read-only dataplane report. |
 | `lan-attach.py` | **Stale, pending rework.** A rootful helper that wires a host veth into the fabric. Written for the old bridge model; will be reworked to drop a LAN veth into the `hass` netns (so `hass` is the sole LAN/mDNS/discovery-facing endpoint) once that feature lands. |
 | `run-container.sh` | Launch a podman container attached to a fabric namespace. |
 | `typings/`      | Local partial pyroute2 stubs (it ships none); scoped to the API surface we use. |
@@ -86,11 +89,11 @@ The two genuinely subtle pieces (both documented at length in the source):
 - **Why a forked `setns` child for sysctls + nftables.** pyroute2 drives
   links/addrs/routes over a netlink socket bound *into* a netns, but `/proc/sys`
   (sysctls) and the nft ruleset reflect the calling *process's* netns — they
-  aren't reachable through that socket. So `main.py` forks a child (from within
-  the podman context), `setns`es into the `router` netns, writes `/proc/sys`
-  directly, and applies the ruleset as libnftables JSON via `nft -j -f -` (built
-  programmatically by `build_nft`, no hand-formatted text). See `_run_in_netns` /
-  `configure_dataplane`.
+  aren't reachable through that socket. So `run_in_netns` (in `netns.py`) forks a
+  child (from within the podman context), `setns`es into the `router` netns,
+  writes `/proc/sys` directly, and applies the ruleset as libnftables JSON via
+  `nft -j -f -` (built programmatically by `build_nft` in `nftops.py`, no
+  hand-formatted text). See `netns.run_in_netns` / `main.configure_dataplane`.
 - **The "virtual" gateway is made real.** A pure Cilium-style virtual gateway
   relies on a default route (via an uplink) for proxy_arp to answer. This fabric
   is self-contained (no host uplink — that needs root in the host netns), so

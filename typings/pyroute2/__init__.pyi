@@ -7,7 +7,6 @@ from typing import Any, Self, TypedDict
 
 from . import netns as netns
 
-
 class Status(TypedDict):
     """The `.status` dict of an IPRoute/NetNS handle (mirrors the socket spec).
 

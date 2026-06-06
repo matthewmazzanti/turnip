@@ -48,8 +48,8 @@ NETNS_DIR = os.path.join(os.environ["HOME"], "netns")
 ROUTER = "router"
 BRIDGE = "br-iot"
 
-HOST_IF = "lan-host"   # stays in the host netns (networkd bridges this to the LAN)
-IOT_IF = "lan-iot"     # moved into the router netns, enslaved to br-iot
+HOST_IF = "lan-host"  # stays in the host netns (networkd bridges this to the LAN)
+IOT_IF = "lan-iot"  # moved into the router netns, enslaved to br-iot
 
 
 def pause_pid_path() -> str:
@@ -92,8 +92,10 @@ def _cross_into_router(mnt_fd: int) -> None:
         with IPRoute() as ipr:
             bridge = ipr.link_lookup(ifname=BRIDGE)
             if not bridge:
-                sys.exit(f"{BRIDGE} not found in {ROUTER} netns "
-                         f"(bring the internal network up first)")
+                sys.exit(
+                    f"{BRIDGE} not found in {ROUTER} netns "
+                    f"(bring the internal network up first)"
+                )
             iidx = ipr.link_lookup(ifname=IOT_IF)[0]
             ipr.link("set", index=iidx, master=bridge[0])
             ipr.link("set", index=iidx, state="up")
@@ -110,7 +112,7 @@ def up() -> None:
     if os.geteuid() != 0:
         sys.exit("must run as root")
     pid = read_pause_pid()
-    mnt_fd = os.open(f"/proc/{pid}/ns/mnt", os.O_RDONLY)   # host /proc, pre-fork
+    mnt_fd = os.open(f"/proc/{pid}/ns/mnt", os.O_RDONLY)  # host /proc, pre-fork
 
     # Create the veth pair in the host netns -- a pure host-netns op, no ns hop.
     with IPRoute() as ipr:
@@ -122,7 +124,7 @@ def up() -> None:
     # Fork: the child does ONLY the cross-namespace move + enslave.
     child = os.fork()
     if child == 0:
-        _cross_into_router(mnt_fd)   # never returns
+        _cross_into_router(mnt_fd)  # never returns
     _, status = os.waitpid(child, 0)
     if not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0):
         # Roll back the half-built pair so `up` stays retryable.

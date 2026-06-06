@@ -11,6 +11,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pyright>=1.1.410",
+    "ruff>=0.15.16",
 ]
 
 [tool.pyright]
