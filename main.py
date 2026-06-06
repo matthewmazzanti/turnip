@@ -85,6 +85,7 @@ pyroute2 notes
 import contextlib
 import os
 import sys
+from collections.abc import Generator, Iterable
 from dataclasses import dataclass
 
 from pyroute2 import NetNS, netns
@@ -145,8 +146,37 @@ def path_for(name: str) -> str:
     return os.path.join(NETNS_DIR, name)
 
 
+def find_ifindex(ns: NetNS, ifname: str) -> int | None:
+    """ifindex of `ifname` in `ns`, or None if absent.
+
+    Raises if MORE than one link matches: a lookup by name should be unique, so
+    >1 is an ambiguity we surface rather than silently taking the first. Absent
+    (0 matches) stays a legitimate None -- the existence checks
+    (create_bridge/connect/verify) rely on it; use ifindex() where it must exist.
+
+    link_lookup(ifname=...) hits pyroute2's fast path: a single RTM_GETLINK
+    filtered by name (one netlink round-trip), returning [index] or []. We
+    deliberately do NOT cache: an ifindex is reassigned when a link moves netns
+    (see connect) or is deleted/recreated, so a cache keyed by name would hand
+    back a stale index. The lookup is sub-millisecond anyway.
+    """
+    found = ns.link_lookup(ifname=ifname)
+    if len(found) > 1:
+        raise LookupError(
+            f"interface {ifname!r} is ambiguous: {len(found)} matches ({found})")
+    return found[0] if found else None
+
+
+def ifindex(ns: NetNS, ifname: str) -> int:
+    """ifindex of `ifname` in `ns`; raise if absent. Use where it must exist."""
+    idx = find_ifindex(ns, ifname)
+    if idx is None:
+        raise LookupError(f"interface {ifname!r} not found in this namespace")
+    return idx
+
+
 @contextlib.contextmanager
-def open_namespaces(names):
+def open_namespaces(names: Iterable[str]) -> Generator[dict[str, NetNS]]:
     """Open one NetNS socket per name; yield {name: NetNS}; close all on exit.
 
     flags=0 (not NetNS's default O_CREAT) so opening a MISSING namespace errors
@@ -184,64 +214,70 @@ def ensure_netns(name: str) -> None:
     print(f"created netns: {p}")
 
 
-def set_lo_up(ns) -> None:
+def set_lo_up(ns: NetNS) -> None:
     """Bring up loopback in the namespace `ns` is bound to."""
-    lo = ns.link_lookup(ifname="lo")[0]
-    ns.link("set", index=lo, state="up")
+    ns.link("set", index=ifindex(ns, "lo"), state="up")
 
 
 # --- bridge (inside the infra netns) ---------------------------------------
 
-def create_bridge(infra) -> None:
-    """Create + address + bring up `br-iot` in the infra netns (handle `infra`).
+def create_bridge(infra: NetNS) -> int:
+    """Create + address + bring up `br-iot` in the infra netns; return its index.
 
-    Idempotent: skips create if the bridge exists, and addr('replace', ...)
-    won't error on a duplicate address.
+    Returning the ifindex lets `up` fetch it once and pass it to every
+    `connect`, instead of each call re-looking-up the (stable-for-the-run)
+    bridge. Idempotent: skips create if the bridge exists, and addr('replace',
+    ...) won't error on a duplicate address.
     """
-    if infra.link_lookup(ifname=BRIDGE):
-        print(f"bridge exists, skipping create: {BRIDGE}")
-    else:
+    br = find_ifindex(infra, BRIDGE)
+    if br is None:
         infra.link("add", ifname=BRIDGE, kind="bridge")
+        br = ifindex(infra, BRIDGE)
         print(f"created bridge: {BRIDGE}")
-    br = infra.link_lookup(ifname=BRIDGE)[0]
+    else:
+        print(f"bridge exists, skipping create: {BRIDGE}")
     infra.addr("replace", index=br, address=BRIDGE_IP, prefixlen=PREFIX)
     infra.link("set", index=br, state="up")
     print(f"  {BRIDGE} addressed {BRIDGE_IP}/{PREFIX}, set up")
+    return br
 
 
 # --- veth (infra bridge <-> container netns) -------------------------------
 
-def connect(infra, cont, host: Host) -> None:
+def connect(infra: NetNS, cont: NetNS, br_idx: int, host: Host) -> None:
     """Wire container netns `host.name` to the bridge with a veth pair.
 
-    `infra` is the infra-netns handle, `cont` the container-netns handle.
-    v-<name> stays in infra enslaved to the bridge; c-<name> is moved into the
-    container netns, given host.mac (while down), and addressed host.ip.
-    Idempotent: if the host-side end already exists, assume it's wired and skip.
+    `infra` is the infra-netns handle, `cont` the container-netns handle,
+    `br_idx` the bridge ifindex (from create_bridge). v-<name> stays in infra
+    enslaved to the bridge; c-<name> is created directly in the container netns,
+    given host.mac (while down), and addressed host.ip. Idempotent: if the
+    host-side end already exists, assume it's wired and skip.
     """
-    host_if = host.host_if   # infra side, enslaved to bridge
-    cont_if = host.cont_if   # container side
-
-    if infra.link_lookup(ifname=host_if):
-        print(f"veth exists, skipping: {host_if}")
+    if find_ifindex(infra, host.host_if) is not None:
+        print(f"veth exists, skipping: {host.host_if}")
         return
 
-    infra.link("add", ifname=host_if, kind="veth", peer=cont_if)
-    br = infra.link_lookup(ifname=BRIDGE)[0]
-    hidx = infra.link_lookup(ifname=host_if)[0]
-    infra.link("set", index=hidx, master=br)
+    # create the pair with the peer born DIRECTLY in the container netns: no
+    # separate move step, and no infra-side lookup of the container end. The
+    # target ns is taken from the `cont` handle itself (status["netns"] is the
+    # full path it's bound to) so it can't drift from where cont actually points;
+    # the '/'-containing path is opened verbatim by the ifinfmsg encoder.
+    infra.link("add", ifname=host.host_if, kind="veth",
+               peer={"ifname": host.cont_if, "net_ns_fd": cont.status["netns"]})
+    hidx = ifindex(infra, host.host_if)
+    infra.link("set", index=hidx, master=br_idx)
     infra.link("set", index=hidx, state="up")
-    # move the container end out of infra and into the container netns
-    cidx = infra.link_lookup(ifname=cont_if)[0]
-    infra.link("set", index=cidx, net_ns_fd=path_for(host.name))
 
-    # the moved end now lives in `cont`'s namespace -- re-lookup its index there
-    cidx = cont.link_lookup(ifname=cont_if)[0]
+    # the peer lives in `cont`'s namespace; its index there is unknowable in
+    # advance, so look it up via the cont handle. link('add') returns only after
+    # the kernel has created both ends, so a live lookup here always sees it (no
+    # wait needed -- unlike NDB, whose async DB required interfaces.wait()).
+    cidx = ifindex(cont, host.cont_if)
     cont.link("set", index=cidx, address=host.mac)   # set MAC while still down
     cont.addr("replace", index=cidx, address=host.ip, prefixlen=PREFIX)
     cont.link("set", index=cidx, state="up")
-    print(f"  wired {host.name}: {cont_if} {host.ip}/{PREFIX} mac {host.mac} "
-          f"<-> {host_if}@{BRIDGE}")
+    print(f"  wired {host.name}: {host.cont_if} {host.ip}/{PREFIX} mac {host.mac} "
+          f"<-> {host.host_if}@{BRIDGE}")
 
 
 # --- orchestration ---------------------------------------------------------
@@ -256,9 +292,9 @@ def up() -> None:
         for name in ALL_NS:
             set_lo_up(ns[name])
             print(f"  lo up in {name}")
-        create_bridge(ns[INFRA])
+        br_idx = create_bridge(ns[INFRA])
         for host in HOSTS:
-            connect(ns[INFRA], ns[host.name], host)
+            connect(ns[INFRA], ns[host.name], br_idx, host)
 
 
 def verify() -> None:
@@ -273,16 +309,16 @@ def verify() -> None:
         # infra: bridge state + addrs + enslaved ports
         if INFRA in ns:
             r = ns[INFRA]
-            idx = r.link_lookup(ifname=BRIDGE)
-            if not idx:
+            br = find_ifindex(r, BRIDGE)
+            if br is None:
                 print(f"{BRIDGE}: MISSING (infra netns up but no bridge)")
             else:
-                attrs = dict(r.get_links(idx[0])[0]["attrs"])
+                attrs = dict(r.get_links(br)[0]["attrs"])
                 addrs = [dict(a["attrs"]).get("IFA_ADDRESS")
-                         for a in r.get_addr(index=idx[0])]
+                         for a in r.get_addr(index=br)]
                 ports = [dict(l["attrs"]).get("IFLA_IFNAME")
                          for l in r.get_links()
-                         if dict(l["attrs"]).get("IFLA_MASTER") == idx[0]]
+                         if dict(l["attrs"]).get("IFLA_MASTER") == br]
                 print(f"{BRIDGE}: oper={attrs.get('IFLA_OPERSTATE')} "
                       f"addrs={addrs} ports={ports}")
 
@@ -291,14 +327,14 @@ def verify() -> None:
             if host.name not in ns:
                 continue
             c = ns[host.name]
-            cidx = c.link_lookup(ifname=host.cont_if)
-            if not cidx:
+            cidx = find_ifindex(c, host.cont_if)
+            if cidx is None:
                 print(f"{host.name}: {host.cont_if} MISSING (netns up but no veth end)")
                 continue
-            attrs = dict(c.get_links(cidx[0])[0]["attrs"])
+            attrs = dict(c.get_links(cidx)[0]["attrs"])
             mac = attrs.get("IFLA_ADDRESS")
             addrs = [dict(a["attrs"]).get("IFA_ADDRESS")
-                     for a in c.get_addr(index=cidx[0])]
+                     for a in c.get_addr(index=cidx)]
             mac_ok = "ok" if mac == host.mac else f"!= {host.mac}"
             print(f"{host.name}: {host.cont_if} oper={attrs.get('IFLA_OPERSTATE')} "
                   f"mac={mac} ({mac_ok}) addrs={addrs}")

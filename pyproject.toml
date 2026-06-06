@@ -12,3 +12,9 @@ dependencies = [
 dev = [
     "pyright>=1.1.410",
 ]
+
+[tool.pyright]
+include = ["main.py"]
+stubPath = "typings"
+pythonVersion = "3.14"
+typeCheckingMode = "strict"
