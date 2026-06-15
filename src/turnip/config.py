@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-config.py -- the declarative fabric model, in pydantic.
+config.py -- the declarative Turnip model, in pydantic.
 
-A typed loader + validator for `fabric.json` (see CONFIG-SKETCH.md). This is the
+A typed loader + validator for `turnip.json` (see CONFIG-SKETCH.md). This is the
 model only: WHO exists, WHO may talk, WHAT crosses the edge -- never the mechanism
 that secures it. `main.py`/`nftlib.py`/`verify.py` are unchanged here; rewiring
-them to consume `Fabric` is a separate step (per the sketch's build order).
+them to consume `Turnip` is a separate step (per the sketch's build order).
 
 Three entities, three scopes:
   - container   (containers.<name>)               identity + router-independent `links`
@@ -140,7 +140,7 @@ def resolve_runtime(rt: Runtime) -> ResolvedRuntime:
     """Resolve `user` (-> $SUDO_USER) and `netns_dir` (-> <user>'s ~/netns), and
     look the user up in the passwd db for its uid/gid. Mirrors the sketch's
     `_runtime`: an explicit `user` decouples ownership from the invoker (admin
-    runs `sudo fabric up`; it drops to `homelab`)."""
+    runs `sudo turnip up`; it drops to `homelab`)."""
     user = rt.user or os.environ.get("SUDO_USER")
     if not user:
         raise ValueError("set runtime.user or run via sudo ($SUDO_USER)")
@@ -363,7 +363,7 @@ class Network(_Model):
 
     type: NetworkType = NetworkType.ROUTER  # secure-by-default
     gateway: IPv4
-    fabric_if: IfName | None = None  # router: the dummy gateway iface
+    gateway_if: IfName | None = None  # router: the dummy gateway iface
     subnet: IPv4Net | None = None  # bridge-only, required there; forbidden on router
     uplink: Uplink | None = None
     attach: dict[str, Attachment] = {}
@@ -374,8 +374,8 @@ class Network(_Model):
         if self.type is NetworkType.ROUTER:
             if self.subnet is not None:
                 raise ValueError("subnet is forbidden on a router network (/32 everywhere)")
-            if self.fabric_if is None:
-                raise ValueError("router network requires 'fabric_if' (the gateway iface)")
+            if self.gateway_if is None:
+                raise ValueError("router network requires 'gateway_if' (the gateway iface)")
         else:  # bridge
             if self.subnet is None:
                 raise ValueError("bridge network requires 'subnet'")
@@ -400,11 +400,11 @@ class Network(_Model):
         return self
 
 
-# --- the whole fabric -----------------------------------------------------
+# --- the whole network -----------------------------------------------------
 
 
-class Fabric(_Model):
-    """The parsed `fabric.json`: containers, networks, attachments + runtime.
+class Turnip(_Model):
+    """The parsed `turnip.json`: containers, networks, attachments + runtime.
 
     Holds the cross-cutting, container-global checks (the price of the
     network-centric layout) that no single network can see on its own.
@@ -417,14 +417,14 @@ class Fabric(_Model):
     @property
     def requires_root(self) -> bool:
         """sudo is needed only when the host edge is in play: some network has an
-        `uplink` or some container has `links`. A pure routed fabric with neither
+        `uplink` or some container has `links`. A pure routed network with neither
         is the self-contained rootless tool of today."""
         return any(n.uplink for n in self.networks.values()) or any(
             c.links for c in self.containers.values()
         )
 
     @model_validator(mode="after")
-    def _cross_cutting(self) -> Fabric:
+    def _cross_cutting(self) -> Turnip:
         # (name, is_default) per container, gathered from links AND every attach
         ifaces: dict[str, list[tuple[str, bool]]] = {c: [] for c in self.containers}
         for cname, c in self.containers.items():
@@ -463,11 +463,11 @@ class Fabric(_Model):
 # --- loader ---------------------------------------------------------------
 
 
-def load(path: str | os.PathLike[str] | None = None) -> Fabric:
-    """Load and validate a `fabric.json`. Discovery: explicit `path`, else
-    $FABRIC_CONFIG, else ./fabric.json."""
-    p = Path(path or os.environ.get("FABRIC_CONFIG", "fabric.json"))
-    return Fabric.model_validate(json.loads(p.read_text()))
+def load(path: str | os.PathLike[str] | None = None) -> Turnip:
+    """Load and validate a `turnip.json`. Discovery: explicit `path`, else
+    $TURNIP_CONFIG, else ./turnip.json."""
+    p = Path(path or os.environ.get("TURNIP_CONFIG", "turnip.json"))
+    return Turnip.model_validate(json.loads(p.read_text()))
 
 
 if __name__ == "__main__":

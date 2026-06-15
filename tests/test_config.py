@@ -1,4 +1,4 @@
-"""Validation tests for the declarative fabric model (container_network.config).
+"""Validation tests for the declarative Turnip model (turnip.config).
 
 Covers the happy path (the shipped example + the deferred bridge/links shapes)
 and the load-time rejections that enforce the default-deny "omission never
@@ -14,17 +14,17 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from container_network.config import (
-    Fabric,
+from turnip.config import (
     LinkType,
     MacvlanLink,
     MacvlanMode,
     NetworkType,
     Proto,
+    Turnip,
     load,
 )
 
-EXAMPLE = Path(__file__).resolve().parents[1] / "fabric.example.json"
+EXAMPLE = Path(__file__).resolve().parents[1] / "turnip.example.json"
 
 
 # --- helpers --------------------------------------------------------------
@@ -34,7 +34,7 @@ def net(**over: Any) -> dict[str, Any]:
     """A minimal valid router network with an uplink, plus overrides."""
     base: dict[str, Any] = {
         "gateway": "10.0.0.1",
-        "fabric_if": "fabric0",
+        "gateway_if": "gw0",
         "uplink": {"host_if": "h", "router_if": "r", "link": "169.254.1.0"},
         "attach": {},
     }
@@ -42,13 +42,13 @@ def net(**over: Any) -> dict[str, Any]:
     return base
 
 
-def fabric(containers: dict[str, Any], networks: dict[str, Any]) -> dict[str, Any]:
+def cfg(containers: dict[str, Any], networks: dict[str, Any]) -> dict[str, Any]:
     return {"containers": containers, "networks": networks}
 
 
 def reject(data: dict[str, Any], match: str) -> str:
     with pytest.raises(ValidationError, match=match) as ei:
-        Fabric.model_validate(data)
+        Turnip.model_validate(data)
     return str(ei.value)
 
 
@@ -79,7 +79,7 @@ def test_example_json_round_trips_with_alias() -> None:
 
 
 def test_bridge_network_deferred_shape() -> None:
-    data = fabric(
+    data = cfg(
         {"sensor": {}},
         {
             "iot": {
@@ -91,13 +91,13 @@ def test_bridge_network_deferred_shape() -> None:
             }
         },
     )
-    fab = Fabric.model_validate(data)
+    fab = Turnip.model_validate(data)
     assert fab.networks["iot"].type is NetworkType.BRIDGE
     assert str(fab.networks["iot"].subnet) == "10.2.0.0/24"
 
 
 def test_links_union_deferred_shape() -> None:
-    data = fabric(
+    data = cfg(
         {
             "box": {
                 "links": [
@@ -126,7 +126,7 @@ def test_links_union_deferred_shape() -> None:
         },
         {},
     )
-    fab = Fabric.model_validate(data)
+    fab = Turnip.model_validate(data)
     link0 = fab.containers["box"].links[0]
     assert isinstance(link0, MacvlanLink)
     assert link0.type is LinkType.MACVLAN
@@ -135,7 +135,7 @@ def test_links_union_deferred_shape() -> None:
 
 
 def test_egress_any_token_accepted() -> None:
-    data = fabric(
+    data = cfg(
         {"a": {}},
         {
             "n": net(
@@ -149,12 +149,12 @@ def test_egress_any_token_accepted() -> None:
             )
         },
     )
-    fab = Fabric.model_validate(data)
+    fab = Turnip.model_validate(data)
     assert fab.networks["n"].attach["a"].egress[0].port == "any"
 
 
 def test_icmp_egress_is_portless() -> None:
-    data = fabric(
+    data = cfg(
         {"a": {}},
         {
             "n": net(
@@ -162,7 +162,7 @@ def test_icmp_egress_is_portless() -> None:
             )
         },
     )
-    fab = Fabric.model_validate(data)
+    fab = Turnip.model_validate(data)
     assert fab.networks["n"].attach["a"].egress[0].port is None
 
 
@@ -170,7 +170,7 @@ def test_icmp_egress_is_portless() -> None:
 
 
 def test_scoped_egress_missing_port_rejected() -> None:
-    data = fabric(
+    data = cfg(
         {"a": {}},
         {
             "n": net(
@@ -184,14 +184,14 @@ def test_scoped_egress_missing_port_rejected() -> None:
 def test_egress_needs_uplink() -> None:
     n = {
         "gateway": "10.0.0.1",
-        "fabric_if": "f0",
+        "gateway_if": "f0",
         "attach": {"a": {"ip": "10.0.0.5", "interface": "eth0", "egress": True}},
     }
-    reject(fabric({"a": {}}, {"n": n}), "needs this network's uplink")
+    reject(cfg({"a": {}}, {"n": n}), "needs this network's uplink")
 
 
 def test_port_bounds_enforced() -> None:
-    data = fabric(
+    data = cfg(
         {"a": {}},
         {
             "n": net(
@@ -209,7 +209,7 @@ def test_port_bounds_enforced() -> None:
 
 
 def test_icmp_ingress_rejected() -> None:
-    data = fabric(
+    data = cfg(
         {"a": {}},
         {
             "n": net(
@@ -230,11 +230,11 @@ def test_icmp_ingress_rejected() -> None:
 
 
 def test_subnet_forbidden_on_router() -> None:
-    reject(fabric({}, {"r": net(subnet="10.0.0.0/24")}), "subnet is forbidden on a router")
+    reject(cfg({}, {"r": net(subnet="10.0.0.0/24")}), "subnet is forbidden on a router")
 
 
 def test_flows_forbidden_on_bridge() -> None:
-    data = fabric(
+    data = cfg(
         {"a": {}, "b": {}},
         {
             "b": {
@@ -252,15 +252,15 @@ def test_flows_forbidden_on_bridge() -> None:
     reject(data, "router-only")
 
 
-def test_router_requires_fabric_if() -> None:
-    reject(fabric({}, {"r": {"gateway": "10.0.0.1"}}), "requires 'fabric_if'")
+def test_router_requires_gateway_if() -> None:
+    reject(cfg({}, {"r": {"gateway": "10.0.0.1"}}), "requires 'gateway_if'")
 
 
 # --- rejections: cross-cutting container-global checks ---------------------
 
 
 def test_flow_endpoint_must_be_attached() -> None:
-    data = fabric(
+    data = cfg(
         {"a": {}},
         {
             "n": net(
@@ -274,19 +274,19 @@ def test_flow_endpoint_must_be_attached() -> None:
 
 def test_unknown_container_in_attach() -> None:
     reject(
-        fabric({}, {"n": net(attach={"ghost": {"ip": "10.0.0.5", "interface": "eth0"}})}),
+        cfg({}, {"n": net(attach={"ghost": {"ip": "10.0.0.5", "interface": "eth0"}})}),
         "unknown container",
     )
 
 
 def test_two_defaults_rejected() -> None:
-    data = fabric(
+    data = cfg(
         {"a": {}},
         {
             "n1": net(attach={"a": {"ip": "10.0.0.5", "interface": "eth0", "default": True}}),
             "n2": {
                 "gateway": "10.1.0.1",
-                "fabric_if": "f1",
+                "gateway_if": "f1",
                 "attach": {"a": {"ip": "10.1.0.5", "interface": "eth1", "default": True}},
             },
         },
@@ -295,13 +295,13 @@ def test_two_defaults_rejected() -> None:
 
 
 def test_zero_default_multi_iface_rejected() -> None:
-    data = fabric(
+    data = cfg(
         {"a": {}},
         {
             "n1": net(attach={"a": {"ip": "10.0.0.5", "interface": "eth0"}}),
             "n2": {
                 "gateway": "10.1.0.1",
-                "fabric_if": "f1",
+                "gateway_if": "f1",
                 "attach": {"a": {"ip": "10.1.0.5", "interface": "eth1"}},
             },
         },
@@ -310,7 +310,7 @@ def test_zero_default_multi_iface_rejected() -> None:
 
 
 def test_duplicate_interface_in_container() -> None:
-    data = fabric(
+    data = cfg(
         {"a": {"links": [{"type": "phys", "dev": "x", "name": "eth0", "address": "1.2.3.4/24"}]}},
         {"n": net(attach={"a": {"ip": "10.0.0.5", "interface": "eth0"}})},
     )
@@ -318,7 +318,7 @@ def test_duplicate_interface_in_container() -> None:
 
 
 def test_host_port_collision_across_networks() -> None:
-    data = fabric(
+    data = cfg(
         {"a": {}, "b": {}},
         {
             "n": net(
@@ -346,22 +346,22 @@ def test_host_port_collision_across_networks() -> None:
 def test_uplink_link_must_be_even_base() -> None:
     n = net()
     n["uplink"]["link"] = "169.254.1.1"  # odd half of the /31 pair
-    reject(fabric({}, {"n": n}), "even base of a /31")
+    reject(cfg({}, {"n": n}), "even base of a /31")
 
 
 def test_uplink_link_rejects_prefix() -> None:
     n = net()
     n["uplink"]["link"] = "169.254.1.0/31"  # prefix is locked, not configured
-    reject(fabric({}, {"n": n}), "valid IPv4 address")
+    reject(cfg({}, {"n": n}), "valid IPv4 address")
 
 
 def test_ifname_length_capped() -> None:
-    reject(fabric({}, {"n": net(fabric_if="this-name-is-too-long")}), "at most 15 characters")
+    reject(cfg({}, {"n": net(gateway_if="this-name-is-too-long")}), "at most 15 characters")
 
 
 def test_extra_key_forbidden() -> None:
-    reject(fabric({}, {"n": net(egres=True)}), "Extra inputs are not permitted")
+    reject(cfg({}, {"n": net(egres=True)}), "Extra inputs are not permitted")
 
 
 def test_bad_enum_value() -> None:
-    reject(fabric({}, {"n": {"type": "switch", "gateway": "10.0.0.1"}}), "'router' or 'bridge'")
+    reject(cfg({}, {"n": {"type": "switch", "gateway": "10.0.0.1"}}), "'router' or 'bridge'")

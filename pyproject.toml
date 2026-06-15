@@ -1,7 +1,7 @@
 [project]
-name = "container-network"
+name = "turnip"
 version = "0.1.0"
-description = "Persistent rootless container network: a routed (Cilium-style) L3 fabric over podman netns"
+description = "Persistent rootless container network: a routed (Cilium-style) L3 network over podman netns"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -10,14 +10,14 @@ dependencies = [
 ]
 
 [project.scripts]
-fabric = "container_network.main:main"
+turnip = "turnip.main:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/container_network"]
+packages = ["src/turnip"]
 
 [dependency-groups]
 dev = [

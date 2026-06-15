@@ -13,7 +13,7 @@
   "networks": {
     "lan": {
       "gateway": "10.0.0.1",
-      "fabric_if": "fabric0",
+      "gateway_if": "gw0",
       "uplink": {
         "host_if": "veth-lan-host",
         "router_if": "vethR-lan-up",
