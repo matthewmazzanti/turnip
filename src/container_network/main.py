@@ -85,7 +85,8 @@ import sys
 
 from pyroute2 import NetNS
 
-from fabric import (
+from . import nftlib as nft
+from .fabric import (
     ALL_NS,
     FABRIC_FLOWS,
     FABRIC_IF,
@@ -95,7 +96,7 @@ from fabric import (
     ROUTER,
     Host,
 )
-from netns import (
+from .netns import (
     NETNS_DIR,
     ensure_netns,
     find_ifindex,
@@ -108,8 +109,7 @@ from netns import (
     set_lo_up,
     write_sysctls,
 )
-import nftlib as nft
-from verify import verify
+from .verify import verify
 
 # Map key types of the fabric's two verdict maps (the `type ...` of each).
 FLOW_KEY = ["ipv4_addr", "ipv4_addr", "inet_proto", "inet_service"]
@@ -318,7 +318,7 @@ def down() -> None:
         remove_netns(name)
 
 
-if __name__ == "__main__":
+def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "up"
     fn = {"up": up, "verify": verify, "down": down}.get(cmd)
     if fn is None:
@@ -326,3 +326,7 @@ if __name__ == "__main__":
     # Enter podman's rootless user+mount namespaces in-process, then run the
     # command there (replaces wrapping the invocation in `podman unshare`).
     in_podman_context(fn)
+
+
+if __name__ == "__main__":
+    main()

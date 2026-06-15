@@ -93,8 +93,7 @@ def _cross_into_router(mnt_fd: int) -> None:
             bridge = ipr.link_lookup(ifname=BRIDGE)
             if not bridge:
                 sys.exit(
-                    f"{BRIDGE} not found in {ROUTER} netns "
-                    f"(bring the internal network up first)"
+                    f"{BRIDGE} not found in {ROUTER} netns (bring the internal network up first)"
                 )
             iidx = ipr.link_lookup(ifname=IOT_IF)[0]
             ipr.link("set", index=iidx, master=bridge[0])

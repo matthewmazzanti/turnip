@@ -350,7 +350,9 @@ class Uplink(_Model):
         # require it even so {base, base+1} is a well-formed /31 pair with one
         # canonical spelling (rejects e.g. .1, the odd half of the same pair).
         if int(v) & 1:
-            raise ValueError(f"uplink.link {v} must be the even base of a /31 (ends are base, base+1)")
+            raise ValueError(
+                f"uplink.link {v} must be the even base of a /31 (ends are base, base+1)"
+            )
         return v
 
 
@@ -440,9 +442,7 @@ class Fabric(_Model):
                 for ing in a.ingress:
                     key = (str(ing.listen), ing.proto, ing.host_port)
                     if key in ports:
-                        raise ValueError(
-                            f"host_port collision {key}: {cname} vs {ports[key]}"
-                        )
+                        raise ValueError(f"host_port collision {key}: {cname} vs {ports[key]}")
                     ports[key] = cname
 
         for cname, lst in ifaces.items():

@@ -237,9 +237,7 @@ def find_ifindex(ns: NetNS, ifname: str) -> int | None:
     """
     found = ns.link_lookup(ifname=ifname)
     if len(found) > 1:
-        raise LookupError(
-            f"interface {ifname!r} is ambiguous: {len(found)} matches ({found})"
-        )
+        raise LookupError(f"interface {ifname!r} is ambiguous: {len(found)} matches ({found})")
     return found[0] if found else None
 
 
@@ -260,9 +258,7 @@ def open_namespaces(names: Iterable[str]) -> Generator[dict[str, NetNS]]:
     ensure_netns(), and we don't want to bypass its stale-placeholder handling.
     """
     with contextlib.ExitStack() as stack:
-        yield {
-            name: stack.enter_context(NetNS(path_for(name), flags=0)) for name in names
-        }
+        yield {name: stack.enter_context(NetNS(path_for(name), flags=0)) for name in names}
 
 
 def set_lo_up(ns: NetNS) -> None:

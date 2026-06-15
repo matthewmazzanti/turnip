@@ -66,9 +66,7 @@ MetaKey = Literal[
 Family = Literal["ip", "ip6", "inet", "arp", "bridge", "netdev"]
 MatchOp = Literal["==", "!=", "<", ">", "<=", ">=", "in"]
 ChainType = Literal["filter", "nat", "route"]
-Hook = Literal[
-    "prerouting", "input", "forward", "output", "postrouting", "ingress", "egress"
-]
+Hook = Literal["prerouting", "input", "forward", "output", "postrouting", "ingress", "egress"]
 Policy = Literal["accept", "drop"]
 VerdictKind = Literal["accept", "drop", "continue", "return", "jump", "goto"]
 
@@ -245,12 +243,8 @@ class Table:
     ) -> Add:
         return Add(Chain(self.family, self.name, name, type, hook, prio, policy))
 
-    def verdict_map(
-        self, name: str, key_type: list[str], elements: list[tuple[Expr, Expr]]
-    ) -> Add:
-        return Add(
-            VerdictMap(self.family, self.name, name, tuple(key_type), tuple(elements))
-        )
+    def verdict_map(self, name: str, key_type: list[str], elements: list[tuple[Expr, Expr]]) -> Add:
+        return Add(VerdictMap(self.family, self.name, name, tuple(key_type), tuple(elements)))
 
     def rule(self, chain: str, *exprs: Expr) -> Add:
         return Add(Rule(self.family, self.name, chain, exprs))
@@ -283,9 +277,7 @@ def render(x: Value | Object | Command | Ruleset) -> Any:
         case Concat():
             return {"concat": [render(p) for p in x.parts]}
         case Match():
-            return {
-                "match": {"op": x.op, "left": render(x.left), "right": render(x.right)}
-            }
+            return {"match": {"op": x.op, "left": render(x.left), "right": render(x.right)}}
         case Vmap():
             return {"vmap": {"key": render(x.key), "data": f"@{x.setname}"}}
         case Verdict():
@@ -421,9 +413,7 @@ def find_nft() -> str:
     ):
         if os.path.exists(cand):
             return cand
-    raise FileNotFoundError(
-        "nft binary not found (looked in PATH and common locations)"
-    )
+    raise FileNotFoundError("nft binary not found (looked in PATH and common locations)")
 
 
 def load(rs: Ruleset) -> None:

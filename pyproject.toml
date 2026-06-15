@@ -9,15 +9,49 @@ dependencies = [
     "pyroute2>=0.9.6",
 ]
 
+[project.scripts]
+fabric = "container_network.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/container_network"]
+
 [dependency-groups]
 dev = [
     "pyright>=1.1.410",
+    "pytest>=8.3.0",
     "ruff>=0.15.16",
 ]
 
 [tool.pyright]
-include = ["."]
-exclude = [".venv", ".direnv", "netns", "**/__pycache__", "typings"]
+include = ["src", "tests"]
+exclude = ["**/__pycache__"]
 stubPath = "typings"
 pythonVersion = "3.14"
 typeCheckingMode = "strict"
+
+# Tests poke at union/optional members after runtime validation (e.g.
+# attachment.egress[0] on a `bool | list`, network.uplink.link on an Optional),
+# which strict mode rightly flags in library code but is just noise in asserts.
+# Keep src strict; relax those few reports under tests/.
+[[tool.pyright.executionEnvironments]]
+root = "tests"
+reportOptionalMemberAccess = "none"
+reportIndexIssue = "none"
+reportUnknownMemberType = "none"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -14,20 +14,16 @@ import subprocess
 
 from pyroute2 import NetNS
 
-from fabric import ALL_NS, FABRIC_IF, GW_IP, HOST_PREFIX, HOSTS, ROUTER
-from netns import find_ifindex, open_namespaces, path_for, run_in_netns
-from nftlib import find_nft
+from .fabric import ALL_NS, FABRIC_IF, GW_IP, HOST_PREFIX, HOSTS, ROUTER
+from .netns import find_ifindex, open_namespaces, path_for, run_in_netns
+from .nftlib import find_nft
 
 
 def _has_route(ns: NetNS, dst: str, dst_len: int, oif: int) -> bool:
     """True if a route to dst/dst_len out `oif` exists in `ns` (AF_INET)."""
     for r in ns.get_routes(family=socket.AF_INET):
         attrs = dict(r["attrs"])
-        if (
-            r["dst_len"] == dst_len
-            and attrs.get("RTA_DST") == dst
-            and attrs.get("RTA_OIF") == oif
-        ):
+        if r["dst_len"] == dst_len and attrs.get("RTA_DST") == dst and attrs.get("RTA_OIF") == oif:
             return True
     return False
 
@@ -60,9 +56,7 @@ def _router_dataplane_report(nft: str) -> str:
         pa = read(f"net.ipv4.conf.{h.router_if}.proxy_arp")
         rp = read(f"net.ipv4.conf.{h.router_if}.rp_filter")
         lines.append(f"  {h.name}: proxy_arp={pa} rp_filter={rp}")
-    chk = subprocess.run(
-        [nft, "list", "table", "inet", "fabric"], text=True, capture_output=True
-    )
+    chk = subprocess.run([nft, "list", "table", "inet", "fabric"], text=True, capture_output=True)
     if chk.returncode == 0:
         nrules = sum(chk.stdout.count(v) for v in ("accept", "drop"))
         lines.append(f"  nft table 'fabric': present (~{nrules} verdicts)")
@@ -89,13 +83,8 @@ def verify() -> None:
                 print(f"router: {FABRIC_IF} MISSING (router up but no gateway)")
             else:
                 attrs = dict(r.get_links(gidx)[0]["attrs"])
-                addrs = [
-                    dict(a["attrs"]).get("IFA_ADDRESS") for a in r.get_addr(index=gidx)
-                ]
-                print(
-                    f"router: {FABRIC_IF} oper={attrs.get('IFLA_OPERSTATE')} "
-                    f"addrs={addrs}"
-                )
+                addrs = [dict(a["attrs"]).get("IFA_ADDRESS") for a in r.get_addr(index=gidx)]
+                print(f"router: {FABRIC_IF} oper={attrs.get('IFLA_OPERSTATE')} addrs={addrs}")
 
             for h in HOSTS:
                 ridx = find_ifindex(r, h.router_if)
@@ -128,9 +117,7 @@ def verify() -> None:
                 print(f"{h.name}: {h.cont_if} MISSING (netns up but no veth end)")
                 continue
             attrs = dict(c.get_links(cidx)[0]["attrs"])
-            addrs = [
-                dict(a["attrs"]).get("IFA_ADDRESS") for a in c.get_addr(index=cidx)
-            ]
+            addrs = [dict(a["attrs"]).get("IFA_ADDRESS") for a in c.get_addr(index=cidx)]
             gw_ok = "ok" if _has_default_via(c, GW_IP) else "MISSING"
             print(
                 f"{h.name}: {h.cont_if} oper={attrs.get('IFLA_OPERSTATE')} "
