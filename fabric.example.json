@@ -17,7 +17,7 @@
       "uplink": {
         "host_if": "veth-lan-host",
         "router_if": "vethR-lan-up",
-        "link": "169.254.1.0/31",
+        "link": "169.254.1.0",
         "nat": true
       },
       "attach": {
