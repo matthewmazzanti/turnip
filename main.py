@@ -10,7 +10,7 @@ CLI; the pieces it composes:
 
     fabric.py   the model: Host, HOSTS, FABRIC_FLOWS, addressing (ROUTER/GW/...)
     netns.py    enter podman's namespaces, create/open/run-inside netns
-    nftops.py   build the nftables flow matrix as JSON
+    nftlib.py   the nftables DSL + executor; build_nft (below) is the app policy
     verify.py   the `verify` command
 
 Run as your normal login user -- NO `podman unshare` wrapper. main enters
@@ -85,7 +85,16 @@ import sys
 
 from pyroute2 import NetNS
 
-from fabric import ALL_NS, FABRIC_IF, GW_IP, HOST_PREFIX, HOSTS, ROUTER, Host
+from fabric import (
+    ALL_NS,
+    FABRIC_FLOWS,
+    FABRIC_IF,
+    GW_IP,
+    HOST_PREFIX,
+    HOSTS,
+    ROUTER,
+    Host,
+)
 from netns import (
     NETNS_DIR,
     ensure_netns,
@@ -99,8 +108,77 @@ from netns import (
     set_lo_up,
     write_sysctls,
 )
-from nftops import build_nft, load
+import nftlib as nft
 from verify import verify
+
+# Map key types of the fabric's two verdict maps (the `type ...` of each).
+FLOW_KEY = ["ipv4_addr", "ipv4_addr", "inet_proto", "inet_service"]
+HOST_KEY = ["ipv4_addr", "ipv4_addr"]
+
+
+def build_nft() -> nft.Ruleset:
+    """The `inet fabric` ruleset (app policy) built on the nftlib `nft` builder.
+
+    flush-and-reload (Table.reload) so re-running `up` replaces the table
+    atomically. Maps precede the rules that reference them. The forward chain
+    (policy drop) accepts: established/related (conntrack return path -- so flows
+    are one-way in the maps); drops invalid; then for new conns -- ICMP only
+    between gateway-authorized pairs, any-port gateway pairs (allowed_hosts), and
+    service-scoped pairs (allowed_flows; `th dport` covers tcp AND udp). Else
+    policy drop. rp_filter strict per veth is the spoof pin; rules match only v4.
+    """
+    ip = {h.name: h.ip for h in HOSTS}
+
+    # allowed_flows elements: each FABRIC_FLOWS tuple, both directions.
+    flow_elem: list[tuple[nft.Expr, nft.Expr]] = []
+    for a, b, proto, port in FABRIC_FLOWS:
+        for s, d in ((a, b), (b, a)):
+            flow_elem.append((nft.concat(ip[s], ip[d], proto, port), nft.accept()))
+
+    # allowed_hosts elements: every container <-> the gateway, both directions.
+    host_elem: list[tuple[nft.Expr, nft.Expr]] = []
+    for h in HOSTS:
+        host_elem.append((nft.concat(h.ip, GW_IP), nft.accept()))
+        host_elem.append((nft.concat(GW_IP, h.ip), nft.accept()))
+
+    # saddr . daddr key, shared by the icmp and any-port host-pair rules.
+    sd = [nft.payload("ip", "saddr"), nft.payload("ip", "daddr")]
+
+    t = nft.Table("inet", "fabric")
+    return nft.ruleset(
+        [
+            *t.reload(),
+            t.chain("forward", type="filter", hook="forward", prio=0, policy="drop"),
+            t.verdict_map("allowed_flows", FLOW_KEY, flow_elem),
+            t.verdict_map("allowed_hosts", HOST_KEY, host_elem),
+            # ct state established,related accept
+            t.rule("forward", nft.ct_state("established", "related"), nft.accept()),
+            # ct state invalid drop
+            t.rule("forward", nft.ct_state("invalid"), nft.drop()),
+            # ct state new meta l4proto icmp ip saddr . ip daddr vmap @allowed_hosts
+            t.rule(
+                "forward",
+                nft.ct_state("new"),
+                nft.match(nft.meta("l4proto"), "icmp"),
+                nft.vmap(nft.concat(*sd), "allowed_hosts"),
+            ),
+            # ct state new ip saddr . ip daddr vmap @allowed_hosts
+            t.rule(
+                "forward",
+                nft.ct_state("new"),
+                nft.vmap(nft.concat(*sd), "allowed_hosts"),
+            ),
+            # ct state new ip saddr . ip daddr . meta l4proto . th dport vmap @allowed_flows
+            t.rule(
+                "forward",
+                nft.ct_state("new"),
+                nft.vmap(
+                    nft.concat(*sd, nft.meta("l4proto"), nft.payload("th", "dport")),
+                    "allowed_flows",
+                ),
+            ),
+        ]
+    )
 
 
 def router_sysctls() -> dict[str, str]:
@@ -141,7 +219,7 @@ def configure_dataplane() -> None:
 
     def apply() -> str:
         write_sysctls(sysctls)
-        load(rules)
+        nft.load(rules)
         return ""
 
     run_in_netns(path_for(ROUTER), apply)

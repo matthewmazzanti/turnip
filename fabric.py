@@ -3,11 +3,10 @@
 fabric.py -- the routed fabric's model: addressing, hosts, and the flow matrix.
 
 The single source of truth for WHAT the fabric is -- which containers, which IPs,
-who may talk to whom. Imported by main.py (orchestration), nftops.py (ruleset),
-and verify.py (checks); kept in its own leaf module so those three don't form an
-import cycle through main (and so running main.py as a script doesn't drag the
-model through a second import). No mechanism here -- just the data and the Host
-type.
+who may talk to whom. Imported by main.py (orchestration + the nft ruleset) and
+verify.py (checks); kept in its own leaf module so they don't form an import
+cycle through main (and so running main.py as a script doesn't drag the model
+through a second import). No mechanism here -- just the data and the Host type.
 """
 
 # Owned, persistent router netns: hosts the gateway, every router-side veth end,

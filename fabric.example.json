@@ -1,0 +1,49 @@
+{
+  "runtime": {
+    "user": "homelab",
+    "netns_dir": "/home/homelab/netns"
+  },
+
+  "containers": {
+    "zwave": {},
+    "hass": {},
+    "proxy": {}
+  },
+
+  "networks": {
+    "lan": {
+      "gateway": "10.0.0.1",
+      "fabric_if": "fabric0",
+      "uplink": {
+        "host_if": "veth-lan-host",
+        "router_if": "vethR-lan-up",
+        "link": "169.254.1.0/31",
+        "nat": true
+      },
+      "attach": {
+        "zwave": {
+          "ip": "10.0.0.11",
+          "interface": "eth0",
+          "egress": [
+            { "proto": ["udp", "tcp"], "port": 53 }
+          ]
+        },
+        "hass": {
+          "ip": "10.0.0.12",
+          "interface": "eth0",
+          "egress": true
+        },
+        "proxy": {
+          "ip": "10.0.0.13",
+          "interface": "eth0",
+          "ingress": [
+            { "proto": "tcp", "host_port": 8443, "port": 443 }
+          ]
+        }
+      },
+      "flows": [
+        { "from": "zwave", "to": "hass", "proto": "tcp", "port": 443 }
+      ]
+    }
+  }
+}

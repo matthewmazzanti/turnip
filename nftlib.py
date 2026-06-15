@@ -23,6 +23,11 @@ Lowercase factories are the ergonomic constructors. Shapes verified against
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import subprocess
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Literal, assert_never
@@ -396,3 +401,42 @@ def goto(target: str) -> Verdict:
 def ruleset(commands: Iterable[Command]) -> Ruleset:
     """The top-level batch -- `render(ruleset(cmds))` gives `{"nftables": [...]}`."""
     return Ruleset(tuple(commands))
+
+
+# --- nft execution ----------------------------------------------------------
+
+
+def find_nft() -> str:
+    """Absolute path to `nft`. With the in-process model the environment is
+    intact (no `podman unshare` reset), so shutil.which normally finds it; the
+    fallbacks (incl. NixOS's current-system path) are belt-and-suspenders."""
+    found = shutil.which("nft")
+    if found:
+        return found
+    for cand in (
+        "/run/current-system/sw/bin/nft",
+        "/usr/sbin/nft",
+        "/usr/bin/nft",
+        "/sbin/nft",
+    ):
+        if os.path.exists(cand):
+            return cand
+    raise FileNotFoundError(
+        "nft binary not found (looked in PATH and common locations)"
+    )
+
+
+def load(rs: Ruleset) -> None:
+    """Render `rs` and load it via `nft -j -f -`. Runs nft in the CURRENT netns,
+    so call it from inside the run_in_netns hop to land in the right namespace."""
+    nft_bin = find_nft()
+    proc = subprocess.run(
+        [nft_bin, "-j", "-f", "-"],
+        input=json.dumps(render(rs)),
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        # surface nft's diagnostic from inside the child before it exits nonzero
+        sys.stderr.write(proc.stderr)
+        raise RuntimeError(f"nft load failed (rc={proc.returncode})")

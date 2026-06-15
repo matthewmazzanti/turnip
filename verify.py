@@ -16,7 +16,7 @@ from pyroute2 import NetNS
 
 from fabric import ALL_NS, FABRIC_IF, GW_IP, HOST_PREFIX, HOSTS, ROUTER
 from netns import find_ifindex, open_namespaces, path_for, run_in_netns
-from nftops import find_nft
+from nftlib import find_nft
 
 
 def _has_route(ns: NetNS, dst: str, dst_len: int, oif: int) -> bool:
