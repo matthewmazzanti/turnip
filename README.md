@@ -1,10 +1,15 @@
-# container-network
+# turnip
 
 A persistent, rootless container network for podman: a **routed, Cilium-style L3
-fabric** built out of network namespaces, veths, and nftables — no shared L2
+network** built out of network namespaces, veths, and nftables — no shared L2
 bridge. Each container hangs off a central `router` netns by its own `/32` veth;
 the router forwards between them by destination IP, and an nftables flow matrix
 decides who may talk to whom.
+
+The network's *model* (who exists, who may talk, what crosses the edge) is moving
+to a declarative `turnip.json` (loaded + validated by `config.py`); the mechanism
+(`main.py`/`nftlib.py`/`verify.py`) still runs on the hardcoded `fabric.py`
+literals today — see `CONFIG-SKETCH.md` for the model and the build order.
 
 ## Why routed instead of a bridge
 
@@ -42,12 +47,13 @@ the gateway. Edit `FABRIC_FLOWS` / `HOSTS` in `main.py` to change it.
 
 Run as your **normal login user** — no `podman unshare` wrapper. `main.py` enters
 podman's rootless user+mount namespaces in-process (see `in_podman_context`); you
-just have to use the venv interpreter that has pyroute2:
+just have to use the venv interpreter that has pyroute2. Use the `turnip` console
+script (installed by `uv sync`/`pip install -e .`) or run the module directly:
 
 ```sh
-./.venv/bin/python main.py up       # create + wire everything
-./.venv/bin/python main.py verify   # report dataplane state
-./.venv/bin/python main.py down     # tear it all down
+uv run turnip up        # create + wire everything   (or: uv run python -m turnip.main up)
+uv run turnip verify    # report dataplane state
+uv run turnip down      # tear it all down
 ```
 
 Attach a container to one of the namespaces (joins it via `--network ns:<path>`):
@@ -63,15 +69,17 @@ teardown — there are no per-element deletes.
 
 ## Files
 
+All package modules live under `src/turnip/`.
+
 | File            | Role |
 |-----------------|------|
-| `main.py`       | Orchestration + CLI: `create_gateway`, `connect`, `configure_dataplane`, and the `up`/`verify`/`down` dispatch. |
-| `fabric.py`     | The model: `Host`, `HOSTS`, `FABRIC_FLOWS`, and the addressing constants (`ROUTER`/`GW_IP`/…). A leaf module so the others don't import-cycle through `main`. |
+| `main.py`       | Orchestration + CLI: `create_gateway`, `connect`, `configure_dataplane`, the app-policy `build_nft`/`router_sysctls`, and the `up`/`verify`/`down` dispatch. |
+| `config.py`     | The declarative model: the pydantic `Turnip` loader + validator for `turnip.json` (containers, networks, attachments, runtime). Not yet consumed by the mechanism — see `CONFIG-SKETCH.md`. |
+| `fabric.py`     | The current (hardcoded) model: `Host`, `HOSTS`, `FABRIC_FLOWS`, and the addressing constants (`ROUTER`/`GW_IP`/…). A leaf module so the others don't import-cycle through `main`. To be retired once the mechanism consumes `config.py`. |
 | `netns.py`      | The namespace layer: enter podman's namespaces (`in_podman_context`), netns lifecycle (`ensure_netns`/`remove_netns`), open sockets + ifindex lookups, and run-code/write-sysctls inside a netns (`run_in_netns`/`write_sysctls`). Plus the rootless / pyroute2 rationale. |
-| `nftops.py`     | Builds the nftables flow matrix as libnftables JSON (`build_nft`) and locates `nft` (`find_nft`). |
+| `nftlib.py`     | A use-case-agnostic, data-oriented DSL for libnftables JSON (`render` over frozen-dataclass sums) and the `nft` executor (`load`/`find_nft`). The app policy that uses it (`build_nft`) lives in `main.py`. |
 | `verify.py`     | The `verify` command — read-only dataplane report. |
-| `lan-attach.py` | **Stale, pending rework.** A rootful helper that wires a host veth into the fabric. Written for the old bridge model; will be reworked to drop a LAN veth into the `hass` netns (so `hass` is the sole LAN/mDNS/discovery-facing endpoint) once that feature lands. |
-| `run-container.sh` | Launch a podman container attached to a fabric namespace. |
+| `run-container.sh` (repo root) | Launch a podman container attached to a network namespace. |
 | `typings/`      | Local partial pyroute2 stubs (it ships none); scoped to the API surface we use. |
 
 ## Design notes
@@ -92,8 +100,9 @@ The two genuinely subtle pieces (both documented at length in the source):
   aren't reachable through that socket. So `run_in_netns` (in `netns.py`) forks a
   child (from within the podman context), `setns`es into the `router` netns,
   writes `/proc/sys` directly, and applies the ruleset as libnftables JSON via
-  `nft -j -f -` (built programmatically by `build_nft` in `nftops.py`, no
-  hand-formatted text). See `netns.run_in_netns` / `main.configure_dataplane`.
+  `nft -j -f -` (built programmatically by `build_nft` in `main.py` on the
+  `nftlib.py` DSL, no hand-formatted text). See `netns.run_in_netns` /
+  `main.configure_dataplane`.
 - **The "virtual" gateway is made real.** A pure Cilium-style virtual gateway
   relies on a default route (via an uplink) for proxy_arp to answer. This fabric
   is self-contained (no host uplink — that needs root in the host netns), so
@@ -103,11 +112,10 @@ The two genuinely subtle pieces (both documented at length in the source):
 
 ## Known gaps / next steps
 
-- **No external egress.** The fabric is self-contained; nothing routes to the
-  host LAN or the internet. The intended path is a rootful LAN attach into the
-  `hass` netns (multi-homing `hass`), at which point its routes need fixing so
-  the LAN becomes the default and the fabric stays a more-specific route. This is
-  what `lan-attach.py` will be reworked into.
+- **No external egress.** The network is self-contained; nothing routes to the
+  host LAN or the internet. The intended path is a rootful host `uplink` (NAT +
+  DNAT) per network, plus per-container `links` for direct LAN membership — both
+  specified in `CONFIG-SKETCH.md` (the "uplink" and "links" sections).
 - **IPv4 only, by design.** IPv6 is disabled router-wide (no service needs it
   here, and it's one less thing to lock down). Adding it would mean a parallel v6
   dataplane.

@@ -1,0 +1,371 @@
+{
+  "nftables": [
+    {
+      "add": {
+        "table": {
+          "family": "inet",
+          "name": "turnip"
+        }
+      }
+    },
+    {
+      "delete": {
+        "table": {
+          "family": "inet",
+          "name": "turnip"
+        }
+      }
+    },
+    {
+      "add": {
+        "table": {
+          "family": "inet",
+          "name": "turnip"
+        }
+      }
+    },
+    {
+      "add": {
+        "chain": {
+          "family": "inet",
+          "table": "turnip",
+          "name": "forward",
+          "type": "filter",
+          "hook": "forward",
+          "prio": 0,
+          "policy": "drop"
+        }
+      }
+    },
+    {
+      "add": {
+        "map": {
+          "family": "inet",
+          "table": "turnip",
+          "name": "allowed_flows",
+          "map": "verdict",
+          "type": [
+            "ipv4_addr",
+            "ipv4_addr",
+            "inet_proto",
+            "inet_service"
+          ],
+          "elem": [
+            [
+              {
+                "concat": [
+                  "10.0.0.11",
+                  "10.0.0.12",
+                  "tcp",
+                  443
+                ]
+              },
+              {
+                "accept": null
+              }
+            ],
+            [
+              {
+                "concat": [
+                  "10.0.0.12",
+                  "10.0.0.13",
+                  "tcp",
+                  443
+                ]
+              },
+              {
+                "accept": null
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "map": {
+          "family": "inet",
+          "table": "turnip",
+          "name": "allowed_hosts",
+          "map": "verdict",
+          "type": [
+            "ipv4_addr",
+            "ipv4_addr"
+          ],
+          "elem": [
+            [
+              {
+                "concat": [
+                  "10.0.0.11",
+                  "10.0.0.1"
+                ]
+              },
+              {
+                "accept": null
+              }
+            ],
+            [
+              {
+                "concat": [
+                  "10.0.0.1",
+                  "10.0.0.11"
+                ]
+              },
+              {
+                "accept": null
+              }
+            ],
+            [
+              {
+                "concat": [
+                  "10.0.0.12",
+                  "10.0.0.1"
+                ]
+              },
+              {
+                "accept": null
+              }
+            ],
+            [
+              {
+                "concat": [
+                  "10.0.0.1",
+                  "10.0.0.12"
+                ]
+              },
+              {
+                "accept": null
+              }
+            ],
+            [
+              {
+                "concat": [
+                  "10.0.0.13",
+                  "10.0.0.1"
+                ]
+              },
+              {
+                "accept": null
+              }
+            ],
+            [
+              {
+                "concat": [
+                  "10.0.0.1",
+                  "10.0.0.13"
+                ]
+              },
+              {
+                "accept": null
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "inet",
+          "table": "turnip",
+          "chain": "forward",
+          "expr": [
+            {
+              "match": {
+                "op": "in",
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": [
+                  "established",
+                  "related"
+                ]
+              }
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "inet",
+          "table": "turnip",
+          "chain": "forward",
+          "expr": [
+            {
+              "match": {
+                "op": "in",
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": "invalid"
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "inet",
+          "table": "turnip",
+          "chain": "forward",
+          "expr": [
+            {
+              "match": {
+                "op": "in",
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": "new"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "l4proto"
+                  }
+                },
+                "right": "icmp"
+              }
+            },
+            {
+              "vmap": {
+                "key": {
+                  "concat": [
+                    {
+                      "payload": {
+                        "protocol": "ip",
+                        "field": "saddr"
+                      }
+                    },
+                    {
+                      "payload": {
+                        "protocol": "ip",
+                        "field": "daddr"
+                      }
+                    }
+                  ]
+                },
+                "data": "@allowed_hosts"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "inet",
+          "table": "turnip",
+          "chain": "forward",
+          "expr": [
+            {
+              "match": {
+                "op": "in",
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": "new"
+              }
+            },
+            {
+              "vmap": {
+                "key": {
+                  "concat": [
+                    {
+                      "payload": {
+                        "protocol": "ip",
+                        "field": "saddr"
+                      }
+                    },
+                    {
+                      "payload": {
+                        "protocol": "ip",
+                        "field": "daddr"
+                      }
+                    }
+                  ]
+                },
+                "data": "@allowed_hosts"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "inet",
+          "table": "turnip",
+          "chain": "forward",
+          "expr": [
+            {
+              "match": {
+                "op": "in",
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": "new"
+              }
+            },
+            {
+              "vmap": {
+                "key": {
+                  "concat": [
+                    {
+                      "payload": {
+                        "protocol": "ip",
+                        "field": "saddr"
+                      }
+                    },
+                    {
+                      "payload": {
+                        "protocol": "ip",
+                        "field": "daddr"
+                      }
+                    },
+                    {
+                      "meta": {
+                        "key": "l4proto"
+                      }
+                    },
+                    {
+                      "payload": {
+                        "protocol": "th",
+                        "field": "dport"
+                      }
+                    }
+                  ]
+                },
+                "data": "@allowed_flows"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

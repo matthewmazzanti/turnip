@@ -5,13 +5,13 @@ netns, and run code inside a netns.
 
 Everything the fabric does happens inside podman's rootless namespaces. This
 module owns getting there (in_podman_context), the persistent-netns lifecycle
-(ensure_netns / remove_netns), opening netlink sockets into them (open_namespaces
+(create_netns / remove_netns), opening netlink sockets into them (open_namespaces
 + the ifindex lookups), and executing code inside a specific netns
 (run_in_netns / write_sysctls). main.py builds the routed dataplane on top.
 
 (Note: this module is named `netns`, and it imports pyroute2's `netns` submodule
 as the name `netns` for its own use -- they don't collide. Other modules import
-the helpers by name, e.g. `from netns import ensure_netns`, so they never rebind
+the helpers by name, e.g. `from netns import create_netns`, so they never rebind
 the `netns` name themselves.)
 
 Why podman's rootless namespaces (and not --rootless-netns)
@@ -77,7 +77,7 @@ pyroute2 notes
 --------------
 - netns.create(full_path) honors the path verbatim; runs unshare(CLONE_NEWNET)
   in a child and bind-mounts /proc/<child>/ns/net onto the file. It opens that
-  mountpoint O_CREAT|O_EXCL, so the path must NOT already exist (see ensure_netns
+  mountpoint O_CREAT|O_EXCL, so the path must NOT already exist (see create_netns
   for the stale-placeholder handling).
 - `NetNS` is, as of pyroute2 0.9.1+, a thin wrapper around `IPRoute(netns=...)`:
   one netlink socket bound INTO the ns (no forked child). Cheap to hold open and
@@ -93,16 +93,13 @@ import os
 import subprocess
 import sys
 import traceback
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Callable, Generator, Mapping
 
 from pyroute2 import NetNS, netns
 
-NETNS_DIR = os.path.join(os.environ["HOME"], "netns")
-
-
-def path_for(name: str) -> str:
-    # full path -> pyroute2 uses it verbatim (keeps everything under $HOME/netns)
-    return os.path.join(NETNS_DIR, name)
+# This module holds no netns-root state: every helper takes a full path that
+# `main` builds from the resolved `runtime.netns_dir` (so the env read stays in the
+# shell). Paths may carry a subdir -- routers/<net>, containers/<container>.
 
 
 # --- entering podman's rootless namespaces ---------------------------------
@@ -174,39 +171,35 @@ def in_podman_context(fn: Callable[[], None]) -> None:
 # --- netns lifecycle + handles ---------------------------------------------
 
 
-def ensure_netns(name: str) -> None:
-    """Create one netns (if absent) at ./netns/<name>. Low-level on purpose.
+def create_netns(p: str) -> None:
+    """Create a fresh netns at full path `p`. Assumes the path is clear -- `up`
+    runs clean-slate (down() then build), so the prior namespace is already gone.
 
-    A live netns is a bind MOUNT, not a non-empty file (the file is size 0).
-    ismount() is True while mounted, False after remove_netns() unmounts it.
-
-    netns.create() opens the mountpoint O_CREAT|O_EXCL, so it requires NO file
-    at the path. A stale 0-byte placeholder -- left behind when the mount ns /
-    rootless pause process was torn down out-of-band (e.g. `podman system
-    migrate`), which drops the mount but not the file -- is NOT a mount yet DOES
-    exist. Remove it first; otherwise create() raises EEXIST, and pyroute2's
-    ChildProcess wrapper turns that into a HANG rather than a clean error.
+    Guards the two ways a leftover could remain so netns.create()'s O_CREAT|O_EXCL
+    can't EEXIST -> HANG (pyroute2's ChildProcess wrapper hangs on EEXIST rather
+    than erroring): a still-live mount means teardown failed, so error loudly; a
+    stale 0-byte placeholder (mount dropped out-of-band, e.g. `podman system
+    migrate`) is just unlinked.
     """
-    p = path_for(name)
     if os.path.ismount(p):
-        print(f"exists, skipping: {p}")
-        return
+        raise RuntimeError(f"netns still mounted at {p} after teardown; refusing to clobber")
     if os.path.lexists(p):
-        os.unlink(p)
-        print(f"removed stale placeholder: {p}")
+        os.unlink(p)  # stale placeholder, not a live mount
+    # `p` may carry a subdir (routers/<net>, containers/<container>); the
+    # mountpoint's parent must exist before netns.create() opens it O_CREAT|O_EXCL.
+    os.makedirs(os.path.dirname(p), exist_ok=True)
     netns.create(p)
     print(f"created netns: {p}")
 
 
-def remove_netns(name: str) -> None:
-    """Remove the netns at ./netns/<name>; tolerate already-gone and stuck mounts.
+def remove_netns(p: str) -> None:
+    """Remove the netns at full path `p`; tolerate already-gone and stuck mounts.
 
     Removing a netns destroys everything inside it (links, routes, sysctls, and
     any per-netns nft table), so this is the whole teardown for a netns. If the
     unmount fails but a leftover file remains, unlink it so a later create() won't
     trip on the placeholder.
     """
-    p = path_for(name)
     try:
         netns.remove(p)
         print(f"removed: {p}")
@@ -250,15 +243,16 @@ def ifindex(ns: NetNS, ifname: str) -> int:
 
 
 @contextlib.contextmanager
-def open_namespaces(names: Iterable[str]) -> Generator[dict[str, NetNS]]:
-    """Open one NetNS socket per name; yield {name: NetNS}; close all on exit.
+def open_namespaces(paths: Mapping[str, str]) -> Generator[dict[str, NetNS]]:
+    """Open one NetNS socket per `{key: full_path}`; yield `{key: NetNS}`; close
+    all on exit. `main` supplies the mapping (it owns path construction).
 
     flags=0 (not NetNS's default O_CREAT) so opening a MISSING namespace errors
     loudly instead of silently creating one: every ns must already exist via
-    ensure_netns(), and we don't want to bypass its stale-placeholder handling.
+    create_netns(), and we don't want to bypass its stale-placeholder handling.
     """
     with contextlib.ExitStack() as stack:
-        yield {name: stack.enter_context(NetNS(path_for(name), flags=0)) for name in names}
+        yield {key: stack.enter_context(NetNS(p, flags=0)) for key, p in paths.items()}
 
 
 def set_lo_up(ns: NetNS) -> None:

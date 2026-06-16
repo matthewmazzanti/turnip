@@ -21,13 +21,18 @@ from turnip.config import (
     NetworkType,
     Proto,
     Turnip,
-    load,
 )
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "turnip.example.json"
 
 
 # --- helpers --------------------------------------------------------------
+
+
+def load(path: Path) -> Turnip:
+    """Read + validate a config file. Loading is IO and lives in `main` now, so
+    the test owns its own one-liner (the model itself is what's under test)."""
+    return Turnip.model_validate(json.loads(path.read_text()))
 
 
 def net(**over: Any) -> dict[str, Any]:

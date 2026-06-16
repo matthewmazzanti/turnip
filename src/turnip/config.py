@@ -26,9 +26,6 @@ from __future__ import annotations
 
 import enum
 import ipaddress
-import json
-import os
-import pwd
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -116,8 +113,9 @@ class _Model(BaseModel):
 
 class Runtime(_Model):
     """Execution environment -- separate from the model (who/what), this is the
-    *where* (which user, dirs, binaries). All optional; resolved by
-    `resolve_runtime` against the environment + passwd db."""
+    *where* (which user, dirs, binaries). All optional; the environment-dependent
+    defaults (current user, ~/netns) are filled in by the caller, which owns the
+    env + passwd-db reads (see `main.resolve_runtime`). This stays pure data."""
 
     user: str | None = None
     netns_dir: Path | None = None
@@ -126,7 +124,8 @@ class Runtime(_Model):
 
 
 class ResolvedRuntime(_Model):
-    """`Runtime` with the environment-dependent defaults filled in."""
+    """`Runtime` with the environment-dependent defaults filled in (by
+    `main.resolve_runtime` -- this module stays free of env/IO)."""
 
     user: str
     uid: int
@@ -134,25 +133,6 @@ class ResolvedRuntime(_Model):
     netns_dir: Path
     nft: Path | None = None
     podman: Path | None = None
-
-
-def resolve_runtime(rt: Runtime) -> ResolvedRuntime:
-    """Resolve `user` (-> $SUDO_USER) and `netns_dir` (-> <user>'s ~/netns), and
-    look the user up in the passwd db for its uid/gid. Mirrors the sketch's
-    `_runtime`: an explicit `user` decouples ownership from the invoker (admin
-    runs `sudo turnip up`; it drops to `homelab`)."""
-    user = rt.user or os.environ.get("SUDO_USER")
-    if not user:
-        raise ValueError("set runtime.user or run via sudo ($SUDO_USER)")
-    pw = pwd.getpwnam(user)  # raises KeyError for an unknown user -- fail closed
-    return ResolvedRuntime(
-        user=user,
-        uid=pw.pw_uid,
-        gid=pw.pw_gid,
-        netns_dir=rt.netns_dir or Path(pw.pw_dir) / "netns",
-        nft=rt.nft,
-        podman=rt.podman,
-    )
 
 
 # --- the edges: egress / ingress (on the attachment) ----------------------
@@ -221,8 +201,10 @@ Egress = bool | list[EgressRule]
 
 class Flow(_Model):
     """A who-may-initiate-to-whom edge in a router network's forward chain.
-    Endpoints are container names attached to *this* network. Expands to both
-    directions; return traffic rides conntrack."""
+    Endpoints are container names attached to *this* network. **Directional**:
+    `from` may initiate to `to` on (proto, port), and only that -- the return path
+    rides conntrack (ct established/related), so there is no reverse entry. Allowing
+    the other direction means a second, explicit flow."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
@@ -460,19 +442,6 @@ class Turnip(_Model):
         return self
 
 
-# --- loader ---------------------------------------------------------------
-
-
-def load(path: str | os.PathLike[str] | None = None) -> Turnip:
-    """Load and validate a `turnip.json`. Discovery: explicit `path`, else
-    $TURNIP_CONFIG, else ./turnip.json."""
-    p = Path(path or os.environ.get("TURNIP_CONFIG", "turnip.json"))
-    return Turnip.model_validate(json.loads(p.read_text()))
-
-
-if __name__ == "__main__":
-    import sys
-
-    fab = load(sys.argv[1] if len(sys.argv) > 1 else None)
-    print(fab.model_dump_json(indent=2, exclude_defaults=True, by_alias=True))
-    print(f"\nrequires_root = {fab.requires_root}")
+# Loading is IO and lives in the caller (`main`): it reads $TURNIP_CONFIG / the
+# file and calls `Turnip.model_validate(...)`. This module stays pure model +
+# validation so it has no env/filesystem reads to reason about.

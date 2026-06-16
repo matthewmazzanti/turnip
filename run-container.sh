@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# run-container.sh -- start a podman container attached to one of the
-# persistent network namespaces created by main.py (./netns/<name>).
+# run-container.sh -- start a podman container attached to one of turnip's
+# persistent container network namespaces (./netns/containers/<name>).
 #
 # The container JOINS the existing netns via `--network ns:<path>` instead of
 # getting a fresh one, so it inherits that ns's interface + address
-# (hass -> 10.0.0.12/32) and its default route via the fabric gateway
-# (10.0.0.1). Reachability to the other containers is then governed by the
-# router's nft flow matrix (see main.py): e.g. zwave<->hass and hass<->proxy on
-# tcp/443, zwave<->proxy denied.
+# (hass -> 10.0.0.12/32) and its default route via the gateway (10.0.0.1).
+# Reachability to the other containers is then governed by the router's nft flow
+# matrix: e.g. zwave<->hass and hass<->proxy on tcp/443, zwave<->proxy denied.
 #
 # Usage:
 #   ./run-container.sh [netns-name] [image] [-- cmd ...]
@@ -21,9 +20,11 @@ set -euo pipefail
 #
 # Default image is nicolaka/netshoot (curl, nmap, dig, tcpdump, nc, iperf3, ...).
 #
-# Prereq: bring the network up first (creates ./netns/* + the routed fabric):
-#   ./.venv/bin/python main.py up
+# Prereq: bring the network up first (creates ./netns/* + the routed network):
+#   uv run turnip up
 
+# Matches runtime.netns_dir's default (the login user's ~/netns); override here
+# if your turnip.json sets a different netns_dir.
 NETNS_DIR="$HOME/netns"
 
 NS="${1:-hass}"
@@ -38,7 +39,7 @@ if [[ "${1:-}" == "--" ]]; then
   CMD=("$@")
 fi
 
-NSPATH="$NETNS_DIR/$NS"
+NSPATH="$NETNS_DIR/containers/$NS"
 
 # The netns is a bind-mount living in podman's (pause-process) mount namespace,
 # NOT the host mount namespace -- so check for it from inside `podman unshare`,
@@ -46,7 +47,7 @@ NSPATH="$NETNS_DIR/$NS"
 if ! podman unshare sh -c "[ -e '$NSPATH' ] && mountpoint -q '$NSPATH'"; then
   echo "error: '$NSPATH' is not a live netns." >&2
   echo "bring the network up first:" >&2
-  echo "  ./.venv/bin/python main.py up" >&2
+  echo "  uv run turnip up" >&2
   exit 1
 fi
 

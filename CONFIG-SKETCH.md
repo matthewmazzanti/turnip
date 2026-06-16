@@ -231,7 +231,9 @@ Expansion:
   explicitly and carries no port.
 - **`port = "any"`** (the explicit wide token) → an all-ports rule for that proto.
 - **`ingress.port` defaults to `host_port`** (the one widening-safe default).
-- `flows` entries expand to both directions.
+- `flows` entries are **directional** — `from` may initiate to `to` on (proto,
+  port), and only that (the return path rides conntrack). One map element per
+  flow; the other direction is a second, explicit flow.
 
 Validation (load-time, fail fast):
 - **A scoped `egress`/`ingress`/`flows` rule missing `proto` or `port` → error**
@@ -450,11 +452,23 @@ the items below are exactly what a bridge trades away.
 - **Links are the deliberate exception.** A `link` iface is outside every router
   and its nft policy by design — an explicit trust grant, not a gap.
 
-## How `fabric.py` changes
+## How the model loads — IMPLEMENTED as `config.py`
+
+> **DONE.** This section's plan is realized in `src/turnip/config.py` — but as a
+> **pydantic** model (`Turnip`/`Network`/`Attachment`/…) rather than the stdlib
+> `json` + hand-rolled `_require` sketch below. Differences from the sketch:
+> discovery is `$TURNIP_CONFIG` → `./turnip.json`; `extra="forbid"` turns typos
+> into load errors; the polymorphic spots (`egress` bool|list, `proto`
+> scalar|list, `port` int|"any", the `links` discriminated union) are real types;
+> validation is split across `@model_validator`s (per-network rules on `Network`,
+> the container-global cross-cutting checks on `Turnip`). The mechanism
+> (`main.py`/`nftlib.py`/`verify.py`) does **not** yet consume it — that rewire is
+> the next step, and retires `fabric.py`. The stdlib sketch is kept below as the
+> original design rationale.
 
 From "module of literals" to "loader + validator." Downstream now iterates
 networks (one router netns, nft table, and uplink each) rather than the single
-`router`; `fabric.py` returns the parsed containers/networks/attachments.
+`router`; the loader returns the parsed containers/networks/attachments.
 
 ```python
 import os, json, pwd
@@ -550,6 +564,8 @@ CONFIG = _load(os.environ.get("FABRIC_CONFIG", "fabric.json"))
   resolver is a different shape (egress/ingress to the host addr). Per deployment.
 - **NAT vs routed egress.** `nat = true` (masquerade) is the home default; routed
   (`nat = false`) needs a static route for the subnet on your LAN router.
-- **Per-flow direction.** `flows` are bidirectional-initiate; add optional
-  `direction` only if one-way is ever wanted.
+- **Per-flow direction.** *Decided:* `flows` are **directional** (`from` → `to`
+  initiation only; conntrack carries the return path). The other direction is a
+  second explicit flow. (Was bidirectional in the retired `fabric.py`; changed so
+  the directional `from`/`to` keys mean what they say, and to stay least-privilege.)
 ```
