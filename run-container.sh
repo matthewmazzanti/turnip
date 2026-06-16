@@ -2,13 +2,15 @@
 set -euo pipefail
 
 # run-container.sh -- start a podman container attached to one of turnip's
-# persistent container network namespaces (./netns/containers/<name>).
+# persistent container netns (./netns/containers/<name>/netns), with the
+# generated hosts file (./netns/containers/<name>/hosts) bind-mounted to
+# /etc/hosts so it can resolve its reachable peers by name.
 #
 # The container JOINS the existing netns via `--network ns:<path>` instead of
 # getting a fresh one, so it inherits that ns's interface + address
 # (hass -> 10.0.0.12/32) and its default route via the gateway (10.0.0.1).
 # Reachability to the other containers is then governed by the router's nft flow
-# matrix: e.g. zwave<->hass and hass<->proxy on tcp/443, zwave<->proxy denied.
+# matrix: e.g. zwave -> hass and hass -> proxy on tcp/443 (directional).
 #
 # Usage:
 #   ./run-container.sh [netns-name] [image] [-- cmd ...]
@@ -39,7 +41,8 @@ if [[ "${1:-}" == "--" ]]; then
   CMD=("$@")
 fi
 
-NSPATH="$NETNS_DIR/containers/$NS"
+NSPATH="$NETNS_DIR/containers/$NS/netns"
+HOSTS="$NETNS_DIR/containers/$NS/hosts"
 
 # The netns is a bind-mount living in podman's (pause-process) mount namespace,
 # NOT the host mount namespace -- so check for it from inside `podman unshare`,
@@ -54,6 +57,7 @@ fi
 set -x
 exec podman run --rm -it \
   --network "ns:$NSPATH" \
+  -v "$HOSTS:/etc/hosts:ro" \
   --cap-add=net_raw \
   --name "iot-$NS" \
   --hostname "$NS" \

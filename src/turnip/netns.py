@@ -5,8 +5,8 @@ netns, and run code inside a netns.
 
 Everything the fabric does happens inside podman's rootless namespaces. This
 module owns getting there (in_podman_context), the persistent-netns lifecycle
-(create_netns / remove_netns), opening netlink sockets into them (open_namespaces
-+ the ifindex lookups), and executing code inside a specific netns
+(create_netns / remove_netns), the ifindex lookups, and executing code inside a
+specific netns
 (run_in_netns / write_sysctls). main.py builds the routed dataplane on top.
 
 (Note: this module is named `netns`, and it imports pyroute2's `netns` submodule
@@ -81,19 +81,19 @@ pyroute2 notes
   for the stale-placeholder handling).
 - `NetNS` is, as of pyroute2 0.9.1+, a thin wrapper around `IPRoute(netns=...)`:
   one netlink socket bound INTO the ns (no forked child). Cheap to hold open and
-  reuse, so `up` opens each ns once (open_namespaces) and passes the handles
-  around. close() closes only the SOCKET; destroying the ns is remove_netns().
+  reuse, so the `main.Model` context manager opens each ns once and stashes the
+  handle on the node. close() closes only the SOCKET; destroying the ns is
+  remove_netns().
 - link('set', index=i, net_ns_fd=PATH): if PATH is a string containing '/', the
   IFLA_NET_NS_FD encoder opens it as a file directly, so our ./netns/<name> paths
   move a link into the target ns with no fd juggling.
 """
 
-import contextlib
 import os
 import subprocess
 import sys
 import traceback
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable
 
 from pyroute2 import NetNS, netns
 
@@ -240,19 +240,6 @@ def ifindex(ns: NetNS, ifname: str) -> int:
     if idx is None:
         raise LookupError(f"interface {ifname!r} not found in this namespace")
     return idx
-
-
-@contextlib.contextmanager
-def open_namespaces(paths: Mapping[str, str]) -> Generator[dict[str, NetNS]]:
-    """Open one NetNS socket per `{key: full_path}`; yield `{key: NetNS}`; close
-    all on exit. `main` supplies the mapping (it owns path construction).
-
-    flags=0 (not NetNS's default O_CREAT) so opening a MISSING namespace errors
-    loudly instead of silently creating one: every ns must already exist via
-    create_netns(), and we don't want to bypass its stale-placeholder handling.
-    """
-    with contextlib.ExitStack() as stack:
-        yield {key: stack.enter_context(NetNS(p, flags=0)) for key, p in paths.items()}
 
 
 def set_lo_up(ns: NetNS) -> None:

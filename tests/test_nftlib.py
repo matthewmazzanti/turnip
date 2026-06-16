@@ -16,8 +16,8 @@ from pathlib import Path
 import pytest
 
 from turnip import nftlib as nft
-from turnip.config import Network, Turnip
-from turnip.main import build_nft
+from turnip.config import Turnip
+from turnip.main import Network, build_model, build_nft
 
 GOLDEN = Path(__file__).resolve().parent / "golden" / "build_nft.json"
 # Regenerate (only when build_nft is *intended* to change): render
@@ -26,8 +26,9 @@ GOLDEN = Path(__file__).resolve().parent / "golden" / "build_nft.json"
 
 
 def _sample_network() -> Network:
-    """A representative router network: zwave/.11, hass/.12, proxy/.13, gw 10.0.0.1,
-    hub-and-spoke flows (zwave -> hass, hass -> proxy on tcp/443)."""
+    """A representative router network (the runtime model object): zwave/.11,
+    hass/.12, proxy/.13, gw 10.0.0.1, hub-and-spoke flows (zwave -> hass,
+    hass -> proxy on tcp/443)."""
     turnip = Turnip.model_validate(
         {
             "containers": {"zwave": {}, "hass": {}, "proxy": {}},
@@ -48,7 +49,7 @@ def _sample_network() -> Network:
             },
         }
     )
-    return turnip.networks["lan"]
+    return build_model(turnip, Path("/n")).networks[0]
 
 
 # --- render(): expression nodes -------------------------------------------

@@ -55,8 +55,14 @@ part it needs (M2 → `Endpoint`, M3 → `NetworkLayout`, M4 → uplink/egress, 
 
 ## Decisions already made
 
-- **netns layout:** `<netns_dir>/routers/<network>` + `<netns_dir>/containers/<container>`
-  (symmetric, collision-free). `run-container.sh` moves to the `containers/` path.
+- **State layout:** `<netns_dir>/routers/<network>` (router netns) +
+  `<netns_dir>/containers/<container>/{netns,hosts}` — a per-container dir holding
+  its netns and its generated hosts file. Symmetric, collision-free.
+  `run-container.sh` joins `containers/<name>/netns` and bind-mounts
+  `containers/<name>/hosts` → `/etc/hosts`. (`netns_dir` is now a slight misnomer
+  since it holds hosts too — candidate rename to `state_dir`, deferred.) Teardown
+  removes the netns + hosts but LEAVES the dir: rmdir hits EBUSY while the netns
+  lazily unmounts (`MNT_DETACH`), and `create()`'s `makedirs(exist_ok)` reuses it.
 - **nft table:** constant `table inet turnip` per router netns.
 - **`resolve_runtime` rootless default:** fall back to the current login user, so
   the no-sudo path needs no explicit `runtime.user`; require an explicit user only
@@ -72,6 +78,21 @@ part it needs (M2 → `Endpoint`, M3 → `NetworkLayout`, M4 → uplink/egress, 
   netns), `up`'s clean-slate clears it for free, in `down`'s order, with no drift.
   *TODO:* refuse when a running container is attached to a target netns (teardown
   would orphan it) — for now the systemd unit orders containers down first.
+- **Runtime model (a stateful object graph, not a pure IR):** `build_model` lowers
+  the config into `Container`/`Network`/`Endpoint` dataclasses; the wiring is free
+  functions over them. `Endpoint.container` is a **direct ref** to the shared
+  `Container` (object graph), not a name to resolve — we don't reslice/serialize, so
+  normalization would only add lookups + `model`-threading + lost type safety. Each
+  netns-owning node carries its `netns_path` and, *while bound*, a live `.netns`
+  handle (`.handle` raises if used unbound); ifindexes are never stashed (they go
+  stale). `Model` **owns the netns lifetime** as methods: `create()` / `teardown()`
+  for the persistent netns, and `bound()` (a generator-CM method, sibling to those)
+  for the with-scoped sockets — `__exit__` must never remove the persistent netns.
+- **Per-container hosts files (a projection, not stored back-refs):** `up` generates
+  each container's `/etc/hosts` (localhost + self + the peers it may *initiate* to,
+  per its directional outbound flows) via `container_peers`, a reverse traversal
+  (container → endpoints → networks → flows → peer IP) computed over the forward
+  graph. Promote to stored back-refs only if a second reverse consumer appears.
 
 ## Milestones
 
