@@ -15,7 +15,7 @@ import pytest
 from turnip import main
 from turnip.config import Turnip
 
-NETNS = Path("/n")
+STATE = Path("/n")
 
 
 def _turnip(containers: dict[str, Any], networks: dict[str, Any]) -> Turnip:
@@ -23,7 +23,7 @@ def _turnip(containers: dict[str, Any], networks: dict[str, Any]) -> Turnip:
 
 
 def _model(containers: dict[str, Any], networks: dict[str, Any]) -> main.Model:
-    return main.build_model(_turnip(containers, networks), NETNS)
+    return main.build_model(_turnip(containers, networks), STATE)
 
 
 def test_build_model_state_layout() -> None:

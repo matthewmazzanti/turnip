@@ -1,7 +1,6 @@
 {
   "runtime": {
-    "user": "homelab",
-    "netns_dir": "/home/homelab/netns"
+    "user": "homelab"
   },
 
   "containers": {

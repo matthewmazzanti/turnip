@@ -17,7 +17,7 @@ is wrong (it already was; see "Compass" below).
 - **Pure modules, imperative shell.** The modules (`config` = model + validation,
   `netns`/`nftlib` = mechanism) hold **no env/IO reads and no mutable state**:
   they take explicit values. `main` is the shell — it reads the config file +
-  environment, resolves the runtime (user/uid/netns_dir), derives names, and
+  environment, resolves the runtime (user/uid/state_dir), derives names, and
   passes concrete values in. So there's no module-level config or hidden global to
   reason about; everything env-dependent is resolved in one place.
 - **Derivations as pure helpers from day one — in `main` while iterating.** The
@@ -55,14 +55,15 @@ part it needs (M2 → `Endpoint`, M3 → `NetworkLayout`, M4 → uplink/egress, 
 
 ## Decisions already made
 
-- **State layout:** `<netns_dir>/routers/<network>` (router netns) +
-  `<netns_dir>/containers/<container>/{netns,hosts}` — a per-container dir holding
-  its netns and its generated hosts file. Symmetric, collision-free.
-  `run-container.sh` joins `containers/<name>/netns` and bind-mounts
-  `containers/<name>/hosts` → `/etc/hosts`. (`netns_dir` is now a slight misnomer
-  since it holds hosts too — candidate rename to `state_dir`, deferred.) Teardown
-  removes the netns + hosts but LEAVES the dir: rmdir hits EBUSY while the netns
-  lazily unmounts (`MNT_DETACH`), and `create()`'s `makedirs(exist_ok)` reuses it.
+- **State layout:** `runtime.state_dir` (default `$XDG_RUNTIME_DIR/turnip`,
+  fallback `/run/user/<uid>/turnip` — the user's runtime tmpfs, where rootless
+  runtime state belongs; the netns can't outlive a reboot anyway) holds
+  `routers/<network>` (router netns) + `containers/<container>/{netns,hosts}` — a
+  per-container dir with its netns and generated hosts file. Symmetric,
+  collision-free. `run-container.sh` joins `containers/<name>/netns` and bind-mounts
+  `containers/<name>/hosts` → `/etc/hosts`. Teardown removes the netns + hosts but
+  LEAVES the dir: rmdir hits EBUSY while the netns lazily unmounts (`MNT_DETACH`),
+  and `create()`'s `makedirs(exist_ok)` reuses it.
 - **nft table:** constant `table inet turnip` per router netns.
 - **`resolve_runtime` rootless default:** fall back to the current login user, so
   the no-sudo path needs no explicit `runtime.user`; require an explicit user only
@@ -102,7 +103,7 @@ grows), and how it's checked.
 ### 1. netns setup — DONE
 - **Pass:** `up` creates `routers/<net>` + `containers/<container>` from `Turnip`;
   `down` removes them. `main()` loads config → resolves runtime → runs inside
-  `in_podman_context`. Drags in: `netns_dir` from `runtime.netns_dir` (threaded as
+  `in_podman_context`. Drags in: `state_dir` from `runtime.state_dir` (threaded as
   an arg, not a global); the current-user `resolve_runtime` fallback;
   `run-container.sh` → `containers/` path.
 - **Refactor (done):** netns naming/paths are pure helpers in `main`

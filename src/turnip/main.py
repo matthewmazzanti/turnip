@@ -80,15 +80,19 @@ def resolve_runtime(rt: Runtime) -> ResolvedRuntime:
     User: explicit `runtime.user`, else `$SUDO_USER`, else the current login user
     -- the rootless baseline runs *as* the user (no sudo, $SUDO_USER unset), so the
     current-user fallback makes a plain `turnip up` work; an explicit `user`
-    decouples ownership from the invoker. netns_dir defaults to <user>'s ~/netns.
+    decouples ownership from the invoker. state_dir defaults to
+    `$XDG_RUNTIME_DIR/turnip` (fallback `/run/user/<uid>/turnip`) -- the user's
+    runtime tmpfs, where rootless runtime state belongs (the netns can't outlive a
+    reboot anyway, and hosts files are regenerated each `up`).
     (The privileged path -- milestone 4 -- will require an explicit user.)"""
     user = rt.user or os.environ.get("SUDO_USER") or pwd.getpwuid(os.getuid()).pw_name
     pw = pwd.getpwnam(user)  # raises KeyError for an unknown user -- fail closed
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{pw.pw_uid}"
     return ResolvedRuntime(
         user=user,
         uid=pw.pw_uid,
         gid=pw.pw_gid,
-        netns_dir=rt.netns_dir or Path(pw.pw_dir) / "netns",
+        state_dir=rt.state_dir or Path(runtime_dir) / "turnip",
         nft=rt.nft,
         podman=rt.podman,
     )
@@ -105,7 +109,7 @@ def resolve_runtime(rt: Runtime) -> ResolvedRuntime:
 @dataclass
 class Container:
     """A container's on-disk state: its netns and its generated hosts file, both
-    under `<netns_dir>/containers/<name>/`. `links` arrive in milestone 5."""
+    under `<state_dir>/containers/<name>/`. `links` arrive in milestone 5."""
 
     name: str
     netns_path: str  # containers/<name>/netns (the bind-mount)
@@ -232,7 +236,7 @@ def router_if(container: str) -> str:
     return name
 
 
-def build_model(turnip: Turnip, netns_dir: Path) -> Model:
+def build_model(turnip: Turnip, state_dir: Path) -> Model:
     """Lower the validated config into the runtime model (no IO, no handles yet).
 
     Containers come from the top-level `containers` map (the authoritative set -- a
@@ -242,8 +246,8 @@ def build_model(turnip: Turnip, netns_dir: Path) -> Model:
     containers = {
         name: Container(
             name,
-            netns_path=str(netns_dir / "containers" / name / "netns"),
-            hosts_path=str(netns_dir / "containers" / name / "hosts"),
+            netns_path=str(state_dir / "containers" / name / "netns"),
+            hosts_path=str(state_dir / "containers" / name / "hosts"),
         )
         for name in turnip.containers
     }
@@ -262,7 +266,7 @@ def build_model(turnip: Turnip, netns_dir: Path) -> Model:
         networks.append(
             Network(
                 name=net_name,
-                netns_path=str(netns_dir / "routers" / net_name),
+                netns_path=str(state_dir / "routers" / net_name),
                 gateway=str(net.gateway),
                 gateway_if=net.gateway_if,
                 endpoints=endpoints,
@@ -524,7 +528,7 @@ def main() -> None:
     # over it -- the forked child inherits the closure, no module global needed.
     turnip = load_config()
     runtime = resolve_runtime(turnip.runtime)
-    model = build_model(turnip, runtime.netns_dir)
+    model = build_model(turnip, runtime.state_dir)
     in_podman_context(lambda: fn(model))
 
 

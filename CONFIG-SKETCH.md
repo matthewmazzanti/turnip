@@ -55,8 +55,7 @@ on-disk artifact `fabric.example.json`.
 ```json
 {
   "runtime": {
-    "user": "homelab",
-    "netns_dir": "/home/homelab/netns"
+    "user": "homelab"
   },
   "containers": { "zwave": {}, "hass": {}, "proxy": {} },
   "networks": {
@@ -187,9 +186,12 @@ binaries), which goes in `runtime`:
   fork-drop target (`/run/user/<uid>` for the pause pid, `sudo -u <user> podman
   …`). Default: `$SUDO_USER`. Explicit value decouples ownership from the invoker
   (admin runs `sudo fabric up`; it drops to `homelab`). Validated via `getpwnam`.
-- **`netns_dir`** — where persistent netns mounts live. Default `<user>`'s
-  `$HOME/netns`. *Shared* knowledge: must equal the `podman run --network
-  ns:<netns_dir>/<name>` path.
+- **`state_dir`** — where turnip's runtime state lives: the netns mounts and the
+  generated per-container hosts files, under `routers/<network>` +
+  `containers/<container>/{netns,hosts}`. Default `$XDG_RUNTIME_DIR/turnip`
+  (fallback `/run/user/<uid>/turnip`) — the user's runtime tmpfs. *Shared*
+  knowledge: must equal the `podman run --network
+  ns:<state_dir>/containers/<name>/netns` path (and the hosts bind-mount source).
 - **`nft` / `podman`** (optional) — binary-path overrides; default to the PATH +
   common-location search.
 
@@ -329,9 +331,10 @@ drives it):
   parent's caps do the move.
 - **sudo breaks the login-user assumptions:** `_pause_pid()` reads
   `/run/user/<runtime.user uid>/...` (bootstrap via `sudo -u <user> podman
-  unshare true`); `NETNS_DIR` comes from `runtime.netns_dir`, not root's
-  `$HOME`. With an uplink/link present the script refuses to run without sudo, and
-  refuses real-root with no resolvable `runtime.user`/`$SUDO_USER`.
+  unshare true`); `state_dir` resolves under the *resolved user's* runtime dir
+  (`/run/user/<uid>/turnip`), not root's. With an uplink/link present the script
+  refuses to run without sudo, and refuses real-root with no resolvable
+  `runtime.user`/`$SUDO_USER`.
 
 What the edges expand to:
 - **egress** — *rootless (router):* allow `ct new` out the uplink for permitted

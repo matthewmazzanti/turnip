@@ -98,7 +98,7 @@ from collections.abc import Callable
 from pyroute2 import NetNS, netns
 
 # This module holds no netns-root state: every helper takes a full path that
-# `main` builds from the resolved `runtime.netns_dir` (so the env read stays in the
+# `main` builds from the resolved `runtime.state_dir` (so the env read stays in the
 # shell). Paths may carry a subdir -- routers/<net>, containers/<container>.
 
 

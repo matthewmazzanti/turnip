@@ -114,11 +114,11 @@ class _Model(BaseModel):
 class Runtime(_Model):
     """Execution environment -- separate from the model (who/what), this is the
     *where* (which user, dirs, binaries). All optional; the environment-dependent
-    defaults (current user, ~/netns) are filled in by the caller, which owns the
-    env + passwd-db reads (see `main.resolve_runtime`). This stays pure data."""
+    defaults (current user, $XDG_RUNTIME_DIR/turnip) are filled in by the caller,
+    which owns the env + passwd-db reads (see `main.resolve_runtime`). Pure data."""
 
     user: str | None = None
-    netns_dir: Path | None = None
+    state_dir: Path | None = None  # holds the netns + generated hosts files
     nft: Path | None = None
     podman: Path | None = None
 
@@ -130,7 +130,7 @@ class ResolvedRuntime(_Model):
     user: str
     uid: int
     gid: int
-    netns_dir: Path
+    state_dir: Path
     nft: Path | None = None
     podman: Path | None = None
 

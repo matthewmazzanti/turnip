@@ -25,9 +25,9 @@ set -euo pipefail
 # Prereq: bring the network up first (creates ./netns/* + the routed network):
 #   uv run turnip up
 
-# Matches runtime.netns_dir's default (the login user's ~/netns); override here
-# if your turnip.json sets a different netns_dir.
-NETNS_DIR="$HOME/netns"
+# Matches runtime.state_dir's default ($XDG_RUNTIME_DIR/turnip); override here
+# if your turnip.json sets a different state_dir.
+STATE_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/turnip"
 
 NS="${1:-hass}"
 shift || true
@@ -41,8 +41,8 @@ if [[ "${1:-}" == "--" ]]; then
   CMD=("$@")
 fi
 
-NSPATH="$NETNS_DIR/containers/$NS/netns"
-HOSTS="$NETNS_DIR/containers/$NS/hosts"
+NSPATH="$STATE_DIR/containers/$NS/netns"
+HOSTS="$STATE_DIR/containers/$NS/hosts"
 
 # The netns is a bind-mount living in podman's (pause-process) mount namespace,
 # NOT the host mount namespace -- so check for it from inside `podman unshare`,
