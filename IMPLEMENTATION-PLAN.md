@@ -1,12 +1,32 @@
 # Implementation plan — config → mechanism, by milestone
 
-The model is declarative (`config.py` → `Turnip`). The mechanism
-(`main.py`/`nftlib.py`/`netns.py`) still runs on the hardcoded `fabric.py`
-literals. This is the plan to close that gap **bottom-up**: take a minimal,
-working vertical pass at each milestone, then refactor to grow the abstractions
-(the netns/veth/addressing derivations, and eventually a lowered IR) out of code
-that already runs — rather than designing the IR first and discovering its shape
-is wrong (it already was; see "Compass" below).
+The model is declarative (`config.py` → `Turnip`). This is the plan to drive the
+mechanism from it **bottom-up**: a minimal working vertical pass per milestone,
+then refactor to grow the abstractions out of code that already runs — rather than
+designing an IR first and discovering its shape is wrong (it already was; see
+"Compass").
+
+## Current status (handoff)
+
+- **Done & committed (M1–M3):** the rootless baseline is fully config-driven —
+  `turnip up`/`down` create netns, wire the /32 routed veths + gateway, apply the
+  `inet turnip` flow matrix, and generate per-container hosts files. `fabric.py` is
+  deleted; the old literal-driven `main.py`/`verify.py` are parked as `*.py.bak`.
+  47 tests green (ruff/pyright clean). Commits `46fd274`, `fbc1e61`, `e734b05`.
+- **Architecture as built:** `main.py` is the imperative shell (config + env IO,
+  runtime resolution, `build_model`); `config.py`/`netns.py`/`nftlib.py` are pure.
+  The runtime model is a **stateful object graph** (`Container`/`Network`/
+  `Endpoint`), not a pure IR. `Model` owns the netns lifetime (`create`/`teardown`/
+  `bound()`). `up = down() + build` (clean-slate). Flows are **directional**. State
+  lives under `runtime.state_dir` (default `$XDG_RUNTIME_DIR/turnip`).
+- **Next: M4 (uplinks)** — the first *rootful* milestone. The privilege model is
+  **decided** (two sources: sudo or CAP_NET_ADMIN-as-user) and written up in
+  CONFIG-SKETCH "The uplink — and the rootful half it implies". First concrete step
+  is hardening `resolve_runtime` + proving the privileged-exec primitive in
+  isolation (see the M4 section).
+- **Open TODOs:** the running-container teardown guard (`# TODO` in `up`); veth
+  name truncation for multi-network; the deferred `bridge` type / `links` /
+  multi-homing (CONFIG-SKETCH).
 
 ## Approach
 
@@ -32,7 +52,14 @@ is wrong (it already was; see "Compass" below).
 - **`fabric.py` dies incrementally**, its last import going at milestone 3.
   `verify.py` is retired, not rewired (see "What `verify` becomes").
 
-## Compass — where the abstraction is heading (not a spec)
+## Compass — where the abstraction was heading (largely realized)
+
+> **Update (M1–M3 done).** The three-entity shape below held, but it crystallized
+> as a **stateful object graph** (`Container`/`Network`/`Endpoint` dataclasses in
+> `main.py`, built by `build_model`), **not** a pure-IR `Layout` module — we don't
+> reslice/serialize, so the graph with direct refs won out. Read `ContainerLayout`
+> → `Container`, `NetworkLayout` → `Network` below; `links` is the one field still
+> to land (M5). See "Runtime model" under Decisions for the rationale.
 
 So refactors aim somewhere consistent, the eventual lowered IR mirrors config's
 **three entities**, unified — not the network-centric shape first sketched, which
@@ -122,14 +149,14 @@ grows), and how it's checked.
   (the /32 routed veth pairs, container link-scope + default routes, the
   load-bearing router-side /32 route) driven by config `attach` entries. The
   netns/veth name derivations are pure helpers in `main` keyed by relative name
-  (`router_netns`/`container_netns`/`router_if`); `open_namespaces` finalized to a
-  `{name: path}` mapping, shaped here by the wiring loop (its first consumer).
+  (`router_netns`/`container_netns`/`router_if`).
   Non-router networks raise NotImplementedError (bridge is post-baseline).
-- **Refactor (deferred):** the per-attachment derived facts (`router_if`,
-  `cont_if`, `ip`, gateway) are still passed as `(network, container, att)` to
-  `connect` — readable enough that a typed `Endpoint` hasn't earned itself yet. It
-  likely crystallizes at M3, where the nft builder also needs the resolved per-
-  container IPs; let it emerge there rather than forcing it now.
+  *(Note: the `open_namespaces` mapping introduced here was later folded into
+  `Model.bound()` by the post-M3 runtime-model refactor.)*
+- **Refactor (deferred at the time, now done):** at M2 the per-attachment facts
+  were passed as `(network, container, att)` to `connect`; they since crystallized
+  into the `Endpoint`/`Network` runtime objects (the post-M3 refactor — see
+  "Runtime model" under Decisions).
 - **Check (done):** live smoke — gateway `gw0` at `<gw>/32`, both `vethR-*` up with
   their /32 device routes, each container addressed with link-scope-gw + default
   routes; **container → gateway ping succeeds** (weak-host ARP answers, no
@@ -140,12 +167,14 @@ grows), and how it's checked.
 - **Pass (done):** `build_nft(network)` + `router_sysctls(network)` take a config
   `Network` and are applied in each router netns via the `run_in_netns` hop
   (`configure_dataplane`), after all wiring (per-veth sysctls + rp_filter need the
-  veths to exist). Flows expand both-ways, container↔gateway host pairs, icmp-to-gw;
-  table `inet turnip`. `up` is now the full rootless baseline.
-- **Refactor (deferred again):** `build_nft`/`router_sysctls` read
-  `network.gateway`/`attach`/`flows` directly — clean enough that the lowered
-  `NetworkLayout`/`Endpoint` still hasn't earned itself. Same call as M2; let it
-  crystallize only when a consumer makes it pay (e.g. M4's edge, or multi-network).
+  veths to exist). Flows are directional (`from`→`to`), container↔gateway host
+  pairs, icmp-to-gw; table `inet turnip`. `up` is now the full rootless baseline.
+- **Refactor (done, post-M3):** the runtime object graph
+  (`Container`/`Network`/`Endpoint` + `build_model`) landed as a follow-up — the
+  derivations + parallel path/handle maps were the friction that earned it. The
+  wiring/dataplane are now free functions over those objects; `build_nft` reads
+  `network.gateway`/`endpoints`/`flows`. (Not a pure IR — see "Runtime model"
+  under Decisions.)
 - **Deleted:** `fabric.py` (last consumer gone). `verify.py` stays parked as
   `.bak` (reference for the future integration tests).
 - **Check (done):** the **parity** test passes — config-driven `build_nft` for a
@@ -159,22 +188,39 @@ grows), and how it's checked.
 - *Note:* `port="any"`/icmp-in-flows raise NotImplementedError (need a second map
   shape) — deferred; the baseline carries concrete ports.
 
-### 4. uplinks  *(rootful — host edge)*
-- **Pass:** per-network `uplink` veth (router netns ↔ host netns) + `egress`/
-  `ingress` (router-side allow rules; host-side masquerade/DNAT/route), on the
-  sudo / fork-drop / `SCM_RIGHTS` primitive (CONFIG-SKETCH "the rootful half").
-  Brings in the explicit-user requirement and the `requires_root` gate.
-- **Refactor:** `uplink` on `NetworkLayout`, `egress`/`ingress` on `Endpoint`; the
-  privileged-execution primitive abstracted as the reusable `wire_into(netns)`.
+### 4. uplinks — NEXT  *(rootful — host edge)*
+First time turnip runs privileged. **The privilege plumbing is the hard part, not
+the uplink** — see CONFIG-SKETCH "The uplink — and the rootful half it implies"
+for the full model. Summary:
+- **Two privilege sources** (decided this session): `sudo` (real root) **or** run
+  as the user with `CAP_NET_ADMIN` (ambient cap — the systemd `User=` +
+  `AmbientCapabilities` service path, no root). `requires_root` (any uplink/links)
+  is the gate.
+- **Forked into two branches** (the fork is forced by the userns split, not
+  privilege): a host-edge branch in the init netns (host veth end, masquerade/DNAT
+  in host nft, host route, `ip_forward`) and a netns branch in podman's ns. The
+  parent keeps its privilege; the child becomes the user (**drop if root**, else
+  no-op); they pass the router-netns fd via `SCM_RIGHTS`.
+- **First step (do before any uplink logic):** harden `resolve_runtime`
+  (privilege detection via euid/CapEff, require-explicit-user-under-root, uid-based
+  dir resolution) and build + standalone-test the privileged-exec primitive
+  (generalizes `in_podman_context`). Prove fork + host-netns op + netns op + fd
+  pass in isolation first.
+- **Then the uplink itself:** add `uplink` to the `Network` object and
+  `egress`/`ingress` to `Endpoint` (more fields, additive — `build_model` lowers
+  them); router-side allow rules in the existing nft table; host-side
+  masquerade/DNAT in a host nft zone. `down` grows host-side teardown (flush the
+  host nft zone; the veth + its routes mostly auto-die with the router netns) —
+  one zone per network. `up = down() + build` clears it for free.
 - **Check:** integration test — a permitted egress reaches out, an ingress DNAT
-  lands; default-deny holds otherwise.
+  lands; default-deny holds otherwise; re-`up` doesn't stack host nft rules.
 
 ### 5. links  *(rootful — container edge)*
 - **Pass:** container-scoped host-netdev holes (`veth`/`macvlan`/`ipvlan`/`phys`),
   own-vs-borrow ownership implied by `type`, teardown by name **and** kind.
-- **Refactor:** `ContainerLayout` grows `links` — the unified container scope
-  finally crystallizes (the thing the network-centric sketch couldn't hold). The
-  one-default-route invariant now reads across attachments *and* links in one place.
+- **Refactor:** the `Container` object grows `links` — the container scope already
+  exists (it owns the netns + hosts), so this is additive. The one-default-route
+  invariant now reads across attachments *and* links in one place.
 - **Check:** integration test — a link iface appears in the container with its
   static address, outside every router's nft policy; `down` returns `phys`, reaps
   virtual, never touches anchors.

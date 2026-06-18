@@ -6,10 +6,12 @@ bridge. Each container hangs off a central `router` netns by its own `/32` veth;
 the router forwards between them by destination IP, and an nftables flow matrix
 decides who may talk to whom.
 
-The network's *model* (who exists, who may talk, what crosses the edge) is moving
-to a declarative `turnip.json` (loaded + validated by `config.py`); the mechanism
-(`main.py`/`nftlib.py`/`verify.py`) still runs on the hardcoded `fabric.py`
-literals today — see `CONFIG-SKETCH.md` for the model and the build order.
+The network's *model* (who exists, who may talk, what crosses the edge) is a
+declarative `turnip.json`, loaded + validated by `config.py`; the mechanism
+(`main.py` over `netns.py`/`nftlib.py`) builds the dataplane from it. The rootless
+baseline (milestones 1–3) is done; the rootful host edge (uplinks, links) is next.
+See `CONFIG-SKETCH.md` for the config model and `IMPLEMENTATION-PLAN.md` for the
+milestone status and architecture.
 
 ## Why routed instead of a bridge
 
@@ -39,33 +41,35 @@ hass   netns:  eth0 10.0.0.12/32  default via 10.0.0.1
 proxy  netns:  eth0 10.0.0.13/32  default via 10.0.0.1
 ```
 
-The flow matrix is hub-and-spoke with `hass` as the hub: `zwave`↔`hass` and
-`hass`↔`proxy` on tcp/443; `zwave`↔`proxy` is denied. Every container may reach
-the gateway. Edit `FABRIC_FLOWS` / `HOSTS` in `main.py` to change it.
+The example flow matrix is hub-and-spoke with `hass` as the hub: `zwave`→`hass`
+and `hass`→`proxy` on tcp/443 (flows are **directional** — `from` initiates to
+`to`). Every container may reach the gateway. Edit `containers`/`networks`/`flows`
+in `turnip.json` to change it (see `turnip.example.json`). The `inet fabric` table
+in the diagram is now `inet turnip`, one per router netns.
 
 ## Usage
 
 Run as your **normal login user** — no `podman unshare` wrapper. `main.py` enters
 podman's rootless user+mount namespaces in-process (see `in_podman_context`); you
-just have to use the venv interpreter that has pyroute2. Use the `turnip` console
-script (installed by `uv sync`/`pip install -e .`) or run the module directly:
+just have to use the venv interpreter that has pyroute2. Config is discovered via
+`$TURNIP_CONFIG`, else `./turnip.json`.
 
 ```sh
-uv run turnip up        # create + wire everything   (or: uv run python -m turnip.main up)
-uv run turnip verify    # report dataplane state
+uv run turnip up        # create + wire everything, write hosts files
 uv run turnip down      # tear it all down
 ```
 
-Attach a container to one of the namespaces (joins it via `--network ns:<path>`):
+Attach a container to its namespace (joins via `--network ns:<path>` and mounts
+its generated hosts file to `/etc/hosts`):
 
 ```sh
 ./run-container.sh            # hass netns, netshoot shell
 ./run-container.sh zwave      # zwave netns
 ```
 
-`down` removes the namespaces; since the `router` netns owns the gateway, all
-veths, the routes, the sysctls, and the nft table, removing it is a complete
-teardown — there are no per-element deletes.
+`down` removes every netns the config implies. Since each router netns owns its
+gateway, veths, routes, sysctls, and nft table, removing it is a complete teardown
+— no per-element deletes. (`up` is `down()` + build: clean-slate every time.)
 
 ## Files
 
@@ -73,13 +77,12 @@ All package modules live under `src/turnip/`.
 
 | File            | Role |
 |-----------------|------|
-| `main.py`       | Orchestration + CLI: `create_gateway`, `connect`, `configure_dataplane`, the app-policy `build_nft`/`router_sysctls`, and the `up`/`verify`/`down` dispatch. |
-| `config.py`     | The declarative model: the pydantic `Turnip` loader + validator for `turnip.json` (containers, networks, attachments, runtime). Not yet consumed by the mechanism — see `CONFIG-SKETCH.md`. |
-| `fabric.py`     | The current (hardcoded) model: `Host`, `HOSTS`, `FABRIC_FLOWS`, and the addressing constants (`ROUTER`/`GW_IP`/…). A leaf module so the others don't import-cycle through `main`. To be retired once the mechanism consumes `config.py`. |
-| `netns.py`      | The namespace layer: enter podman's namespaces (`in_podman_context`), netns lifecycle (`ensure_netns`/`remove_netns`), open sockets + ifindex lookups, and run-code/write-sysctls inside a netns (`run_in_netns`/`write_sysctls`). Plus the rootless / pyroute2 rationale. |
+| `main.py`       | The imperative shell + CLI: config/env IO, `resolve_runtime`, `build_model` (config → the `Container`/`Network`/`Endpoint` runtime graph), the wiring (`create_gateway`/`connect`/`configure_dataplane`), the app policy (`build_nft`/`router_sysctls`), hosts-file generation (`container_peers`/`hosts_file`), and the `up`/`down` dispatch. |
+| `config.py`     | The declarative model: pure pydantic `Turnip` (types + validation, no IO) for `turnip.json` — containers, networks, attachments, runtime. This *is* the model the mechanism consumes. |
+| `netns.py`      | The namespace layer (pure mechanism, explicit args): enter podman's namespaces (`in_podman_context`), netns lifecycle (`create_netns`/`remove_netns`), ifindex lookups, run-code/write-sysctls inside a netns (`run_in_netns`/`write_sysctls`). Plus the rootless / pyroute2 rationale. |
 | `nftlib.py`     | A use-case-agnostic, data-oriented DSL for libnftables JSON (`render` over frozen-dataclass sums) and the `nft` executor (`load`/`find_nft`). The app policy that uses it (`build_nft`) lives in `main.py`. |
-| `verify.py`     | The `verify` command — read-only dataplane report. |
-| `run-container.sh` (repo root) | Launch a podman container attached to a network namespace. |
+| `run-container.sh` (repo root) | Launch a podman container attached to its netns, with its generated hosts file bind-mounted to `/etc/hosts`. |
+| `*.py.bak`      | The old literal-driven `main.py`/`verify.py`, parked as reference for the remaining milestones (M4/M5); to be removed when those land. |
 | `typings/`      | Local partial pyroute2 stubs (it ships none); scoped to the API surface we use. |
 
 ## Design notes

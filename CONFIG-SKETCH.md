@@ -303,38 +303,76 @@ between that network's router netns and the **host** netns, which is what makes
    network's subnet, and host nftables (masquerade + DNAT). That state is
    **rootful**. (With multiple uplinks, the host holds one such zone per network.)
 
-So the tool grows a root-required component. The chosen model: **run the whole
-thing under `sudo`, and drop privilege for the netns ops** — one invocation,
-iterated per network.
+So the tool grows a component that needs `CAP_NET_ADMIN` in the **init** userns
+(to touch the host netns). Two ways to hold it, both supported:
 
-Privilege model (mechanism — the `uplink`/`egress`/`ingress`/`links` config
-drives it):
+- **`sudo turnip up`** — real root. The convenient interactive path.
+- **Run as the user with `CAP_NET_ADMIN`** (ambient cap) — no root at all. The
+  clean *service* path: a systemd unit with `User=<user>` +
+  `AmbientCapabilities=CAP_NET_ADMIN`. (Get the cap from the *launcher* — systemd
+  ambient, or `setpriv --ambient-caps=+net_admin`. Do **not** `setcap` the Python
+  interpreter — that grants the cap to every Python invocation system-wide.)
 
-- **Root does NOT change netns ownership.** Rootless `podman run` can only
-  `setns()` into netns owned by podman's rootless userns — a property of the
-  *containers*. So even under sudo, the persistent netns are still created inside
-  podman's user+mount ns.
-- **Fork and drop, don't `su`.** A literal `su` is irrecoverable and loses root
-  for the host work. Instead: fork; the **parent stays root** for the host edge
-  (uplink host ends, masquerade/DNAT, host sysctls); the **child drops to
-  `runtime.user`'s uid/gid** (initgroups → setresgid → setresuid) and runs the
-  podman-context body. Becoming the login user (vs root entering the userns) is
-  the proven path: it maps to uid 0 inside podman's userns via the uid_map, and
-  the `setns(CLONE_NEWUSER)` join is permitted by owner-match (`euid == owner`).
-- **An uplink veth crosses a userns boundary** (root netns is init-userns; a
-  router netns is rootless-userns; caps propagate to descendants, never up). The
-  child (in podman's mount ns, where the router-netns bind-mount is visible)
-  **opens the router-netns fd and hands it to the root parent over a `socketpair`
-  via `SCM_RIGHTS`**. Fd passing needs **no capability** — creds are checked at
-  `open()` and at the privileged op (`setns`/the `net_ns_fd` move), never at
-  transfer. So the child's mount-ns visibility does the opening and the root
-  parent's caps do the move.
-- **sudo breaks the login-user assumptions:** `_pause_pid()` reads
-  `/run/user/<runtime.user uid>/...` (bootstrap via `sudo -u <user> podman
-  unshare true`); `state_dir` resolves under the *resolved user's* runtime dir
-  (`/run/user/<uid>/turnip`), not root's. With an uplink/link present the script
-  refuses to run without sudo, and refuses real-root with no resolvable
-  `runtime.user`/`$SUDO_USER`.
+### The fork is forced by the userns split, not by privilege
+
+The work splits into two branches that **must** be separate processes:
+
+- **host-edge branch** — runs in the **init** netns + init userns (uplink host
+  ends, masquerade/DNAT in host nft, host route, `ip_forward`). Needs
+  `CAP_NET_ADMIN` *in the init userns*.
+- **netns branch** — enters podman's user+mount ns to create/wire the
+  router/container netns. Needs to *be* the rootless user.
+
+You can't do both in one process: entering podman's (descendant) userns is a
+one-way descent that **loses caps over the init netns** (caps propagate to
+descendants, never up). So `up` **forks**: the **parent is the host-edge branch**
+(it keeps whatever privilege the process started with), the **child is the netns
+branch**. They hand the router-netns fd across via `SCM_RIGHTS` — the child (in
+podman's mount ns) can `open()` the bind-mount, the parent has the caps to move
+the veth's far end into it. Fd passing needs **no capability**: creds are checked
+at `open()` and at the privileged op (`setns`/`net_ns_fd` move), never at transfer.
+
+The privilege *source* changes only two small things — everything else is one path:
+
+| | host-edge branch (parent) | netns branch (child) |
+|---|---|---|
+| **sudo (uid 0)** | already root → has caps | **drop** to `runtime.user` (initgroups → setresgid → setresuid) |
+| **user + CAP_NET_ADMIN** | already the user, ambient cap → has caps | already the user → **no drop**, just enter podman's ns |
+
+So the only privilege *operations* are: the child drops **iff** it started as
+root; the parent just keeps what it had. (Becoming the login user, vs root
+entering the userns, is the proven path: it maps to uid 0 inside podman's userns
+via the uid_map, and the `setns(CLONE_NEWUSER)` join is permitted by owner-match,
+`euid == owner`.) **Root does NOT change netns ownership** — even under sudo the
+persistent netns are created inside podman's rootless user+mount ns.
+
+### Gate + detection (driven by `requires_root`)
+
+`requires_root` (any `uplink` or any `links`) is the switch; a pure routed config
+stays rootless (unchanged):
+
+- **Have host-edge privilege?** = `euid == 0` **or** `CAP_NET_ADMIN ∈ CapEff`
+  (read `/proc/self/status`). If `requires_root` and neither → error: *needs root
+  (sudo) or CAP_NET_ADMIN (e.g. systemd AmbientCapabilities)*.
+- **If root:** require a resolvable `runtime.user`/`$SUDO_USER` (do **not** fall
+  back to the current user — that's `root`); resolve `state_dir` + the pause-pid
+  path by the **target uid** (`/run/user/<uid>/...`), ignoring the invoker's env
+  (under sudo `$XDG_RUNTIME_DIR` is root's). Bootstrap the pause process *as the
+  user* (`sudo -u <user> podman unshare true`).
+- **If user + cap:** the user *is* the current user, env is correct, dirs resolve
+  as today — simpler.
+
+Non-interactive cases (systemd) also need `loginctl enable-linger <user>` so
+`/run/user/<uid>` + the podman pause process exist with no active login.
+
+### First implementation step (prove the primitive in isolation)
+
+Before any uplink/nft logic: harden `resolve_runtime` (the detection + gate +
+uid-based dir resolution above), then build the **privileged-exec primitive**
+(generalizing today's `in_podman_context`, which is just the netns branch with no
+host-edge sibling) and test it standalone — fork, do a trivial host-netns op in
+the parent and a netns op in the dropped/same-user child, pass an fd between them
+— so the privilege plumbing is proven before any real work rides on it.
 
 What the edges expand to:
 - **egress** — *rootless (router):* allow `ct new` out the uplink for permitted

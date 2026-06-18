@@ -7,3 +7,8 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+
+# turnip dev VM
+turnip.qcow2
+nix/testvm_key
+result
