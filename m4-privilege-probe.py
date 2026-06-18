@@ -227,7 +227,9 @@ def host_edge_branch(sock: socket.socket) -> None:
         print(f"  host-edge: moved {ROUTER_VETH} into the passed netns fd OK", flush=True)
 
         os.close(router_fd)
-        sock.send(b"moved")  # ack so the child can verify
+        sock.send(b"moved")  # tell the child to verify
+        sock.recv(16)  # wait for "verified" BEFORE teardown: deleting either veth
+        #                end reaps BOTH, which would race the child's check
     finally:
         # host end stays in init netns -> clean it up (the router end left with the
         # veth move; deleting either end reaps the pair).
@@ -295,6 +297,7 @@ def netns_branch(pw: pwd.struct_passwd, sock: socket.socket) -> None:
         # Verify the parent's cross-userns move actually landed in OUR netns.
         with NetNS(ns_path, flags=0) as ns:
             found = ns.link_lookup(ifname=ROUTER_VETH)
+        sock.send(b"verified")  # release the parent to tear the pair down now
         if not found:
             raise RuntimeError(f"{ROUTER_VETH} not present in router netns after move")
         print(f"  netns: confirmed {ROUTER_VETH} in router netns (idx={found[0]})", flush=True)
