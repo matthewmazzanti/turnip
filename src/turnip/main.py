@@ -42,10 +42,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
 
-from pyroute2 import NetNS
+from pyroute2 import IPRoute, NetNS
 
 from . import nftlib as nft
-from .config import HOST_PREFIX, Flow, NetworkType, Proto, ResolvedRuntime, Runtime, Turnip
+from .config import (
+    HOST_PREFIX,
+    LINK_PREFIX,
+    Flow,
+    NetworkType,
+    Proto,
+    ResolvedRuntime,
+    Runtime,
+    Turnip,
+)
 from .netns import (
     collect_fds_from_child,
     create_netns,
@@ -54,6 +63,7 @@ from .netns import (
     in_podman_context,
     remove_netns,
     run_in_netns,
+    run_in_netns_fd,
     set_lo_up,
     write_sysctls,
 )
@@ -562,15 +572,63 @@ def wire_in_podman(model: Model, runtime: ResolvedRuntime) -> dict[str, int]:
 
 
 def teardown_host_edge(model: Model) -> None:
-    """Remove host-side rootful state (uplink host veths, host nft) in the init netns.
-    A no-op until uplinks land (step D) -- there is no host state yet."""
-    # uplinks not lowered onto the model yet; nothing host-side to tear down.
+    """Remove host-side uplink state in the init netns -- the host veth end, which does
+    NOT die with the router netns (its peer does, the host end persists). Runs in the
+    privileged parent, before re-wiring (up = down + build) and on `down`. Idempotent:
+    skips a veth that's already gone. A no-op for networks without an uplink, so the
+    rootless path never touches the init netns here."""
+    uplinks = [net.uplink for net in model.networks if net.uplink is not None]
+    if not uplinks:
+        return
+    ipr = IPRoute()
+    try:
+        for up in uplinks:
+            found = ipr.link_lookup(ifname=up.host_if)
+            if found:
+                ipr.link("del", index=found[0])
+                print(f"  removed host uplink veth {up.host_if}")
+    finally:
+        ipr.close()
 
 
 def host_edge_connect(network: Network, router_fd: int) -> None:
-    """Wire a network's uplink veth across the init<->router boundary -- the host edge.
-    A no-op until the uplink lands (step D)."""
-    # network has no uplink yet; nothing to connect.
+    """Wire a network's uplink veth across the init<->router boundary -- the host edge,
+    run in the privileged init-side parent (phase 2). No-op without an uplink.
+
+    The veth is born in the init netns; the router end is moved into the router netns by
+    fd (IFLA_NET_NS_FD -- needs only CAP_NET_ADMIN, which root holds in init, flowing
+    down to podman's userns). The host end is addressed on the /31 init-side; the router
+    end + its default route via the host end are set inside the router netns, entered by
+    fd (setns, which root may do from the init userns). No nft/masquerade yet."""
+    up = network.uplink
+    if up is None:
+        return
+    ipr = IPRoute()
+    try:
+        ipr.link("add", ifname=up.host_if, kind="veth", peer={"ifname": up.router_if})
+        ipr.link("set", index=ipr.link_lookup(ifname=up.router_if)[0], net_ns_fd=router_fd)
+        hidx = ipr.link_lookup(ifname=up.host_if)[0]
+        ipr.addr("add", index=hidx, address=up.host_ip, prefixlen=LINK_PREFIX)
+        ipr.link("set", index=hidx, state="up")
+    finally:
+        ipr.close()
+
+    def configure_router_end() -> str:
+        r = IPRoute()
+        try:
+            ridx = r.link_lookup(ifname=up.router_if)[0]
+            r.addr("add", index=ridx, address=up.router_ip, prefixlen=LINK_PREFIX)
+            r.link("set", index=ridx, state="up")
+            r.route("add", dst="default", gateway=up.host_ip, oif=ridx)
+        finally:
+            r.close()
+        return ""
+
+    run_in_netns_fd(router_fd, configure_router_end)
+    print(
+        f"  {network.name} uplink: {up.host_if} {up.host_ip} <-> {up.router_if} "
+        f"{up.router_ip}/{LINK_PREFIX} (router default via {up.host_ip})"
+    )
 
 
 def up(model: Model, runtime: ResolvedRuntime) -> None:

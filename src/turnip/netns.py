@@ -165,6 +165,8 @@ def in_podman_context(runtime: ResolvedRuntime, fn: Callable[[], None]) -> None:
 
     The child inherits stdout, so `fn`'s prints reach the terminal; we flush before
     os._exit (which skips buffering). A non-zero child exit fails this process."""
+    sys.stdout.flush()  # flush BEFORE fork so the child can't inherit + re-emit our buffer
+    sys.stderr.flush()
     child = os.fork()
     if child == 0:
         code = 0
@@ -223,6 +225,8 @@ def collect_fds_from_child(produce_fds: Callable[[], dict[str, int]]) -> dict[st
     `produce_fds` callback's job, kept out of here so the bridge is testable without
     podman."""
     parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    sys.stdout.flush()  # flush BEFORE fork so the child can't inherit + re-emit our buffer
+    sys.stderr.flush()
     pid = os.fork()
     if pid == 0:
         parent_sock.close()
