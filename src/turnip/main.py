@@ -52,11 +52,13 @@ from .config import (
     Egress,
     Flow,
     IngressRule,
+    Link,
     NetworkType,
     Proto,
     ResolvedRuntime,
     Runtime,
     Turnip,
+    VethLink,
 )
 from .netns import (
     collect_fds_from_child,
@@ -140,13 +142,33 @@ def resolve_runtime(rt: Runtime) -> ResolvedRuntime:
 
 
 @dataclass
+class HostLink:
+    """A lowered container link: the config `spec` plus the two facts build_model
+    derives, so the wiring reads them and never re-derives (parallels Endpoint).
+
+    - `default`: effective default-route ownership -- configured `default`, OR the
+      container's sole interface (config only *requires* an explicit default when a
+      container has >1 interface, so a single-homed container's lone link implicitly
+      owns it).
+    - `host_if`: the host-side veth end's derived name, for veth links only; None for
+      macvlan/ipvlan/phys, which move/create a device directly with no host-side veth.
+    """
+
+    spec: Link
+    default: bool
+    host_if: str | None = None
+
+
+@dataclass
 class Container:
     """A container's on-disk state: its netns and its generated hosts file, both
-    under `<state_dir>/containers/<name>/`. `links` arrive in milestone 5."""
+    under `<state_dir>/containers/<name>/`, plus its `links` -- host-netdev holes
+    moved into its netns (milestone 5), lowered to HostLink."""
 
     name: str
     netns_path: str  # containers/<name>/netns (the bind-mount)
     hosts_path: str  # containers/<name>/hosts (bind-mounted to /etc/hosts)
+    links: list[HostLink] = field(default_factory=list["HostLink"])
     netns: NetNS | None = None  # bound only inside `with model.bound():`
 
     @property
@@ -169,6 +191,7 @@ class Endpoint:
     router_if: str  # router-side veth name (vethR-<container>)
     cont_if: str  # container-side iface name (from attach.interface)
     ip: str  # the container's /32 on this network
+    default: bool = False  # effective default-route owner (configured, or sole iface)
     egress: Egress = False  # outbound allowance out this network's uplink (bool | rules)
     # host_port -> container DNATs (published ports)
     ingress: list[IngressRule] = field(default_factory=list[IngressRule])
@@ -288,20 +311,55 @@ def router_if(container: str) -> str:
     return name
 
 
+def link_host_if(container: str, link: VethLink) -> str:
+    """Host-side veth name for a container's veth link. Like router_if it only needs
+    to be unique in the init netns, so it keys on (container, link name) -- a container
+    may have several veth links. Rejects an over-long name rather than letting the
+    kernel truncate it into a silent collision; the general hashing scheme is deferred
+    with the multi-network veth-name work."""
+    name = f"vethL-{container}-{link.name}"
+    if len(name) > IFNAMSIZ:
+        raise ValueError(
+            f"link host veth name {name!r} exceeds IFNAMSIZ ({IFNAMSIZ}); "
+            f"shorten {container!r}/{link.name!r}"
+        )
+    return name
+
+
 def build_model(turnip: Turnip, state_dir: Path) -> Model:
     """Lower the validated config into the runtime model (no IO, no handles yet).
 
     Containers come from the top-level `containers` map (the authoritative set -- a
     links-only container with no attachment still gets its netns); each network's
     endpoints reference those shared container objects (so a multi-homed container
-    is one netns with N endpoints)."""
+    is one netns with N endpoints).
+
+    Effective default-route ownership is resolved here once: an interface owns the
+    container's default route if it is configured `default`, OR it is the container's
+    sole interface (links + attachments). config's _cross_cutting guarantees at most
+    one configured default and forbids an undefaulted multi-interface container, so
+    this lowers cleanly to exactly one owner per container -- stored on Endpoint /
+    HostLink so connect()/link_connect() stay dumb."""
+    iface_total = {name: len(c.links) for name, c in turnip.containers.items()}
+    for net in turnip.networks.values():
+        for cname in net.attach:
+            iface_total[cname] += 1
+
     containers = {
         name: Container(
             name,
             netns_path=str(state_dir / "containers" / name / "netns"),
             hosts_path=str(state_dir / "containers" / name / "hosts"),
+            links=[
+                HostLink(
+                    spec=link,
+                    default=link.default or iface_total[name] == 1,
+                    host_if=link_host_if(name, link) if isinstance(link, VethLink) else None,
+                )
+                for link in c.links
+            ],
         )
-        for name in turnip.containers
+        for name, c in turnip.containers.items()
     }
     networks: list[Network] = []
     for net_name, net in turnip.networks.items():
@@ -317,8 +375,9 @@ def build_model(turnip: Turnip, state_dir: Path) -> Model:
                 router_if(cname),
                 att.interface,
                 str(att.ip),
-                att.egress,
-                att.ingress,
+                default=att.default or iface_total[cname] == 1,
+                egress=att.egress,
+                ingress=att.ingress,
             )
             for cname, att in net.attach.items()
         ]
@@ -369,9 +428,12 @@ def connect(network: Network, ep: Endpoint) -> None:
     vethR-<container> stays in the router; the container iface is born directly in
     the container netns (peer net_ns_fd from the cont handle, so it can't drift).
     Container side: /32 address, an explicit link-scope route to the gateway
-    (nothing is on-link under /32), then default via it. Router side: the single
-    /32 device route that is both the forwarding entry and rp_filter's reverse-path
-    anchor. Both netns are recreated clean by `up`, so this just builds."""
+    (nothing is on-link under /32), then -- only if this endpoint owns the container's
+    default route (ep.default) -- default via it. A container whose default lives on
+    another interface (another network, or a `default` link) gets gateway reachability
+    here but no 0.0.0.0/0. Router side: the single /32 device route that is both the
+    forwarding entry and rp_filter's reverse-path anchor. Both netns are recreated
+    clean by `up`, so this just builds."""
     router, cont = network.handle, ep.container.handle
 
     # Born in the right namespaces in one shot: peer (cont_if) directly in cont.
@@ -389,12 +451,15 @@ def connect(network: Network, ep: Endpoint) -> None:
     cidx = ifindex(cont, ep.cont_if)
     cont.addr("add", index=cidx, address=ep.ip, prefixlen=HOST_PREFIX)
     cont.link("set", index=cidx, state="up")
-    # /32 => gateway is not on-link; pin it link-scope, then default via it.
+    # /32 => gateway is not on-link; pin it link-scope, then default via it iff this
+    # endpoint owns the container's default route.
     cont.route("add", dst=network.gateway, oif=cidx, scope="link")
-    cont.route("add", dst="default", gateway=network.gateway, oif=cidx)
+    if ep.default:
+        cont.route("add", dst="default", gateway=network.gateway, oif=cidx)
     print(
         f"  wired {ep.container.name}: {ep.cont_if} {ep.ip}/{HOST_PREFIX} -> gw "
-        f"{network.gateway} <-> {ep.router_if} (route {ep.ip}/{HOST_PREFIX} dev {ep.router_if})"
+        f"{network.gateway}{' (default)' if ep.default else ''} <-> {ep.router_if} "
+        f"(route {ep.ip}/{HOST_PREFIX} dev {ep.router_if})"
     )
 
 
@@ -670,6 +735,18 @@ def write_hosts(model: Model) -> None:
 
 
 # --- commands --------------------------------------------------------------
+# Phase 1 ships netns fds up to the init parent keyed BY TYPE ("router:<net>" /
+# "container:<name>") so a network and a container that happen to share a name can't
+# collide -- they live in symmetric subdirs precisely because they can. These two
+# accessors keep the prefix scheme in one place.
+
+
+def router_fd(fds: dict[str, int], net: Network) -> int:
+    return fds[f"router:{net.name}"]
+
+
+def container_fd(fds: dict[str, int], container: Container) -> int:
+    return fds[f"container:{container.name}"]
 
 
 def wire_in_podman(model: Model, runtime: ResolvedRuntime) -> dict[str, int]:
@@ -677,9 +754,10 @@ def wire_in_podman(model: Model, runtime: ResolvedRuntime) -> dict[str, int]:
     rebuild the netns clean-slate, wire each network (gateway + /32 routed veths + hosts
     files), and apply each router's dataplane (sysctls + nft) -- all the netns work,
     done from inside podman's userns where the rootless user holds CAP_SYS_ADMIN. Then
-    open and RETURN a router-netns fd per network: the netns persist by bind-mount, so
-    the fds (shipped to the init-side parent) stay valid after this child exits, for the
-    parent's phase-2 host edge.
+    open and RETURN the netns fds the init parent's phase 2 needs: a "router:<net>" fd
+    per network (for the uplink host edge), and a "container:<name>" fd per LINKED
+    container (for the link host edge -- rootless containers need none). The netns
+    persist by bind-mount, so the fds stay valid after this child exits.
 
     Clean slate: model.teardown() is the netns side; the host-edge side is cleared by
     the parent (teardown_host_edge)."""
@@ -702,18 +780,32 @@ def wire_in_podman(model: Model, runtime: ResolvedRuntime) -> dict[str, int]:
     for network in model.networks:
         if network.uplink is None:
             configure_dataplane(network)
-    return {net.name: os.open(net.netns_path, os.O_RDONLY) for net in model.networks}
+    fds = {f"router:{net.name}": os.open(net.netns_path, os.O_RDONLY) for net in model.networks}
+    fds.update(
+        {f"container:{c.name}": os.open(c.netns_path, os.O_RDONLY)
+         for c in model.containers if c.links}
+    )
+    return fds
 
 
 def teardown_host_edge(model: Model) -> None:
-    """Remove host-side uplink state in the init netns: the host veth end (which does
-    NOT die with the router netns -- its peer does, the host end persists) and the host
-    nat zone. Runs in the privileged parent, before re-wiring (up = down + build) and on
-    `down`. Idempotent -- skips an absent veth, and adds-then-deletes each nft table so
-    the delete always succeeds. A no-op without uplinks, so the rootless path never
-    touches the init netns here."""
+    """Remove host-side state in the init netns that does NOT die with the router/
+    container netns: each network's uplink host veth end + host nat zone, AND each veth
+    link's host-side end. Runs in the privileged parent, before re-wiring (up = down +
+    build) and on `down`.
+
+    The link host end is deleted by name, idempotently: its container-side peer dies
+    when the container netns is torn down, but the init-side end may survive that (as
+    the uplink host end does), so we delete it here -- and if the kernel already reaped
+    it with its peer, find_ifindex is None and we skip. Deleting either end of a veth
+    pair destroys both, which is fine: the container side is being rebuilt (up) or
+    removed (down) anyway. A no-op without uplinks AND without links, so the rootless
+    path never touches the init netns here."""
     uplinked = [(net.name, up) for net in model.networks if (up := net.uplink) is not None]
-    if not uplinked:
+    link_host_ifs = [
+        link.host_if for c in model.containers for link in c.links if link.host_if is not None
+    ]
+    if not uplinked and not link_host_ifs:
         return
     with IPRoute() as ipr:
         for _name, up in uplinked:
@@ -721,6 +813,11 @@ def teardown_host_edge(model: Model) -> None:
             if idx is not None:
                 ipr.link("del", index=idx)
                 print(f"  removed host uplink veth {up.host_if}")
+        for host_if in link_host_ifs:
+            idx = find_ifindex(ipr, host_if)
+            if idx is not None:
+                ipr.link("del", index=idx)
+                print(f"  removed link host veth {host_if}")
     for name, _up in uplinked:
         table = nft.Table("ip", f"turnip_host_{name}")
         nft.load(nft.ruleset([nft.Add(table), nft.Delete(table)]))
@@ -769,25 +866,129 @@ def host_edge_connect(network: Network, router_fd: int) -> None:
     )
 
 
+def link_connect(container: Container, link: HostLink, fd: int) -> None:
+    """Wire one container link -- a host-netdev hole into the container's netns, OUTSIDE
+    every router and its nft policy (the deliberate L2 trust escape). Runs in the
+    privileged init-side parent (phase 2): the anchor lives in the init netns where root
+    holds CAP_NET_ADMIN, and the container end is born directly in the container netns
+    via IFLA_NET_NS_FD (the cap flows down into podman's userns -- the same cross-userns
+    move the uplink veth proves, here targeting a container netns instead of a router).
+
+    This slice wires the two veth types:
+    - veth->bridge: a veth pair, container end born in the container netns, host end
+      enslaved to the named host bridge (a shared L2 segment with the host).
+    - veth->host:   the same, but the host end is left bare in the init (root) netns for
+      the operator to route to -- the point-to-point escape hatch. turnip adds NO host
+      route; what the host does with its end is the host's call.
+    macvlan/ipvlan/phys are later slices. The in-container half (address/mac/mtu/routes/
+    default) is uniform and entered by fd."""
+    spec = link.spec
+
+    def configure_iface() -> str:
+        # in-container half: address (real on-link subnet -- no /32 link-scope pin),
+        # optional mac/mtu, up, static routes, and default-via-gateway iff this link
+        # owns the container's default route.
+        with IPRoute() as r:
+            idx = ifindex(r, spec.name)
+            if spec.mac is not None:
+                r.link("set", index=idx, address=spec.mac)
+            if spec.mtu is not None:
+                r.link("set", index=idx, mtu=spec.mtu)
+            r.addr(
+                "add", index=idx,
+                address=str(spec.address.ip), prefixlen=spec.address.network.prefixlen,
+            )
+            r.link("set", index=idx, state="up")
+            for route in spec.routes:
+                r.route("add", dst=str(route), oif=idx)
+            if link.default and spec.gateway is not None:
+                r.route("add", dst="default", gateway=str(spec.gateway), oif=idx)
+        return ""
+
+    match spec:
+        case VethLink():
+            assert link.host_if is not None  # build_model derives it for veth links
+            with IPRoute() as ipr:
+                ipr.link(
+                    "add", ifname=link.host_if, kind="veth",
+                    peer={"ifname": spec.name, "net_ns_fd": fd},
+                )
+                hidx = ifindex(ipr, link.host_if)
+                if spec.bridge is not None:  # veth->bridge: enslave the host end
+                    ipr.link("set", index=hidx, master=ifindex(ipr, spec.bridge))
+                ipr.link("set", index=hidx, state="up")
+            anchor = f"bridge {spec.bridge}" if spec.bridge is not None else "host (root netns)"
+        case _:
+            raise NotImplementedError(
+                f"link type {spec.type.value!r} is not wired yet (veth only in this slice)"
+            )
+
+    run_in_netns_fd(fd, configure_iface)
+    print(
+        f"  linked {container.name}: {spec.name} {spec.address} via {anchor}"
+        f"{' (default)' if link.default else ''}"
+    )
+
+
+def _link_kind(ns: IPRoute, idx: int) -> str | None:
+    """IFLA_INFO_KIND for a link ('bridge', 'veth', 'dummy', ...) -- the kernel's own
+    type label. None for a device with no link-kind (a physical NIC carries no
+    IFLA_LINKINFO), which the borrow/own doctrine reads as 'physical'."""
+    info = ns.link("get", index=idx)[0].get_attr("IFLA_LINKINFO")
+    return info.get_attr("IFLA_INFO_KIND") if info is not None else None
+
+
+def validate_link_anchors(model: Model) -> None:
+    """Validate each link's host-side anchor in the init netns BEFORE any netns is built,
+    so a missing or wrong-kind anchor fails fast (cheap, and the alternative is a
+    confusing mid-wiring kernel error). Anchors are BORROWED -- we only check, never
+    create. This slice checks veth->bridge anchors: the named bridge exists and is
+    kind=bridge. (macvlan-parent / phys-device checks land with those types.) A no-op
+    when no container has a bridge link."""
+    veth_bridges = [
+        (c.name, link.spec.bridge)
+        for c in model.containers
+        for link in c.links
+        if isinstance(link.spec, VethLink) and link.spec.bridge is not None
+    ]
+    if not veth_bridges:
+        return
+    with IPRoute() as ipr:
+        for cname, bridge in veth_bridges:
+            idx = find_ifindex(ipr, bridge)
+            if idx is None:
+                raise ValueError(f"{cname}: link bridge {bridge!r} not found in the host netns")
+            kind = _link_kind(ipr, idx)
+            if kind != "bridge":
+                raise ValueError(
+                    f"{cname}: link anchor {bridge!r} is kind {kind!r}, not a bridge"
+                )
+
+
 def up(model: Model, runtime: ResolvedRuntime) -> None:
     """Two phases joined by the fd bridge. Phase 1 (a podman child, wire_in_podman) does
     all the netns work -- rebuild clean-slate, wire each network, apply the dataplane --
-    inside podman's userns, and ships a router-netns fd per network. Phase 2 (this
-    init-side parent) connects each network's host edge (uplink veth) over those fds; it
-    needs only CAP_NET_ADMIN (the IFLA_NET_NS_FD move) which root holds in the init
-    netns, and is a no-op for networks without an uplink. Clean slate spans both halves
-    (up = down + build): the host-edge teardown here + the netns teardown in phase 1."""
-    teardown_host_edge(model)  # parent: clear prior host state (no-op without uplinks)
-    router_fds = collect_fds_from_child(lambda: wire_in_podman(model, runtime))
+    inside podman's userns, and ships a netns fd per network (+ per linked container).
+    Phase 2 (this init-side parent) connects each network's host edge (uplink veth) and
+    each container's links over those fds; it needs only CAP_NET_ADMIN (the
+    IFLA_NET_NS_FD move) which root holds in the init netns, and is a no-op for networks
+    without an uplink / containers without links. Clean slate spans both halves (up =
+    down + build): the host-edge teardown here + the netns teardown in phase 1."""
+    teardown_host_edge(model)  # parent: clear prior host state (no-op without uplinks/links)
+    validate_link_anchors(model)  # fail fast on a bad anchor before building any netns
+    fds = collect_fds_from_child(lambda: wire_in_podman(model, runtime))
     try:
         for network in model.networks:
             if network.uplink is None:
                 continue  # fully wired (incl. dataplane) in phase 1
-            host_edge_connect(network, router_fds[network.name])  # uplink veth
+            host_edge_connect(network, router_fd(fds, network))  # uplink veth
             configure_host_nat(network)  # ip_forward + host masquerade (init netns)
-            apply_dataplane_fd(network, router_fds[network.name])  # router dataplane via fd
+            apply_dataplane_fd(network, router_fd(fds, network))  # router dataplane via fd
+        for container in model.containers:
+            for link in container.links:
+                link_connect(container, link, container_fd(fds, container))
     finally:
-        for fd in router_fds.values():
+        for fd in fds.values():
             os.close(fd)
 
 

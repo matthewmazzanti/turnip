@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 
 from turnip import main
-from turnip.config import Proto, Runtime, Turnip
+from turnip.config import Proto, Runtime, Turnip, VethLink
 
 STATE = Path("/n")
 
@@ -228,6 +228,95 @@ def test_router_if_rejects_overlong_name() -> None:
     # "vethR-" (6) + a 10+ char container overflows IFNAMSIZ (15)
     with pytest.raises(ValueError, match="IFNAMSIZ"):
         main.router_if("a-very-long-container-name")
+
+
+# --- links (milestone 5): lowering + effective default-route ownership -----
+
+
+def test_build_model_lowers_links() -> None:
+    # a veth->bridge link (default) and a veth->host link, both lowered to HostLink
+    model = _model(
+        {
+            "box": {
+                "links": [
+                    {"type": "veth", "bridge": "br-lan", "name": "eth1",
+                     "address": "192.168.1.10/24", "gateway": "192.168.1.1", "default": True},
+                    {"type": "veth", "peer": "host", "name": "eth2", "address": "10.9.0.2/30"},
+                ]
+            }
+        },
+        {},
+    )
+    br, host = model.containers[0].links
+    assert isinstance(br.spec, VethLink) and br.spec.bridge == "br-lan"
+    assert br.host_if == "vethL-box-eth1"  # host-side veth name derived from (container, link)
+    assert isinstance(host.spec, VethLink) and host.spec.peer == "host"
+    assert host.host_if == "vethL-box-eth2"
+    # the configured default lands on the bridge link, not the host link
+    assert (br.default, host.default) == (True, False)
+
+
+def test_link_sole_interface_is_implicitly_default() -> None:
+    # one link, no attachment, no explicit default => it implicitly owns the default
+    model = _model(
+        {"box": {"links": [{"type": "veth", "peer": "host", "name": "eth0",
+                            "address": "10.9.0.2/30"}]}},
+        {},
+    )
+    (link,) = model.containers[0].links
+    assert link.default is True
+
+
+def test_default_link_steals_default_from_attachment() -> None:
+    # box has an attachment AND a default link (2 interfaces); the link owns the default,
+    # so the endpoint must NOT also claim it (exactly one default route per container)
+    model = _model(
+        {"box": {"links": [{"type": "veth", "bridge": "br0", "name": "eth1",
+                            "address": "192.168.1.10/24", "default": True}]}},
+        {"lan": {"gateway": "10.0.0.1", "gateway_if": "gw0",
+                 "attach": {"box": {"ip": "10.0.0.5", "interface": "eth0"}}}},
+    )
+    assert model.networks[0].endpoints[0].default is False
+    assert model.containers[0].links[0].default is True
+
+
+def test_sole_attachment_is_implicitly_default() -> None:
+    # regression: a single-homed container with no explicit default still gets the
+    # default route (the gated connect() must still fire for it)
+    model = _model(
+        {"box": {}},
+        {"lan": {"gateway": "10.0.0.1", "gateway_if": "gw0",
+                 "attach": {"box": {"ip": "10.0.0.5", "interface": "eth0"}}}},
+    )
+    assert model.networks[0].endpoints[0].default is True
+
+
+def test_non_veth_link_has_no_host_if() -> None:
+    # macvlan/ipvlan/phys create/move a device directly -- no host-side veth name
+    model = _model(
+        {"box": {"links": [{"type": "phys", "dev": "enp3", "name": "eth0",
+                            "address": "192.168.1.20/24"}]}},
+        {},
+    )
+    assert model.containers[0].links[0].host_if is None
+
+
+def test_link_host_if_derives_and_rejects_overlong() -> None:
+    short = VethLink.model_validate(
+        {"type": "veth", "peer": "host", "name": "eth0", "address": "10.0.0.2/30"}
+    )
+    assert main.link_host_if("box", short) == "vethL-box-eth0"
+    with pytest.raises(ValueError, match="IFNAMSIZ"):
+        main.link_host_if("a-long-container", short)
+
+
+def test_fd_accessors_use_typed_prefixes() -> None:
+    # phase-1 ships fds keyed "router:<net>" / "container:<name>"; the accessors are the
+    # single place that scheme lives, so a name shared by a net and a container can't collide
+    model = _model({"box": {}}, {"lan": {"gateway": "10.0.0.1", "gateway_if": "gw0"}})
+    fds = {"router:lan": 7, "container:box": 8}
+    assert main.router_fd(fds, model.networks[0]) == 7
+    assert main.container_fd(fds, model.containers[0]) == 8
 
 
 # --- resolve_runtime: user/uid/dir resolution (sudo-aware) -----------------

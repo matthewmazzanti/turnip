@@ -19,14 +19,23 @@ designing an IR first and discovering its shape is wrong (it already was; see
   `Endpoint`), not a pure IR. `Model` owns the netns lifetime (`create`/`teardown`/
   `bound()`). `up = down() + build` (clean-slate). Flows are **directional**. State
   lives under `runtime.state_dir` (default `$XDG_RUNTIME_DIR/turnip`).
-- **Next: M4 (uplinks)** — the first *rootful* milestone. The privilege model is
-  **decided** (two sources: sudo or CAP_NET_ADMIN-as-user) and written up in
-  CONFIG-SKETCH "The uplink — and the rootful half it implies". First concrete step
-  is hardening `resolve_runtime` + proving the privileged-exec primitive in
-  isolation (see the M4 section).
+- **Done & committed (M4 — uplinks):** the rootful host edge — two-phase fork
+  (podman child ships router-netns fds → init-side root parent), host masquerade +
+  DNAT, router egress/ingress allow rules, default-deny INPUT. `resolve_runtime` is
+  privilege-aware (euid/SUDO_USER, reject root-as-target). Commits `f619819`…`94ba0f6`.
+- **In progress: M5 (links) — slice 1 landed (not yet committed).** Model refactor +
+  the two `veth` link types (`veth→bridge`, `veth→host`), VM-validated end-to-end.
+  `Container` grows lowered `links` (`HostLink` = config spec + derived effective-
+  default + host-veth name); `Endpoint` grows `default`; the default route is now
+  gated on effective ownership (configured, or sole interface). The fd-bridge ships
+  `container:<name>` fds (linked containers only) alongside `router:<net>`;
+  `link_connect` (phase-2 init parent) births the container end via `net_ns_fd`,
+  enslaves the host end to the bridge (or leaves it bare for `peer="host"`);
+  `validate_link_anchors` fails fast on a missing/wrong-kind bridge. Slice 2 =
+  `macvlan`/`ipvlan`, slice 3 = `phys` (see the M5 section).
 - **Open TODOs:** the running-container teardown guard (`# TODO` in `up`); veth
-  name truncation for multi-network; the deferred `bridge` type / `links` /
-  multi-homing (CONFIG-SKETCH).
+  name truncation for multi-network; the deferred `bridge` *network* type /
+  multi-homing (CONFIG-SKETCH); M5 slices 2–3.
 
 ## Approach
 
@@ -188,7 +197,7 @@ grows), and how it's checked.
 - *Note:* `port="any"`/icmp-in-flows raise NotImplementedError (need a second map
   shape) — deferred; the baseline carries concrete ports.
 
-### 4. uplinks — NEXT  *(rootful — host edge)*
+### 4. uplinks — DONE  *(rootful — host edge)*
 First time turnip runs privileged. **The privilege plumbing is the hard part, not
 the uplink** — see CONFIG-SKETCH "The uplink — and the rootful half it implies"
 for the full model. Summary:
@@ -215,15 +224,43 @@ for the full model. Summary:
 - **Check:** integration test — a permitted egress reaches out, an ingress DNAT
   lands; default-deny holds otherwise; re-`up` doesn't stack host nft rules.
 
-### 5. links  *(rootful — container edge)*
+### 5. links  *(rootful — container edge)*  — sliced; slice 1 DONE (uncommitted)
+Sliced for incremental landing (config models all four types already):
+**slice 1 = the model refactor + the two `veth` types; slice 2 = `macvlan`/`ipvlan`;
+slice 3 = `phys`.**
+
 - **Pass:** container-scoped host-netdev holes (`veth`/`macvlan`/`ipvlan`/`phys`),
   own-vs-borrow ownership implied by `type`, teardown by name **and** kind.
-- **Refactor:** the `Container` object grows `links` — the container scope already
-  exists (it owns the netns + hosts), so this is additive. The one-default-route
-  invariant now reads across attachments *and* links in one place.
-- **Check:** integration test — a link iface appears in the container with its
-  static address, outside every router's nft policy; `down` returns `phys`, reaps
-  virtual, never touches anchors.
+- **Refactor (slice 1, done):** the `Container` object grows lowered `links`
+  (`HostLink` = config spec + the two derived facts: effective default-route
+  ownership and, for veth, the host-side veth name). The one-default-route
+  invariant reads across attachments *and* links in one place — `build_model`
+  resolves the *effective* default (configured, OR the container's sole interface)
+  once, stored on `Endpoint.default` / `HostLink.default`, so `connect()` /
+  `link_connect()` stay dumb. The fd-bridge keys split `router:<net>` /
+  `container:<name>` (the latter only for linked containers).
+- **Slice 1 mechanism (done):** `link_connect` (phase-2 init parent) mirrors
+  `host_edge_connect` — births the container end via `net_ns_fd`, enslaves the
+  host end to the bridge (`veth→bridge`) or leaves it bare (`veth→host`; turnip
+  adds no host route — the deliberate point-to-point escape hatch). In-container
+  config (addr/mac/mtu/routes/default) entered by fd. `validate_link_anchors`
+  fails fast (init netns, before any build) on a missing/non-bridge anchor.
+  `teardown_host_edge` deletes link host veths idempotently.
+- **Check (slice 1, done — VM-validated):** link iface appears in the container
+  with its static address + correct (gated) default route, **outside every
+  router's nft policy** (zero nft refs); `veth→bridge` host end enslaved to the
+  bridge; re-`up` is clean-slate (no stacked host veths); `down` leaves the bridge
+  anchor untouched. **Empirical findings (kernel 6.18):** the cross-userns
+  `net_ns_fd` birth into a *container* netns works (same cap-flow-down as the
+  uplink); and a veth host end is **reaped with the container netns** on teardown
+  (so the explicit host-veth delete is belt-and-suspenders, kept idempotent for
+  kernels where it survives).
+- **Slices 2–3 (deferred):** `macvlan`/`ipvlan` (born-into-netns with init-resolved
+  `IFLA_LINK` parent; validate vs create-then-move; mode-kwarg fidelity; wireless-
+  parent reject) and `phys` (cross-userns move; primary-NIC reject; **kernel
+  auto-returns it to init on netns destroy — decided: no explicit `return_phys`**;
+  may need a spare VM NIC). Then the full check: `phys` returns to root, virtual is
+  reaped, anchors untouched.
 
 ## What `verify` becomes
 
