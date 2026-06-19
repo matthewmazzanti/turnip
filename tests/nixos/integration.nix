@@ -13,7 +13,7 @@
 {
   name = "turnip-integration";
 
-  nodes.machine = { ... }: {
+  nodes.machine = { pkgs, ... }: {
     imports = [ ../../nix/turnip-host.nix ];
     virtualisation.memorySize = 2048;
     virtualisation.cores = 2;
@@ -21,6 +21,22 @@
     environment.systemPackages = [ turnipEnv ];
     # Probe toolkit + scenarios, baked in (no source mount -- this is hermetic).
     environment.etc."turnip-tests".source = ../integration;
+
+    # Borrowed link anchors, provided declaratively (turnip validates, never creates):
+    # an empty host bridge (the veth->bridge segment; STP off so ports forward at once)
+    # and a dummy NIC standing in for a movable physical device (the phys move).
+    networking.bridges."br-lan".interfaces = [ ];
+    systemd.services.turnip-test-anchors = {
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network.target" ];
+      path = [ pkgs.iproute2 ];
+      serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+      script = ''
+        ip link add net-phys type dummy || true
+        ip link set net-phys up
+        ip link set br-lan up
+      '';
+    };
   };
 
   testScript = ''
@@ -41,5 +57,15 @@
     # routed network + directional flow matrix: addresses, default routes, and
     # allow/deny reachability against live listeners.
     scenario("scenario_router", "router.json")
+
+    # container links (veth->bridge / veth->host / phys): the L2 trust escape,
+    # outside every router's nft policy.
+    machine.wait_until_succeeds("ip link show net-phys")  # anchor service settled
+    scenario("scenario_links", "links.json")
+
+    # bad configs must fail fast at validate_link_anchors, before building anything.
+    with subtest("negative: anchor / validation rejects"):
+        for cfg in ["neg_badbridge.json", "neg_physprimary.json", "neg_coexist.json"]:
+            machine.fail(f"TURNIP_CONFIG=/etc/turnip-tests/configs/{cfg} turnip up")
   '';
 }

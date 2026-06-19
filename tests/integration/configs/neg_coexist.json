@@ -1,0 +1,13 @@
+{
+  "runtime": { "user": "homelab" },
+  "containers": {
+    "box": {
+      "links": [
+        { "type": "macvlan", "parent": "eth0", "name": "lan0",
+          "address": "192.168.1.10/24", "default": true },
+        { "type": "ipvlan", "parent": "eth0", "name": "lan1", "address": "192.168.1.11/24" }
+      ]
+    }
+  },
+  "networks": {}
+}

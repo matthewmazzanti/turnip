@@ -84,22 +84,40 @@ class Probe:
             self._wrap(container, argv), cwd="/tmp", text=True, capture_output=True
         )
 
-    # --- structural introspection (compared to literal, hand-authored values) ---
-
-    def addrs(self, container: str, ifname: str) -> set[str]:
-        """The set of `ip/prefixlen` IPv4 addresses on `ifname` in `container`."""
-        cp = self._run(container, ["ip", "-j", "addr", "show", "dev", ifname])
-        if cp.returncode != 0:
-            return set()
+    @staticmethod
+    def _addrs(stdout: str) -> set[str]:
+        """Parse `ip -j addr` JSON -> the set of `ip/prefixlen` IPv4 addresses."""
         out: set[str] = set()
-        for link in json.loads(cp.stdout):
+        for link in json.loads(stdout or "[]"):
             for a in link.get("addr_info", []):
                 if a.get("family") == "inet":
                     out.add(f"{a['local']}/{a['prefixlen']}")
         return out
 
+    # --- structural introspection inside a container (vs literal expectations) ---
+
+    def addrs(self, container: str, ifname: str) -> set[str]:
+        """The set of `ip/prefixlen` IPv4 addresses on `ifname` in `container`."""
+        cp = self._run(container, ["ip", "-j", "addr", "show", "dev", ifname])
+        return self._addrs(cp.stdout) if cp.returncode == 0 else set()
+
     def iface_exists(self, container: str, ifname: str) -> bool:
         return self._run(container, ["ip", "link", "show", "dev", ifname]).returncode == 0
+
+    # --- the host INIT netns (the probe's own netns; no podman-unshare) ----------
+    # For devices that live host-side: a phys device moved OUT of init (and returned on
+    # down), a veth->host host end, the uplink host end.
+
+    def init_iface_exists(self, ifname: str) -> bool:
+        return subprocess.run(
+            ["ip", "link", "show", "dev", ifname], capture_output=True
+        ).returncode == 0
+
+    def init_addrs(self, ifname: str) -> set[str]:
+        cp = subprocess.run(
+            ["ip", "-j", "addr", "show", "dev", ifname], text=True, capture_output=True
+        )
+        return self._addrs(cp.stdout) if cp.returncode == 0 else set()
 
     def has_default_via(self, container: str, gateway: str) -> bool:
         """True if `container` has a default route via `gateway`."""
