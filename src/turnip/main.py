@@ -47,7 +47,9 @@ from pyroute2 import NetNS
 from . import nftlib as nft
 from .config import HOST_PREFIX, Flow, NetworkType, Proto, ResolvedRuntime, Runtime, Turnip
 from .netns import (
+    collect_fds_from_child,
     create_netns,
+    enter_podman,
     ifindex,
     in_podman_context,
     remove_netns,
@@ -108,6 +110,7 @@ def resolve_runtime(rt: Runtime) -> ResolvedRuntime:
         user=user,
         uid=pw.pw_uid,
         gid=pw.pw_gid,
+        home=Path(pw.pw_dir),
         state_dir=rt.state_dir or Path(f"/run/user/{pw.pw_uid}") / "turnip",
         nft=rt.nft,
         podman=rt.podman,
@@ -428,10 +431,16 @@ def build_nft(network: Network) -> nft.Ruleset:
 
 
 def configure_dataplane(network: Network) -> None:
-    """One forked hop into a router netns: write its sysctls, then load its nft
-    table. Both need the fabric veths to already exist (per-veth conf.* dirs, and
-    rp_filter's reverse-path lookup), so `up` calls this after all wiring. Uses the
-    netns_path (a forked setns hop), so it runs after the bind sockets are closed."""
+    """Write a router netns's sysctls + load its nft table, run from WITHIN podman's
+    userns (phase 1) via a forked setns-by-path hop. This stays in phase 1 -- not the
+    init-side parent -- because entering a netns (setns CLONE_NEWNET) needs CAP_SYS_ADMIN
+    in the CALLER's own userns: the rootless user has it only inside podman's userns
+    (owner-match grants caps in the TARGET userns, not the caller's). Both ops need the
+    veths to already exist, so it runs after all wiring.
+
+    (When uplink nft lands, the uplink-dependent rules -- which need the uplink veth,
+    created host-side in phase 2 -- get re-applied by the ROOT parent over the fd; root
+    *does* hold CAP_SYS_ADMIN in the init userns. That split is rootful-only.)"""
     sysctls = router_sysctls(network)
     rules = build_nft(network)
 
@@ -495,25 +504,21 @@ def write_hosts(model: Model) -> None:
 # --- commands --------------------------------------------------------------
 
 
-def up(model: Model) -> None:
-    """(Re)create the netns the config implies, wire each network (gateway + a /32
-    routed veth per endpoint), then apply each router's dataplane (sysctls + the
-    nft flow matrix).
+def wire_in_podman(model: Model, runtime: ResolvedRuntime) -> dict[str, int]:
+    """Phase 1, run in a forked child: become the rootless user, enter podman's ns,
+    rebuild the netns clean-slate, wire each network (gateway + /32 routed veths + hosts
+    files), and apply each router's dataplane (sysctls + nft) -- all the netns work,
+    done from inside podman's userns where the rootless user holds CAP_SYS_ADMIN. Then
+    open and RETURN a router-netns fd per network: the netns persist by bind-mount, so
+    the fds (shipped to the init-side parent) stay valid after this child exits, for the
+    parent's phase-2 host edge.
 
-    Clean slate: tear everything down first (up = down() + build), so `up` always
-    converges to the current config and shares ONE teardown path with the `down`
-    command -- which grows host-side rootful state in milestone 4 that up's
-    clean-slate must also clear.
-
-    Order: wire ALL networks first, then the dataplane pass -- the per-veth sysctls
-    (proxy_arp/rp_filter) and rp_filter's reverse-path lookup need the veths to
-    exist, and the dataplane runs via a forked setns hop (run_in_netns), so it goes
-    after the bind sockets are closed (the `with model.bound()` block)."""
+    Clean slate: model.teardown() is the netns side; the host-edge side is cleared by
+    the parent (teardown_host_edge)."""
+    enter_podman(runtime)
     # TODO: refuse when a running container is attached to a target netns -- the
-    #       teardown below would orphan it (it keeps the old ns while a fresh one
-    #       takes the path). For now assume containers are down (the systemd unit
-    #       orders them before this).
-    model.teardown()  # clean slate
+    #       teardown below would orphan it. For now assume containers are down.
+    model.teardown()  # clean slate (netns side)
     model.create()
     write_hosts(model)  # per-container hosts files (config-derived; dirs now exist)
     with model.bound():  # open + bind a netns socket per node, closed on exit
@@ -523,14 +528,47 @@ def up(model: Model) -> None:
             create_gateway(network)
             for ep in network.endpoints:
                 connect(network, ep)
-
-    # sockets closed; now the in-netns dataplane (sysctls + nft) per router netns
+    # sockets closed; dataplane (sysctls + nft) per router, still inside podman's userns
     for network in model.networks:
         configure_dataplane(network)
+    return {net.name: os.open(net.netns_path, os.O_RDONLY) for net in model.networks}
 
 
-def down(model: Model) -> None:
-    model.teardown()
+def teardown_host_edge(model: Model) -> None:
+    """Remove host-side rootful state (uplink host veths, host nft) in the init netns.
+    A no-op until uplinks land (step D) -- there is no host state yet."""
+    # uplinks not lowered onto the model yet; nothing host-side to tear down.
+
+
+def host_edge_connect(network: Network, router_fd: int) -> None:
+    """Wire a network's uplink veth across the init<->router boundary -- the host edge.
+    A no-op until the uplink lands (step D)."""
+    # network has no uplink yet; nothing to connect.
+
+
+def up(model: Model, runtime: ResolvedRuntime) -> None:
+    """Two phases joined by the fd bridge. Phase 1 (a podman child, wire_in_podman) does
+    all the netns work -- rebuild clean-slate, wire each network, apply the dataplane --
+    inside podman's userns, and ships a router-netns fd per network. Phase 2 (this
+    init-side parent) connects each network's host edge (uplink veth) over those fds; it
+    needs only CAP_NET_ADMIN (the IFLA_NET_NS_FD move) which root holds in the init
+    netns, and is a no-op for networks without an uplink. Clean slate spans both halves
+    (up = down + build): the host-edge teardown here + the netns teardown in phase 1."""
+    teardown_host_edge(model)  # parent: clear prior host state (no-op until uplinks)
+    router_fds = collect_fds_from_child(lambda: wire_in_podman(model, runtime))
+    try:
+        for network in model.networks:
+            host_edge_connect(network, router_fds[network.name])
+    finally:
+        for fd in router_fds.values():
+            os.close(fd)
+
+
+def down(model: Model, runtime: ResolvedRuntime) -> None:
+    """Tear down both halves: host-edge state in the init parent, then the netns in a
+    podman child (which reaps everything inside -- veths, routes, nft)."""
+    teardown_host_edge(model)
+    in_podman_context(runtime, model.teardown)
 
 
 def main() -> None:
@@ -539,18 +577,17 @@ def main() -> None:
     if fn is None:
         sys.exit(f"usage: {sys.argv[0]} {{up|down}}")
 
-    # Resolve everything env-dependent in the PARENT (env + passwd db intact), build
-    # the runtime model, then run the command inside podman's namespaces, closing
-    # over it -- the forked child inherits the closure, no module global needed.
+    # Resolve everything env-dependent here in the PARENT (env + passwd db intact),
+    # build the runtime model, then run the command -- which forks into podman for the
+    # netns work and does the host edge here in the init netns.
     turnip = load_config()
     runtime = resolve_runtime(turnip.runtime)
-    # The host edge (any uplink/links) needs the init netns -> privilege. For now
-    # that means sudo; CAP_NET_ADMIN-as-user is deferred (todo.md). The two-phase
-    # rootful execution lands in a later step -- this is just the gate.
+    # The host edge (any uplink/links) needs the init netns -> privilege. For now that
+    # means sudo; CAP_NET_ADMIN-as-user is deferred (todo.md).
     if turnip.requires_root and os.geteuid() != 0:
         sys.exit("config needs the host edge (uplink/links) -- run via sudo")
     model = build_model(turnip, runtime.state_dir)
-    in_podman_context(lambda: fn(model))
+    fn(model, runtime)
 
 
 if __name__ == "__main__":

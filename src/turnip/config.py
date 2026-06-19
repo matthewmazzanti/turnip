@@ -130,6 +130,7 @@ class ResolvedRuntime(_Model):
     user: str
     uid: int
     gid: int
+    home: Path  # the target user's home -- podman needs $HOME after a root->user drop
     state_dir: Path
     nft: Path | None = None
     podman: Path | None = None

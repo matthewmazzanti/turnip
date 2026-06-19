@@ -98,6 +98,8 @@ from collections.abc import Callable
 
 from pyroute2 import NetNS, netns
 
+from .config import ResolvedRuntime
+
 # This module holds no netns-root state: every helper takes a full path that
 # `main` builds from the resolved `runtime.state_dir` (so the env read stays in the
 # shell). Paths may carry a subdir -- routers/<net>, containers/<container>.
@@ -106,16 +108,15 @@ from pyroute2 import NetNS, netns
 # --- entering podman's rootless namespaces ---------------------------------
 
 
-def _pause_pid() -> int:
+def _pause_pid(runtime_dir: str) -> int:
     """PID of podman's rootless pause process (holds the user+mount ns alive).
 
-    Read from $XDG_RUNTIME_DIR/libpod/tmp/pause.pid; if the file is missing or
-    names a dead process, bootstrap one with `podman unshare true` (a no-op that
-    spawns the pause process) and re-read. Runs in the PARENT, where the env and
-    PATH are intact, so `podman` resolves.
+    Read from <runtime_dir>/libpod/tmp/pause.pid; if missing or naming a dead
+    process, bootstrap one with `podman unshare true` and re-read. `runtime_dir` is
+    the TARGET user's runtime dir (passed in, not read from the env), so it's correct
+    after a root->user drop under sudo, where $XDG_RUNTIME_DIR would still be root's.
     """
-    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-    path = os.path.join(runtime, "libpod", "tmp", "pause.pid")
+    path = os.path.join(runtime_dir, "libpod", "tmp", "pause.pid")
 
     def read() -> int:
         with open(path) as f:
@@ -125,35 +126,50 @@ def _pause_pid() -> int:
         pid = read()
         if os.path.exists(f"/proc/{pid}"):
             return pid
-    except OSError, ValueError:
+    except (OSError, ValueError):
         pass
     subprocess.run(["podman", "unshare", "true"], check=True)
     return read()
 
 
-def in_podman_context(fn: Callable[[], None]) -> None:
-    """Run `fn` inside podman's rootless user + mount namespaces.
+def enter_podman(runtime: ResolvedRuntime) -> None:
+    """Become the rootless user (iff we started as root) and enter podman's user +
+    mount ns by owner-match. Call inside a freshly-forked, single-threaded child.
 
-    Forks a single-threaded child and os.setns()es into the pause process's user
-    ns (we own it -> full caps, mapped to uid 0) then its mount ns (so the
-    persistent $HOME/netns/* bind-mounts are visible). The child runs `fn` -- the
-    whole up/verify/down body -- in that context; deeper hops into individual
-    netns (for sysctls/nft) are nested forks from there (see run_in_netns).
+    The drop is root-only: you can only drop *to* a user from root, and as the user
+    the launcher already did it (initgroups would need the CAP_SETGID we lack). After
+    the drop euid == the podman-userns owner, so the setns joins are permitted and
+    inside we map to container-uid-0. Env (XDG_RUNTIME_DIR/HOME) is corrected to the
+    target user so `podman` + the libpod paths resolve (under sudo they'd be root's).
 
-    The child inherits stdout, so `fn`'s prints reach the terminal directly -- we
-    just flush before os._exit (which skips buffer flushing). A non-zero child
-    exit propagates as this process's failure.
-    """
-    pid = _pause_pid()
-    user_fd = os.open(f"/proc/{pid}/ns/user", os.O_RDONLY)
-    mnt_fd = os.open(f"/proc/{pid}/ns/mnt", os.O_RDONLY)
+    (Capability-based privilege -- staying an unprivileged user holding CAP_NET_ADMIN
+    rather than dropping from root -- is deferred; see todo.md.)"""
+    if os.geteuid() == 0:
+        os.setresgid(runtime.gid, runtime.gid, runtime.gid)
+        os.initgroups(runtime.user, runtime.gid)
+        os.setresuid(runtime.uid, runtime.uid, runtime.uid)
+    runtime_dir = f"/run/user/{runtime.uid}"
+    os.environ["XDG_RUNTIME_DIR"] = runtime_dir
+    os.environ["HOME"] = str(runtime.home)
+    pid = _pause_pid(runtime_dir)
+    os.setns(os.open(f"/proc/{pid}/ns/user", os.O_RDONLY), os.CLONE_NEWUSER)
+    os.setns(os.open(f"/proc/{pid}/ns/mnt", os.O_RDONLY), os.CLONE_NEWNS)
 
+
+def in_podman_context(runtime: ResolvedRuntime, fn: Callable[[], None]) -> None:
+    """Fork a single-threaded child that becomes the rootless user, enters podman's
+    user+mount ns (enter_podman), and runs `fn()` there -- for side-effecting work
+    that returns nothing (e.g. `down`'s netns teardown). Work that must hand fds back
+    to the init-side parent uses collect_fds_from_child with a produce_fds that calls
+    enter_podman.
+
+    The child inherits stdout, so `fn`'s prints reach the terminal; we flush before
+    os._exit (which skips buffering). A non-zero child exit fails this process."""
     child = os.fork()
     if child == 0:
         code = 0
         try:
-            os.setns(user_fd, os.CLONE_NEWUSER)
-            os.setns(mnt_fd, os.CLONE_NEWNS)
+            enter_podman(runtime)
             fn()
         except SystemExit as e:
             code = e.code if isinstance(e.code, int) else 1
@@ -312,25 +328,18 @@ def set_lo_up(ns: NetNS) -> None:
 # --- executing inside a netns (sysctls + nft) ------------------------------
 
 
-def run_in_netns(ns_path: str, fn: Callable[[], str]) -> str:
-    """Run `fn` inside the netns at `ns_path`; return whatever it prints back.
-
-    Forks (from within the podman context we're already in), os.setns(
-    CLONE_NEWNET) into the target netns, runs fn(), and pipes fn's returned
-    string back. Used for the two things pyroute2 can't do over its socket:
-    writing /proc/sys (per-netns) and loading nft (per-netns). Only the NET hop
-    is needed -- we already hold podman's user+mount ns.
-
-    Forking keeps the caller's netns and its open pyroute2 sockets untouched.
-    CLONE_NEWNET has no single-thread restriction. A non-zero child exit raises.
-    """
+def _run_entered(enter: Callable[[], None], fn: Callable[[], str]) -> str:
+    """Fork, run `enter()` (which os.setns(CLONE_NEWNET)es into the target netns),
+    then `fn()`, piping fn's returned string back. Forking keeps the caller's netns
+    and its open pyroute2 sockets untouched; CLONE_NEWNET has no single-thread
+    restriction. A non-zero child exit raises. Used for the two things pyroute2 can't
+    do over its socket: writing /proc/sys and loading nft (both per-netns)."""
     r, w = os.pipe()
     child = os.fork()
     if child == 0:
         os.close(r)
         try:
-            ns_fd = os.open(ns_path, os.O_RDONLY)
-            os.setns(ns_fd, os.CLONE_NEWNET)
+            enter()
             os.write(w, fn().encode())
             os._exit(0)
         except Exception:
@@ -343,8 +352,21 @@ def run_in_netns(ns_path: str, fn: Callable[[], str]) -> str:
     os.close(r)
     _, status = os.waitpid(child, 0)
     if not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0):
-        raise RuntimeError(f"in-netns step failed in {ns_path} (see child output)")
+        raise RuntimeError("in-netns step failed (see child output)")
     return out.decode()
+
+
+def run_in_netns(ns_path: str, fn: Callable[[], str]) -> str:
+    """Run `fn` inside the netns at `ns_path` (opened by path -- caller is in the
+    podman mount ns where the bind-mount is visible). Returns fn's printed string."""
+    return _run_entered(lambda: os.setns(os.open(ns_path, os.O_RDONLY), os.CLONE_NEWNET), fn)
+
+
+def run_in_netns_fd(ns_fd: int, fn: Callable[[], str]) -> str:
+    """Run `fn` inside the netns referred to by `ns_fd` -- the init-side parent holds
+    router-netns fds passed up from the podman child and can't see the bind-mount
+    path, so it enters by fd (permitted via owner-match / cap-flow-down)."""
+    return _run_entered(lambda: os.setns(ns_fd, os.CLONE_NEWNET), fn)
 
 
 def write_sysctls(settings: dict[str, str]) -> None:
