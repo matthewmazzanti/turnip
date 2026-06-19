@@ -54,8 +54,13 @@ if ! podman unshare sh -c "[ -e '$NSPATH' ] && mountpoint -q '$NSPATH'"; then
   exit 1
 fi
 
+# Interactive (-it) for a shell, but NOT when a command was given (so it's scriptable,
+# e.g. the integration test's `-- <cmd>` runs with no tty).
+TTY=(-it)
+if [[ ${#CMD[@]} -gt 0 ]]; then TTY=(); fi
+
 set -x
-exec podman run --rm -it \
+exec podman run --rm "${TTY[@]}" \
   --network "ns:$NSPATH" \
   -v "$HOSTS:/etc/hosts:ro" \
   --cap-add=net_raw \

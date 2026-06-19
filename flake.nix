@@ -82,6 +82,12 @@
       checks = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          # a tiny "connect to argv[1]:argv[2], exit 0/1" baked into the test image.
+          tconnect = pkgs.writeScriptBin "tconnect" ''
+            #!${pkgs.python3Minimal}/bin/python3
+            import socket, sys
+            socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3).close()
+          '';
         in
         {
           integration = pkgs.testers.runNixOSTest (import ./tests/nixos/integration.nix {
@@ -91,6 +97,18 @@
           integration-uplink = pkgs.testers.runNixOSTest (import ./tests/nixos/uplink.nix {
             inherit lib;
             turnipEnv = self.packages.${system}.turnip;
+          });
+          integration-podman = pkgs.testers.runNixOSTest (import ./tests/nixos/podman.nix {
+            inherit lib;
+            turnipEnv = self.packages.${system}.turnip;
+            # a registry-free OCI image (python3 only) + a tiny connect-by-host:port
+            # script inside it, referenced by absolute path to dodge shell quoting.
+            image = pkgs.dockerTools.buildLayeredImage {
+              name = "turnip-test";
+              tag = "latest";
+              contents = [ pkgs.python3Minimal tconnect ];
+            };
+            tconnect = "${tconnect}/bin/tconnect";
           });
         });
 
