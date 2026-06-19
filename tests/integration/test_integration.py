@@ -138,29 +138,33 @@ def test_linklan() -> None:
         assert p.connects("iv", "192.168.2.2", 8888), "ipvlan child -> world over the LAN"
 
 
-# configs whose `turnip up` must FAIL at validate_link_anchors, before building anything.
+# each of these must FAIL at validate_link_anchors, before any netns is built. _box wraps
+# the bad link(s) in a one-container config so each test shows just what's wrong.
 def _box(*links: dict[str, object]) -> dict[str, object]:
     return {"containers": {"box": {"links": list(links)}}, "networks": {}}
 
 
-_REJECTED = {
-    "badbridge": _box(
+def test_reject_missing_bridge() -> None:
+    # veth->bridge onto an anchor that doesn't exist.
+    assert turnip_attempt(_box(
         {"type": "veth", "bridge": "does-not-exist", "name": "eth0", "address": "192.168.50.10/24"},
-    ),
-    "phys_primary": _box(
+    )) != 0
+
+
+def test_reject_phys_on_primary_nic() -> None:
+    # phys on the host's default-route NIC -- would sever the host.
+    assert turnip_attempt(_box(
         {"type": "phys", "dev": "eth0", "name": "eth9", "address": "10.0.0.9/24"},
-    ),
-    "macvlan_ipvlan_share_parent": _box(
+    )) != 0
+
+
+def test_reject_macvlan_ipvlan_share_parent() -> None:
+    # a device is a macvlan master XOR an ipvlan master -- can't be both.
+    assert turnip_attempt(_box(
         {"type": "macvlan", "parent": "eth0", "name": "lan0",
          "address": "192.168.1.10/24", "default": True},
         {"type": "ipvlan", "parent": "eth0", "name": "lan1", "address": "192.168.1.11/24"},
-    ),
-}
-
-
-@pytest.mark.parametrize("config", _REJECTED.values(), ids=_REJECTED.keys())
-def test_config_rejected(config) -> None:
-    assert turnip_attempt(config) != 0
+    )) != 0
 
 
 def test_podman_attach() -> None:
