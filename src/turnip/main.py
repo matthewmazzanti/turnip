@@ -435,9 +435,13 @@ def build_nft(network: Network) -> nft.Ruleset:
     forward chain (policy drop) accepts: established/related (the conntrack return path
     -- so flows are one-way in the map); drops invalid; then for new conns the
     service-scoped intra-network flows (allowed_flows; `th dport` covers tcp AND udp)
-    and the host-edge egress/ingress allows. Else policy drop. (Container<->gateway
-    traffic targets the router's OWN address -- INPUT/OUTPUT, not the forward chain --
-    so it isn't gated here; with no INPUT base chain it defaults to accept.)"""
+    and the host-edge egress/ingress allows. Else policy drop.
+
+    A second base chain, INPUT (policy drop), locks down the router's OWN address (the
+    gateway + the uplink end -- container<->gateway traffic is INPUT/OUTPUT, not
+    forwarded): it accepts loopback, the conntrack return, and icmp (the gateway ping),
+    dropping tcp/udp so no router-local service is exposed without a deliberate allow.
+    OUTPUT stays default-accept -- the router originates nothing untrusted."""
     ip = {ep.container.name: ep.ip for ep in network.endpoints}
 
     # allowed_flows: one entry per flow, DIRECTIONAL -- `from` may initiate to
@@ -498,7 +502,9 @@ def build_nft(network: Network) -> nft.Ruleset:
         [
             *table.reload(),
             table.chain("forward", type="filter", hook="forward", prio=0, policy="drop"),
+            table.chain("input", type="filter", hook="input", prio=0, policy="drop"),
             table.verdict_map("allowed_flows", FLOW_KEY, flow_elem),
+            # forward: the intra-network flow matrix + the host-edge egress/ingress allows
             table.rule("forward", nft.ct_state("established", "related"), nft.accept()),
             table.rule("forward", nft.ct_state("invalid"), nft.drop()),
             table.rule(
@@ -510,6 +516,13 @@ def build_nft(network: Network) -> nft.Ruleset:
                 ),
             ),
             *edge_rules,
+            # input: the router's OWN address (gateway, uplink end) is default-deny.
+            # Accept loopback, the conntrack return path, and icmp (the gateway ping +
+            # /31 diagnostics); tcp/udp fall to the policy drop, so no router-local
+            # service is reachable from containers without a deliberate allow.
+            table.rule("input", nft.match(nft.meta("iifname"), "lo"), nft.accept()),
+            table.rule("input", nft.ct_state("established", "related"), nft.accept()),
+            table.rule("input", nft.match(nft.meta("l4proto"), "icmp"), nft.accept()),
         ]
     )
 
