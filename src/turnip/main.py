@@ -75,24 +75,40 @@ def load_config() -> Turnip:
 
 
 def resolve_runtime(rt: Runtime) -> ResolvedRuntime:
-    """Fill in `Runtime`'s environment-dependent defaults from the env + passwd db.
+    """Fill in `Runtime`'s environment-dependent defaults, resolved by the TARGET
+    user so it stays correct under sudo.
 
-    User: explicit `runtime.user`, else `$SUDO_USER`, else the current login user
-    -- the rootless baseline runs *as* the user (no sudo, $SUDO_USER unset), so the
-    current-user fallback makes a plain `turnip up` work; an explicit `user`
-    decouples ownership from the invoker. state_dir defaults to
-    `$XDG_RUNTIME_DIR/turnip` (fallback `/run/user/<uid>/turnip`) -- the user's
-    runtime tmpfs, where rootless runtime state belongs (the netns can't outlive a
-    reboot anyway, and hosts files are regenerated each `up`).
-    (The privileged path -- milestone 4 -- will require an explicit user.)"""
-    user = rt.user or os.environ.get("SUDO_USER") or pwd.getpwuid(os.getuid()).pw_name
+    User: explicit `runtime.user`, else `$SUDO_USER`, else -- ONLY when unprivileged
+    -- the current login user. Running privileged (euid 0, i.e. under sudo) the
+    current user is root, which is never the rootless-podman owner, so we refuse the
+    current-user fallback: an explicit `runtime.user`/`$SUDO_USER` is required, and it
+    must be non-root. (Capability-based privilege -- running as the user with
+    CAP_NET_ADMIN instead of root -- is deferred; see todo.md. For now privileged
+    means euid 0.)
+
+    Dirs follow the target UID (`/run/user/<uid>/turnip`), NOT `$XDG_RUNTIME_DIR`,
+    which under sudo is root's; for the rootless user the two coincide. The netns
+    can't outlive a reboot and hosts files are regenerated each `up`, so the user's
+    runtime tmpfs is the right home."""
+    if os.geteuid() == 0:
+        user = rt.user or os.environ.get("SUDO_USER")
+        if not user:
+            raise ValueError(
+                "running as root: set runtime.user (the rootless-podman owner), "
+                "or invoke via sudo so $SUDO_USER is set"
+            )
+    else:
+        user = rt.user or os.environ.get("SUDO_USER") or pwd.getpwuid(os.getuid()).pw_name
     pw = pwd.getpwnam(user)  # raises KeyError for an unknown user -- fail closed
-    runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{pw.pw_uid}"
+    if pw.pw_uid == 0:
+        raise ValueError(
+            f"runtime.user {user!r} resolves to root; it must be the unprivileged owner"
+        )
     return ResolvedRuntime(
         user=user,
         uid=pw.pw_uid,
         gid=pw.pw_gid,
-        state_dir=rt.state_dir or Path(runtime_dir) / "turnip",
+        state_dir=rt.state_dir or Path(f"/run/user/{pw.pw_uid}") / "turnip",
         nft=rt.nft,
         podman=rt.podman,
     )
@@ -528,6 +544,11 @@ def main() -> None:
     # over it -- the forked child inherits the closure, no module global needed.
     turnip = load_config()
     runtime = resolve_runtime(turnip.runtime)
+    # The host edge (any uplink/links) needs the init netns -> privilege. For now
+    # that means sudo; CAP_NET_ADMIN-as-user is deferred (todo.md). The two-phase
+    # rootful execution lands in a later step -- this is just the gate.
+    if turnip.requires_root and os.geteuid() != 0:
+        sys.exit("config needs the host edge (uplink/links) -- run via sudo")
     model = build_model(turnip, runtime.state_dir)
     in_podman_context(lambda: fn(model))
 
