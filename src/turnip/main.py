@@ -37,6 +37,7 @@ import contextlib
 import json
 import os
 import pwd
+import socket
 import sys
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
@@ -52,8 +53,12 @@ from .config import (
     Egress,
     Flow,
     IngressRule,
+    IpvlanLink,
+    IpvlanMode,
     Link,
+    MacvlanLink,
     NetworkType,
+    PhysLink,
     Proto,
     ResolvedRuntime,
     Runtime,
@@ -866,6 +871,11 @@ def host_edge_connect(network: Network, router_fd: int) -> None:
     )
 
 
+# IFLA_IPVLAN_MODE numeric values (linux/if_link.h). pyroute2 has a name map for
+# macvlan modes but not ipvlan's, so we resolve ipvlan's ourselves.
+_IPVLAN_MODE = {IpvlanMode.L2: 0, IpvlanMode.L3: 1, IpvlanMode.L3S: 2}
+
+
 def link_connect(container: Container, link: HostLink, fd: int) -> None:
     """Wire one container link -- a host-netdev hole into the container's netns, OUTSIDE
     every router and its nft policy (the deliberate L2 trust escape). Runs in the
@@ -874,22 +884,35 @@ def link_connect(container: Container, link: HostLink, fd: int) -> None:
     via IFLA_NET_NS_FD (the cap flows down into podman's userns -- the same cross-userns
     move the uplink veth proves, here targeting a container netns instead of a router).
 
-    This slice wires the two veth types:
+    The host-side (init-netns) half differs by ownership -- own (create) vs borrow
+    (move) -- implied by `type`:
     - veth->bridge: a veth pair, container end born in the container netns, host end
       enslaved to the named host bridge (a shared L2 segment with the host).
     - veth->host:   the same, but the host end is left bare in the init (root) netns for
       the operator to route to -- the point-to-point escape hatch. turnip adds NO host
       route; what the host does with its end is the host's call.
-    macvlan/ipvlan/phys are later slices. The in-container half (address/mac/mtu/routes/
-    default) is uniform and entered by fd."""
+    - macvlan/ipvlan: born directly into the container netns off the host `parent` --
+      `link=` (IFLA_LINK) resolves the parent in the INIT netns while `net_ns_fd` places
+      the new device in the container netns (one shot, so the device never appears named
+      in init). OWNED (virtual): reaped with the netns.
+    - phys: the existing host device is MOVED into the container netns (set net_ns_fd on
+      it). BORROWED: it returns to init when the netns is destroyed (kernel
+      default_device_exit), so there is no teardown code -- and it arrives named after
+      the host `dev`, so configure_iface renames it to the configured `name` first.
+
+    The in-container half (rename-if-needed, address/mac/mtu/routes/default) is uniform
+    and entered by fd."""
     spec = link.spec
+    entry_name = spec.name  # the device's name on entry; phys keeps its host name (below)
 
     def configure_iface() -> str:
         # in-container half: address (real on-link subnet -- no /32 link-scope pin),
         # optional mac/mtu, up, static routes, and default-via-gateway iff this link
         # owns the container's default route.
         with IPRoute() as r:
-            idx = ifindex(r, spec.name)
+            idx = ifindex(r, entry_name)
+            if entry_name != spec.name:  # phys: arrives named after its host dev; rename
+                r.link("set", index=idx, ifname=spec.name)  # (down post-move, so rename is ok)
             if spec.mac is not None:
                 r.link("set", index=idx, address=spec.mac)
             if spec.mtu is not None:
@@ -918,10 +941,31 @@ def link_connect(container: Container, link: HostLink, fd: int) -> None:
                     ipr.link("set", index=hidx, master=ifindex(ipr, spec.bridge))
                 ipr.link("set", index=hidx, state="up")
             anchor = f"bridge {spec.bridge}" if spec.bridge is not None else "host (root netns)"
-        case _:
-            raise NotImplementedError(
-                f"link type {spec.type.value!r} is not wired yet (veth only in this slice)"
-            )
+        case MacvlanLink():
+            with IPRoute() as ipr:
+                ipr.link(
+                    "add", ifname=spec.name, kind="macvlan",
+                    link=ifindex(ipr, spec.parent),  # parent resolved in INIT netns
+                    macvlan_mode=spec.mode.value,
+                    net_ns_fd=fd,  # ... born into the container netns
+                )
+            anchor = f"macvlan on {spec.parent} ({spec.mode.value})"
+        case IpvlanLink():
+            with IPRoute() as ipr:
+                ipr.link(
+                    "add", ifname=spec.name, kind="ipvlan",
+                    link=ifindex(ipr, spec.parent),
+                    # pyroute2 maps macvlan mode NAMES but not ipvlan's, so IFLA_IPVLAN_MODE
+                    # must be the numeric value (linux/if_link.h: l2=0, l3=1, l3s=2).
+                    ipvlan_mode=_IPVLAN_MODE[spec.mode],
+                    net_ns_fd=fd,
+                )
+            anchor = f"ipvlan on {spec.parent} ({spec.mode.value})"
+        case PhysLink():
+            entry_name = spec.dev  # moved in under its host name; configure_iface renames
+            with IPRoute() as ipr:
+                ipr.link("set", index=ifindex(ipr, spec.dev), net_ns_fd=fd)
+            anchor = f"phys {spec.dev}"
 
     run_in_netns_fd(fd, configure_iface)
     print(
@@ -938,30 +982,80 @@ def _link_kind(ns: IPRoute, idx: int) -> str | None:
     return info.get_attr("IFLA_INFO_KIND") if info is not None else None
 
 
+def _is_wireless(ifname: str) -> bool:
+    """True if `ifname` is a wireless netdev (it exposes /sys/class/net/<if>/wireless).
+    macvlan can't bridge onto a wireless parent -- the AP drops the extra MACs -- so the
+    doctrine rejects it and points at ipvlan (single MAC) instead."""
+    return os.path.exists(f"/sys/class/net/{ifname}/wireless")
+
+
+def _default_route_oifs(ns: IPRoute) -> set[int]:
+    """Oifs carrying an IPv4 default route in `ns` -- the host's primary NIC(s). Used to
+    refuse moving the host's own uplink into a container (which would sever the host)."""
+    return {
+        oif
+        for r in ns.route("dump", family=socket.AF_INET)
+        if r["dst_len"] == 0 and (oif := r.get_attr("RTA_OIF")) is not None
+    }
+
+
 def validate_link_anchors(model: Model) -> None:
     """Validate each link's host-side anchor in the init netns BEFORE any netns is built,
-    so a missing or wrong-kind anchor fails fast (cheap, and the alternative is a
-    confusing mid-wiring kernel error). Anchors are BORROWED -- we only check, never
-    create. This slice checks veth->bridge anchors: the named bridge exists and is
-    kind=bridge. (macvlan-parent / phys-device checks land with those types.) A no-op
-    when no container has a bridge link."""
-    veth_bridges = [
-        (c.name, link.spec.bridge)
-        for c in model.containers
-        for link in c.links
-        if isinstance(link.spec, VethLink) and link.spec.bridge is not None
-    ]
-    if not veth_bridges:
+    so a bad anchor fails fast (cheap, and the alternative is a confusing mid-wiring
+    kernel error). Anchors are BORROWED -- we only check, never create. Per type:
+    - veth->bridge: the named bridge exists and is kind=bridge.
+    - veth->host:   no anchor (the root netns is always present).
+    - macvlan/ipvlan: the `parent` exists; a macvlan parent must not be wireless.
+    - phys: the `dev` exists and is NOT the host's primary (default-route) NIC -- moving
+      that into a container would sever the host.
+    A no-op when no container has links."""
+    specs = [(c.name, link.spec) for c in model.containers for link in c.links]
+    if not specs:
         return
+    # macvlan and ipvlan cannot share a parent (kernel: a device is a macvlan master XOR
+    # an ipvlan master) -- catch it as a clear error, not a raw EBUSY mid-wiring.
+    flavor: dict[str, str] = {}
+    for _cname, spec in specs:
+        if isinstance(spec, MacvlanLink | IpvlanLink):
+            if (prev := flavor.setdefault(spec.parent, spec.type.value)) != spec.type.value:
+                raise ValueError(
+                    f"parent {spec.parent!r}: macvlan and ipvlan cannot share a parent device "
+                    f"({prev} vs {spec.type.value})"
+                )
     with IPRoute() as ipr:
-        for cname, bridge in veth_bridges:
+        default_oifs = _default_route_oifs(ipr)
+        for cname, spec in specs:
+            _validate_anchor(ipr, cname, spec, default_oifs)
+
+
+def _validate_anchor(ipr: IPRoute, cname: str, spec: Link, default_oifs: set[int]) -> None:
+    """Anchor check for one link (init netns); see validate_link_anchors. Borrowed
+    anchors are validated, never created -- a bad one raises here, before any build."""
+    match spec:
+        case VethLink(bridge=str(bridge)):
             idx = find_ifindex(ipr, bridge)
             if idx is None:
-                raise ValueError(f"{cname}: link bridge {bridge!r} not found in the host netns")
-            kind = _link_kind(ipr, idx)
-            if kind != "bridge":
+                raise ValueError(f"{cname}: link bridge {bridge!r} not found in host netns")
+            if (kind := _link_kind(ipr, idx)) != "bridge":
+                raise ValueError(f"{cname}: link anchor {bridge!r} is kind {kind!r}, not a bridge")
+        case VethLink():  # peer="host" -- the root netns, always present
+            pass
+        case MacvlanLink(parent=parent):
+            if find_ifindex(ipr, parent) is None:
+                raise ValueError(f"{cname}: macvlan parent {parent!r} not found in host netns")
+            if _is_wireless(parent):
+                raise ValueError(f"{cname}: macvlan parent {parent!r} is wireless; use ipvlan")
+        case IpvlanLink(parent=parent):
+            if find_ifindex(ipr, parent) is None:
+                raise ValueError(f"{cname}: ipvlan parent {parent!r} not found in host netns")
+        case PhysLink(dev=dev):
+            idx = find_ifindex(ipr, dev)
+            if idx is None:
+                raise ValueError(f"{cname}: phys dev {dev!r} not found in host netns")
+            if idx in default_oifs:
                 raise ValueError(
-                    f"{cname}: link anchor {bridge!r} is kind {kind!r}, not a bridge"
+                    f"{cname}: phys dev {dev!r} is the host's primary (default-route) "
+                    f"NIC; refusing to move it into a container"
                 )
 
 

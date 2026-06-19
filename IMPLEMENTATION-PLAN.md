@@ -23,19 +23,21 @@ designing an IR first and discovering its shape is wrong (it already was; see
   (podman child ships router-netns fds → init-side root parent), host masquerade +
   DNAT, router egress/ingress allow rules, default-deny INPUT. `resolve_runtime` is
   privilege-aware (euid/SUDO_USER, reject root-as-target). Commits `f619819`…`94ba0f6`.
-- **In progress: M5 (links) — slice 1 landed (not yet committed).** Model refactor +
-  the two `veth` link types (`veth→bridge`, `veth→host`), VM-validated end-to-end.
-  `Container` grows lowered `links` (`HostLink` = config spec + derived effective-
-  default + host-veth name); `Endpoint` grows `default`; the default route is now
-  gated on effective ownership (configured, or sole interface). The fd-bridge ships
+- **Done: M5 (links) — all three slices, VM-validated** (slice 1 committed
+  `b609257`; slices 2–3 follow). Container-scoped host-netdev holes that bypass the
+  routers/nft: `veth→bridge`, `veth→host`, `macvlan`, `ipvlan`, `phys`. `Container`
+  grows lowered `links` (`HostLink` = config spec + derived effective-default +
+  host-veth name); `Endpoint` grows `default`; the default route is gated on
+  effective ownership (configured, or sole interface). The fd-bridge ships
   `container:<name>` fds (linked containers only) alongside `router:<net>`;
-  `link_connect` (phase-2 init parent) births the container end via `net_ns_fd`,
-  enslaves the host end to the bridge (or leaves it bare for `peer="host"`);
-  `validate_link_anchors` fails fast on a missing/wrong-kind bridge. Slice 2 =
-  `macvlan`/`ipvlan`, slice 3 = `phys` (see the M5 section).
+  `link_connect` (phase-2 init parent) births virtual devices into the container
+  netns via `net_ns_fd` (veth/macvlan/ipvlan) or moves a `phys` device in;
+  `validate_link_anchors` fails fast (anchor exists/kind, macvlan-wireless, phys
+  primary-NIC, macvlan⊕ipvlan-per-parent). The whole config surface is now wired —
+  rootless baseline + rootful uplink + rootful links.
 - **Open TODOs:** the running-container teardown guard (`# TODO` in `up`); veth
   name truncation for multi-network; the deferred `bridge` *network* type /
-  multi-homing (CONFIG-SKETCH); M5 slices 2–3.
+  multi-homing (CONFIG-SKETCH).
 
 ## Approach
 
@@ -224,10 +226,10 @@ for the full model. Summary:
 - **Check:** integration test — a permitted egress reaches out, an ingress DNAT
   lands; default-deny holds otherwise; re-`up` doesn't stack host nft rules.
 
-### 5. links  *(rootful — container edge)*  — sliced; slice 1 DONE (uncommitted)
-Sliced for incremental landing (config models all four types already):
+### 5. links  *(rootful — container edge)*  — all slices DONE & VM-validated
+Sliced for incremental landing (config modeled all four types already):
 **slice 1 = the model refactor + the two `veth` types; slice 2 = `macvlan`/`ipvlan`;
-slice 3 = `phys`.**
+slice 3 = `phys`.** All landed; slice 1 committed (`b609257`), slices 2–3 follow.
 
 - **Pass:** container-scoped host-netdev holes (`veth`/`macvlan`/`ipvlan`/`phys`),
   own-vs-borrow ownership implied by `type`, teardown by name **and** kind.
@@ -255,12 +257,21 @@ slice 3 = `phys`.**
   uplink); and a veth host end is **reaped with the container netns** on teardown
   (so the explicit host-veth delete is belt-and-suspenders, kept idempotent for
   kernels where it survives).
-- **Slices 2–3 (deferred):** `macvlan`/`ipvlan` (born-into-netns with init-resolved
-  `IFLA_LINK` parent; validate vs create-then-move; mode-kwarg fidelity; wireless-
-  parent reject) and `phys` (cross-userns move; primary-NIC reject; **kernel
-  auto-returns it to init on netns destroy — decided: no explicit `return_phys`**;
-  may need a spare VM NIC). Then the full check: `phys` returns to root, virtual is
-  reaped, anchors untouched.
+- **Slices 2–3 (done — VM-validated):** `macvlan`/`ipvlan` are born directly into
+  the container netns off the host `parent` (`link=` IFLA_LINK resolved in init +
+  `net_ns_fd` placing the device — the born-into-netns idiom works for both, no
+  create-then-move needed). `phys` MOVES the existing device in (set `net_ns_fd`),
+  renames it to the configured `name` in-netns, and is **borrowed** — relies on the
+  kernel returning it to init on netns destroy (decided: no `return_phys`).
+  `validate_link_anchors` grew: parent-exists, macvlan-wireless reject, phys
+  primary/default-route-NIC reject, and a macvlan⊕ipvlan-share-a-parent reject.
+- **Empirical findings (kernel 6.18, slices 2–3):** macvlan accepts a mode **name**
+  via pyroute2 (`macvlan_mode="bridge"`) but ipvlan does **not** — `IFLA_IPVLAN_MODE`
+  needs the numeric value (`_IPVLAN_MODE`: l2=0/l3=1/l3s=2; confirmed l3s round-trips).
+  macvlan and ipvlan **cannot share a parent** (kernel EBUSY — a device is a macvlan
+  master XOR ipvlan master), hence the new validation. phys validated with a dummy
+  stand-in (the move/rename/borrow code path is identical; real-NIC auto-return is
+  relied-upon kernel behavior, not turnip code).
 
 ## What `verify` becomes
 

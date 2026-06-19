@@ -14,7 +14,17 @@ from typing import Any
 import pytest
 
 from turnip import main
-from turnip.config import Proto, Runtime, Turnip, VethLink
+from turnip.config import (
+    IpvlanLink,
+    IpvlanMode,
+    MacvlanLink,
+    MacvlanMode,
+    PhysLink,
+    Proto,
+    Runtime,
+    Turnip,
+    VethLink,
+)
 
 STATE = Path("/n")
 
@@ -299,6 +309,41 @@ def test_non_veth_link_has_no_host_if() -> None:
         {},
     )
     assert model.containers[0].links[0].host_if is None
+
+
+def test_build_model_lowers_macvlan_and_ipvlan() -> None:
+    model = _model(
+        {
+            "box": {
+                "links": [
+                    {"type": "macvlan", "parent": "eth0", "name": "lan0",
+                     "address": "192.168.1.10/24", "mode": "private", "default": True},
+                    {"type": "ipvlan", "parent": "eth0", "name": "lan1",
+                     "address": "192.168.1.11/24"},  # mode defaults to l2
+                ]
+            }
+        },
+        {},
+    )
+    mv, iv = model.containers[0].links
+    assert isinstance(mv.spec, MacvlanLink)
+    assert (mv.spec.parent, mv.spec.mode) == ("eth0", MacvlanMode.PRIVATE)
+    assert isinstance(iv.spec, IpvlanLink)
+    assert (iv.spec.parent, iv.spec.mode) == ("eth0", IpvlanMode.L2)
+    # neither has a host-side veth; the configured default lands on the macvlan
+    assert (mv.host_if, iv.host_if) == (None, None)
+    assert (mv.default, iv.default) == (True, False)
+
+
+def test_build_model_lowers_phys() -> None:
+    model = _model(
+        {"box": {"links": [{"type": "phys", "dev": "enp3s0", "name": "eth0",
+                            "address": "192.168.1.20/24", "gateway": "192.168.1.1"}]}},
+        {},
+    )
+    (phys,) = model.containers[0].links
+    assert isinstance(phys.spec, PhysLink) and phys.spec.dev == "enp3s0"
+    assert phys.default is True  # sole interface => implicit default
 
 
 def test_link_host_if_derives_and_rejects_overlong() -> None:
