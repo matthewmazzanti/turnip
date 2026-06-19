@@ -12,8 +12,10 @@ same kernel forwarding/NAT/bridge paths as a separate box.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
@@ -22,7 +24,10 @@ from pathlib import Path
 import pytest
 
 HERE = Path(__file__).parent
-CONFIGS = HERE / "configs"
+
+# every config runs as the rootless-podman owner; default it so the inline configs in
+# the tests stay focused on the network, not boilerplate (a config may still override).
+_DEFAULT_RUNTIME = {"user": "homelab"}
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
@@ -35,37 +40,56 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(skip)
 
 
-def _turnip(action: str, config: str) -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, "TURNIP_CONFIG": str(CONFIGS / config)}
+def _materialize(config: dict[str, object]) -> str:
+    """Write a config dict to a temp JSON file and return its path (turnip's CLI reads a
+    file via TURNIP_CONFIG). `runtime` defaults to the rootless owner unless overridden."""
+    full = {"runtime": _DEFAULT_RUNTIME, **config}
+    fd, path = tempfile.mkstemp(suffix=".json", prefix="turnip-test-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(full, f)
+    return path
+
+
+def _turnip(action: str, path: str) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, "TURNIP_CONFIG": path}
     return subprocess.run(["turnip", action], env=env, capture_output=True, text=True)
 
 
 @pytest.fixture
-def turnip() -> Callable[[str], object]:
-    """`with turnip("net.json"):` brings the network up and ALWAYS tears it down (a
-    failing assertion in the body can't leak a live netns -- teardown is in a finally)."""
+def turnip() -> Callable[[dict[str, object]], object]:
+    """`with turnip({...}):` materializes the config, brings the network up, and ALWAYS
+    tears it down (a failing assertion in the body can't leak a live netns -- teardown is
+    in a finally)."""
 
     @contextmanager
-    def _up_down(config: str) -> Generator[None]:
-        up = _turnip("up", config)
-        assert up.returncode == 0, f"turnip up failed:\n{up.stdout}\n{up.stderr}"
+    def _up_down(config: dict[str, object]) -> Generator[None]:
+        path = _materialize(config)
         try:
-            yield
+            up = _turnip("up", path)
+            assert up.returncode == 0, f"turnip up failed:\n{up.stdout}\n{up.stderr}"
+            try:
+                yield
+            finally:
+                _turnip("down", path)
         finally:
-            _turnip("down", config)
+            os.unlink(path)
 
     return _up_down
 
 
 @pytest.fixture
-def turnip_attempt() -> Callable[[str], int]:
-    """Run `turnip up` for a config expected to FAIL, then always `down`; return the up
-    return code (for the negative / validation-reject tests)."""
+def turnip_attempt() -> Callable[[dict[str, object]], int]:
+    """`turnip up` for a config expected to FAIL, then always `down`; return the up return
+    code (for the negative / validation-reject tests)."""
 
-    def _attempt(config: str) -> int:
-        rc = _turnip("up", config).returncode
-        _turnip("down", config)  # idempotent; a no-op when up failed before building
-        return rc
+    def _attempt(config: dict[str, object]) -> int:
+        path = _materialize(config)
+        try:
+            rc = _turnip("up", path).returncode
+            _turnip("down", path)  # idempotent; a no-op when up failed before building
+            return rc
+        finally:
+            os.unlink(path)
 
     return _attempt
 

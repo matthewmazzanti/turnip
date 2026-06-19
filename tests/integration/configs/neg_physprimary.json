@@ -1,8 +1,0 @@
-{
-  "runtime": { "user": "homelab" },
-  "containers": {
-    "box": { "links": [ { "type": "phys", "dev": "eth0", "name": "eth9",
-                          "address": "10.0.0.9/24" } ] }
-  },
-  "networks": {}
-}
