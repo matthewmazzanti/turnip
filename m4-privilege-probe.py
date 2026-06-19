@@ -1,252 +1,140 @@
 #!/usr/bin/env python3
 """
-m4-privilege-probe.py -- standalone proof of turnip's M4 privilege primitive.
+m4-privilege-probe.py -- standalone proof of turnip's M4 host<->podman netns bridge.
 
-NOT part of the package. A throwaway harness to prove the privilege plumbing in
-isolation BEFORE any uplink/nft logic rides on it (IMPLEMENTATION-PLAN.md M4:
-"prove fork + host-netns op + netns op + fd-pass in isolation first").
+NOT part of the package. A throwaway harness proving the privilege/namespace plumbing
+in isolation before any uplink/nft logic rides on it.
 
-It demonstrates the unified, source-agnostic model we settled on:
+SCOPE (deliberately reduced): this runs at **sudo level** -- as root throughout. The
+capability route (run as an unprivileged user + ambient CAP_NET_ADMIN instead of
+root) is DEFERRED; see todo.md. At sudo level the privilege handling is trivial: the
+podman child does a plain setresuid drop to the rootless user (it needs no init-userns
+cap -- owner-match re-grants caps inside podman's userns), and the host-edge parent
+just stays root. No ctypes, no cap dance.
 
-  1. UNIVERSAL TOP LAYER -- become `user` + CAP_NET_ADMIN (ambient). When launched
-     as root we re-exec through setpriv(1), the standard tool for this exact drop
-     (it owns the keepcaps + setgid/initgroups/setresuid + raise-ambient dance, so
-     we don't hand-roll it); when already the user with the ambient cap (the systemd
-     User= + AmbientCapabilities path) it's a no-op. After this point the host-edge
-     branch holds ONLY CAP_NET_ADMIN -- never full root, even under sudo (min priv).
-  2. FORK into the two branches the userns split forces apart:
-       - parent = HOST-EDGE branch: keeps the cap; does init-netns ops
-         (veth, ip_forward, host nft masquerade), then moves the veth far-end into
-         the router netns via an fd the child passes.
-       - child  = NETNS branch: DROPS the cap entirely (it gets its powers from
-         joining podman's userns by owner-match, not from any init-userns cap),
-         enters podman's user+mount ns, creates a router netns, and hands its fd
-         back over SCM_RIGHTS.
-  3. The fd round-trip proves the load-bearing kernel fact: the host-edge parent,
-     holding CAP_NET_ADMIN only in the INIT userns, can still operate on a netns
-     owned by podman's (descendant) userns -- caps flow DOWN to descendants, and
-     CAP_NET_ADMIN is exactly enough for the IFLA_NET_NS_FD move (no CAP_SYS_ADMIN,
-     no uid 0). That is the whole proof that "user+cap == sudo" for the host edge.
+What this proves: the host<->podman netns bridge, as two SEQUENTIAL phases joined by
+an fd-passing socket -- the design that replaces the old concurrent fork (which raced
+on teardown):
 
-Run it BOTH ways; both must reach the identical end state. Use the venv
-interpreter explicitly -- under sudo a bare `python3` won't have pyroute2:
+  Phase 1  (podman world, a child): drop to the rootless user, enter podman's user +
+    mount ns, create a router netns per network, send their fds back over a socket,
+    and EXIT. The fds stay valid after the child is gone -- they're independent open
+    file descriptions in the parent, and each netns is pinned by its bind-mount.
 
-    # source = real root -> we re-exec through setpriv internally (the DROP path):
-    sudo .venv/bin/python m4-privilege-probe.py <user>
+  Phase 2  (init world, the parent, still root): collect the fds into a {network: fd}
+    mapping and run the host edge -- per network, a veth whose far end is moved into
+    that netns fd (root has CAP_NET_ADMIN in init + CAP_SYS_ADMIN in podman's userns
+    via cap-flow-down), plus a host op (ip_forward). No concurrency, no handshake.
 
-    # source = user + ambient cap (the systemd service shape) -> our drop is a
-    # no-op; we land as <user> holding only CAP_NET_ADMIN, no root:
-    sudo setpriv --reuid <user> --regid <gid> --init-groups \
-         --inh-caps +net_admin --ambient-caps +net_admin \
-         .venv/bin/python m4-privilege-probe.py <user>
-
-`<user>` is the rootless-podman owner (the run target). It must not be root.
+Run (sudo only):
+    sudo <python-with-pyroute2> m4-privilege-probe.py <rootless-podman-user>
+e.g. in the dev VM:
+    sudo /run/current-system/sw/bin/python3 /mnt/turnip/m4-privilege-probe.py homelab
 """
 
-import ctypes
-import ctypes.util
+import json
 import os
 import pwd
 import socket
 import subprocess
 import sys
+import traceback
+from collections.abc import Callable
 
-from pyroute2 import IPRoute, NetNS, netns
+from pyroute2 import IPRoute, netns
 
-# --- capability syscalls (stdlib `os` covers uid/gid/setns/fork, not caps) ---
-
-libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
-
-# setpriv handles the acquire/drop-to-user direction; the only cap ops we still do
-# in-process are the child's drop (clear ambient + zero the sets) and IS_SET reporting.
-PR_CAP_AMBIENT = 47
-PR_CAP_AMBIENT_IS_SET = 1
-PR_CAP_AMBIENT_CLEAR_ALL = 4
+# --- reporting (CapEff read is pure /proc -- no ctypes) ---------------------
 
 CAP_NET_ADMIN = 12
-CAP_MASK = 1 << CAP_NET_ADMIN  # CAP_NET_ADMIN lives in the first u32 (caps 0..31)
-_CAP_VERSION_3 = 0x20080522
-
-
-class _CapHeader(ctypes.Structure):
-    _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
-
-
-class _CapData(ctypes.Structure):
-    # one struct per 32-cap block; version 3 => an array of 2 (caps 0..63)
-    _fields_ = [
-        ("effective", ctypes.c_uint32),
-        ("permitted", ctypes.c_uint32),
-        ("inheritable", ctypes.c_uint32),
-    ]
-
-
-def _prctl(option: int, arg2: int = 0, arg3: int = 0) -> int:
-    r = libc.prctl(option, arg2, arg3, 0, 0)
-    if r < 0:
-        e = ctypes.get_errno()
-        raise OSError(e, f"prctl({option}, {arg2}): {os.strerror(e)}")
-    return r
-
-
-def _capset(data: ctypes.Array[_CapData]) -> None:
-    hdr = _CapHeader(_CAP_VERSION_3, 0)
-    if libc.capset(ctypes.byref(hdr), data) != 0:
-        e = ctypes.get_errno()
-        raise OSError(e, f"capset: {os.strerror(e)}")
-
-
-# --- state reporting (so both launch modes produce a comparable transcript) ---
 
 
 def _capeff_has_net_admin() -> bool:
-    """Read CapEff straight from /proc/self/status -- an independent view of the
-    effective set, not our ctypes mutation, so the transcript is trustworthy."""
     for line in open("/proc/self/status"):
         if line.startswith("CapEff:"):
-            return bool(int(line.split()[1], 16) & CAP_MASK)
+            return bool(int(line.split()[1], 16) & (1 << CAP_NET_ADMIN))
     return False
-
-
-def _ambient_has_net_admin() -> bool:
-    return _prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_NET_ADMIN) == 1
 
 
 def report(tag: str) -> None:
     ruid, euid, suid = os.getresuid()
     print(
-        f"  [{tag}] ruid/euid/suid={ruid}/{euid}/{suid}  "
-        f"CAP_NET_ADMIN: eff={_capeff_has_net_admin()} ambient={_ambient_has_net_admin()}",
+        f"  [{tag}] uid {ruid}/{euid}/{suid}  CAP_NET_ADMIN(eff)={_capeff_has_net_admin()}",
         flush=True,
     )
 
 
-# --- step 1: the universal top layer -- become user + CAP_NET_ADMIN ----------
+# --- the fd bridge: pass netns fds across a socket (SCM_RIGHTS) -------------
+# The reusable core to extract into turnip. A child opens fds (in podman's mount ns,
+# where the netns bind-mounts live) and ships them to the parent (in the init mount
+# ns, which can't see those paths). Fd-passing needs no privilege -- creds are checked
+# at open() and at the privileged op (the veth move), never at transfer.
+
+def send_fds_by_name(sock: socket.socket, fds: dict[str, int]) -> None:
+    """Send a {name: fd} mapping, one entry per message -- each name rides in the SAME
+    SCM_RIGHTS message as its fd, so the two can't be misaligned (no positional coupling
+    to maintain, which for netns fds means no veth-into-wrong-network risk)."""
+    for name, fd in fds.items():
+        socket.send_fds(sock, [name.encode()], [fd])
 
 
-def become_user_with_cap(pw: pwd.struct_passwd) -> None:
-    """The universal top layer: land as `user` + ambient CAP_NET_ADMIN.
-
-    - Already there (systemd User=+AmbientCapabilities, or our own post-re-exec
-      state): no-op.
-    - Root: re-exec through setpriv(1), which performs the audited drop -- keepcaps,
-      setresgid + initgroups (setgroups while still privileged: the CAP_SETGID step
-      we can't do as the user), setresuid, and raise the inheritable + ambient cap.
-      setpriv owns exactly this dance, so we don't hand-roll it. Ambient (not just
-      effective) because the host edge shells out -- `nft -f` keeps the cap across
-      execve.
-    - Neither root nor already-cap'd: we can't acquire it -> fail loudly.
-
-    The process's own (uid, cap) state is the re-exec guard: after setpriv we satisfy
-    the first branch, so there is no loop and no sentinel env var. os.execvp replaces
-    the image, so nothing after it runs -- main() re-enters from the top as user+cap."""
-    if os.geteuid() == pw.pw_uid and _capeff_has_net_admin():
-        return
-    if os.geteuid() != 0:
-        sys.exit(
-            "no CAP_NET_ADMIN and not root: launch via sudo (we re-exec through "
-            "setpriv to drop) or as the user with ambient CAP_NET_ADMIN"
-        )
-    print(f"  re-exec via setpriv -> {pw.pw_name!r} + ambient CAP_NET_ADMIN", flush=True)
-    os.execvp(
-        "setpriv",
-        [
-            "setpriv",
-            "--reuid", str(pw.pw_uid),
-            "--regid", str(pw.pw_gid),
-            "--init-groups",
-            "--inh-caps", "+net_admin",  # ambient requires the cap be inheritable
-            "--ambient-caps", "+net_admin",
-            sys.executable, os.path.abspath(__file__), pw.pw_name,
-        ],
-    )
+def recv_fds_by_name(sock: socket.socket) -> dict[str, int]:
+    """Receive what send_fds_by_name sent -> {name: fd}, looping until EOF (the sender
+    closes the socket after the last entry). The socketpair is SOCK_SEQPACKET, so each
+    recv returns exactly one message -- explicit framing, no reliance on SCM boundaries."""
+    out: dict[str, int] = {}
+    while True:
+        msg, fds, _flags, _addr = socket.recv_fds(sock, 4096, 1)
+        if not fds:  # EOF: peer closed after the last fd
+            return out
+        out[msg.decode()] = fds[0]
 
 
-def drop_cap_entirely() -> None:
-    """The netns child sheds CAP_NET_ADMIN before podman work: it needs no init-
-    userns cap (owner-match grants full caps INSIDE podman's userns on the join),
-    so dropping is strictly safer and costs nothing. Unconditional."""
-    _prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL)
-    _capset((_CapData * 2)())  # zeroed effective/permitted/inheritable, both blocks
+def collect_fds_from_child(produce_fds: Callable[[], dict[str, int]]) -> dict[str, int]:
+    """Run `produce_fds()` in a forked child -- it RETURNS a {name: fd} mapping, which
+    THIS function ships over the socket -- collect it in the parent, wait for the child
+    to EXIT, and return it. Concentrating the fd transfer here keeps the work function
+    socket-agnostic. The returned fds outlive the child (independent OFDs; the netns are
+    pinned by their bind-mounts), so phase 2 can use them with the child long gone."""
+    parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    pid = os.fork()
+    if pid == 0:
+        parent_sock.close()
+        code = 0
+        try:
+            send_fds_by_name(child_sock, produce_fds())
+        except BaseException:
+            traceback.print_exc()
+            code = 1
+        finally:
+            child_sock.close()
+            sys.stdout.flush()
+            sys.stderr.flush()
+        os._exit(code)
+    child_sock.close()
+    fds = recv_fds_by_name(parent_sock)
+    parent_sock.close()
+    _, status = os.waitpid(pid, 0)
+    if not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0):
+        sys.exit("phase 1 (podman netns branch) failed -- see child output above")
+    return fds
 
 
-# --- step 2a: the HOST-EDGE branch (parent) -- init netns, keeps the cap ------
-
-HOST_VETH = "veth-probe-h"  # stays in the init netns
-ROUTER_VETH = "veth-probe-r"  # moved into the child's router netns via the passed fd
-PROBE_NFT_TABLE = "turnip_probe"
+# --- phase 1: the netns branch (podman world) ------------------------------
 
 
-def host_edge_branch(sock: socket.socket) -> None:
-    """Runs in the init netns + init userns, holding ONLY CAP_NET_ADMIN.
-
-    Proves the three host-edge op classes need nothing more than that cap:
-    (a) write /proc/sys ip_forward, (b) load a host nft NAT table, (c) create a
-    veth in the init netns -- then receive the router-netns fd from the child and
-    move the far end in, the cross-userns step that is the crux of the model."""
-    report("host-edge: start")
-
-    # (a) ip_forward -- write the CURRENT value back: proves the CAP_NET_ADMIN-gated
-    #     /proc/sys write without perturbing the host's real forwarding state.
-    path = "/proc/sys/net/ipv4/ip_forward"
-    cur = open(path).read().strip()
-    open(path, "w").write(cur)
-    print(f"  host-edge: wrote ip_forward (unchanged value {cur!r}) OK", flush=True)
-
-    # (b) host nft NAT zone -- load then delete a throwaway masquerade table.
-    ruleset = f"""
-    table ip {PROBE_NFT_TABLE} {{
-      chain postrouting {{
-        type nat hook postrouting priority srcnat; policy accept;
-        ip saddr 169.254.99.0/31 masquerade
-      }}
-    }}
-    """
-    subprocess.run(["nft", "-f", "-"], input=ruleset, text=True, check=True)
-    subprocess.run(["nft", "delete", "table", "ip", PROBE_NFT_TABLE], check=True)
-    print(f"  host-edge: loaded + removed nft NAT table 'ip {PROBE_NFT_TABLE}' OK", flush=True)
-
-    # (c) veth in the init netns; one end will be moved into the child's netns.
-    ipr = IPRoute()
-    try:
-        ipr.link("add", ifname=HOST_VETH, kind="veth", peer={"ifname": ROUTER_VETH})
-        print(f"  host-edge: created veth {HOST_VETH} <-> {ROUTER_VETH} in init netns", flush=True)
-
-        # Receive the router-netns fd the child opened inside podman's mount ns.
-        msg, fds, _flags, _addr = socket.recv_fds(sock, 64, 1)
-        if not fds:
-            raise RuntimeError(f"no fd received from netns child (msg={msg!r})")
-        router_fd = fds[0]
-        print(f"  host-edge: received router-netns fd={router_fd} via SCM_RIGHTS", flush=True)
-
-        # THE crux: move ROUTER_VETH into a netns owned by podman's userns, holding
-        # CAP_NET_ADMIN only in the init userns. Permitted because caps flow down to
-        # descendant userns and CAP_NET_ADMIN alone authorizes IFLA_NET_NS_FD.
-        idx = ipr.link_lookup(ifname=ROUTER_VETH)[0]
-        ipr.link("set", index=idx, net_ns_fd=router_fd)
-        print(f"  host-edge: moved {ROUTER_VETH} into the passed netns fd OK", flush=True)
-
-        os.close(router_fd)
-        sock.send(b"moved")  # tell the child to verify
-        sock.recv(16)  # wait for "verified" BEFORE teardown: deleting either veth
-        #                end reaps BOTH, which would race the child's check
-    finally:
-        # host end stays in init netns -> clean it up (the router end left with the
-        # veth move; deleting either end reaps the pair).
-        leftover = ipr.link_lookup(ifname=HOST_VETH)
-        if leftover:
-            ipr.link("del", index=leftover[0])
-        ipr.close()
-    report("host-edge: done")
-
-
-# --- step 2b: the NETNS branch (child) -- drop cap, enter podman, own a netns -
+def drop_to(pw: pwd.struct_passwd) -> None:
+    """Plain root -> user drop (no caps retained). At sudo level the child needs no
+    init-userns capability: owner-match grants a full set INSIDE podman's userns on
+    the setns join. So this is just setresgid + initgroups + setresuid -- stdlib, no
+    ctypes. (The capability-retaining drop for the no-root path is deferred -- todo.md.)"""
+    os.setresgid(pw.pw_gid, pw.pw_gid, pw.pw_gid)
+    os.initgroups(pw.pw_name, pw.pw_gid)
+    os.setresuid(pw.pw_uid, pw.pw_uid, pw.pw_uid)
 
 
 def _pause_pid(runtime_dir: str) -> int:
-    """podman's rootless pause pid (holds the user+mount ns alive). Bootstrap with
-    `podman unshare true` if absent. Runs as the dropped user with the env already
-    corrected (XDG_RUNTIME_DIR/HOME), so podman resolves the right runtime dir."""
+    """podman's rootless pause pid (holds the user+mount ns alive); bootstrap with
+    `podman unshare true` if absent. Runs as the dropped user with the env corrected."""
     path = os.path.join(runtime_dir, "libpod", "tmp", "pause.pid")
     try:
         pid = int(open(path).read().strip())
@@ -258,108 +146,121 @@ def _pause_pid(runtime_dir: str) -> int:
     return int(open(path).read().strip())
 
 
-def netns_branch(pw: pwd.struct_passwd, sock: socket.socket) -> None:
-    """Runs as the user; drops the cap; enters podman's user+mount ns; creates a
-    router netns and passes its fd to the host-edge parent; verifies the move."""
-    drop_cap_entirely()
-    report("netns: cap dropped")
-
-    # Derive everything from the TARGET uid, never the (possibly root-owned) env --
-    # the same hardening resolve_runtime will get. Correct the env so the podman
-    # subprocess + libpod paths resolve to the user's runtime dir under sudo.
+def enter_podman(pw: pwd.struct_passwd) -> None:
+    """Enter podman's user + mount ns by owner-match (euid == owner after drop_to)."""
     runtime_dir = f"/run/user/{pw.pw_uid}"
     os.environ["XDG_RUNTIME_DIR"] = runtime_dir
     os.environ["HOME"] = pw.pw_dir
-
     pid = _pause_pid(runtime_dir)
-    user_fd = os.open(f"/proc/{pid}/ns/user", os.O_RDONLY)
-    mnt_fd = os.open(f"/proc/{pid}/ns/mnt", os.O_RDONLY)
-    os.setns(user_fd, os.CLONE_NEWUSER)  # owner-match (euid==owner) grants full caps here
-    os.setns(mnt_fd, os.CLONE_NEWNS)  # persistent bind-mounts now visible
+    os.setns(os.open(f"/proc/{pid}/ns/user", os.O_RDONLY), os.CLONE_NEWUSER)
+    os.setns(os.open(f"/proc/{pid}/ns/mnt", os.O_RDONLY), os.CLONE_NEWNS)
+
+
+def netns_branch(pw: pwd.struct_passwd, names: list[str]) -> dict[str, int]:
+    """The child's whole job: drop, enter podman's ns, create a router netns per name,
+    and RETURN {name: fd}. It does no socket work -- collect_fds_from_child owns the
+    transfer (and then exits us)."""
+    drop_to(pw)
+    report("netns: dropped to user")
+    enter_podman(pw)
     report("netns: in podman user+mnt ns")  # euid now maps to container-uid-0
 
-    ns_path = os.path.join(runtime_dir, "turnip-probe", "router")
-    os.makedirs(os.path.dirname(ns_path), exist_ok=True)
-    if os.path.lexists(ns_path):
-        netns.remove(ns_path)
-    netns.create(ns_path)  # CAP_SYS_ADMIN via owner-match => unshare+bind-mount OK
-    print(f"  netns: created router netns at {ns_path}", flush=True)
+    base = f"/run/user/{pw.pw_uid}/turnip-probe"
+    os.makedirs(base, exist_ok=True)
+    fds: dict[str, int] = {}
+    for name in names:
+        path = os.path.join(base, name)
+        if os.path.lexists(path):
+            netns.remove(path)  # reap a prior run's leftover (we're in podman's mnt ns)
+        netns.create(path)
+        fds[name] = os.open(path, os.O_RDONLY)
+        print(f"  netns: created router netns {name!r}", flush=True)
+    return fds
 
+
+# --- phase 2: the host edge (init world, root) -----------------------------
+
+
+def links_in(fd: int) -> list[str]:
+    """Link names in the netns referred to by `fd`, read by entering it in a fork.
+    The parent is root -> holds CAP_SYS_ADMIN in podman's userns via cap-flow-down,
+    so it may setns into that (descendant-userns-owned) netns to look."""
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        os.setns(fd, os.CLONE_NEWNET)
+        names = [link.get_attr("IFLA_IFNAME") for link in IPRoute().get_links()]
+        os.write(w, json.dumps(names).encode())
+        os._exit(0)
+    os.close(w)
+    buf = b""
+    while chunk := os.read(r, 65536):
+        buf += chunk
+    os.close(r)
+    os.waitpid(pid, 0)
+    return json.loads(buf.decode())
+
+
+def host_edge(netns_fds: dict[str, int]) -> None:
+    """Runs in the parent (root, init netns) AFTER the podman child has exited. Per
+    network: a host op (ip_forward) + a veth whose far end is moved into that network's
+    router netns via the passed fd, verified by entering the netns."""
+    report("host-edge: start (root, init netns)")
+
+    path = "/proc/sys/net/ipv4/ip_forward"  # a host-edge op: write it back unchanged
+    cur = open(path).read().strip()
+    open(path, "w").write(cur)
+    print(f"  host-edge: ip_forward write-back OK (unchanged {cur!r})", flush=True)
+
+    ipr = IPRoute()
+    created: list[str] = []
     try:
-        ns_fd = os.open(ns_path, os.O_RDONLY)
-        socket.send_fds(sock, [b"router-ns"], [ns_fd])
-        os.close(ns_fd)
-        print("  netns: sent router-netns fd to host-edge parent (SCM_RIGHTS)", flush=True)
-
-        if sock.recv(16) != b"moved":
-            raise RuntimeError("host-edge parent did not ack the veth move")
-
-        # Verify the parent's cross-userns move actually landed in OUR netns.
-        with NetNS(ns_path, flags=0) as ns:
-            found = ns.link_lookup(ifname=ROUTER_VETH)
-        sock.send(b"verified")  # release the parent to tear the pair down now
-        if not found:
-            raise RuntimeError(f"{ROUTER_VETH} not present in router netns after move")
-        print(f"  netns: confirmed {ROUTER_VETH} in router netns (idx={found[0]})", flush=True)
+        for name, fd in netns_fds.items():
+            host_if, router_if = f"vh-{name}", f"vr-{name}"
+            ipr.link("add", ifname=host_if, kind="veth", peer={"ifname": router_if})
+            created.append(host_if)
+            ipr.link("set", index=ipr.link_lookup(ifname=router_if)[0], net_ns_fd=fd)
+            present = router_if in links_in(fd)
+            print(f"  host-edge: {name}: {router_if} present in netns: {present}", flush=True)
+            if not present:
+                raise RuntimeError(f"{router_if} not in {name!r} netns after move")
     finally:
-        netns.remove(ns_path)
+        for host_if in created:  # delete the host end (reaps the pair); netns reaped next run
+            leftover = ipr.link_lookup(ifname=host_if)
+            if leftover:
+                ipr.link("del", index=leftover[0])
+        ipr.close()
+    report("host-edge: done")
 
 
-# --- driver ------------------------------------------------------------------
+# --- driver ----------------------------------------------------------------
+
+NETWORKS = ["lan", "dmz"]  # demo: two router netns, to exercise the {name: fd} mapping
 
 
 def main() -> None:
     if len(sys.argv) != 2:
-        sys.exit(f"usage: {sys.argv[0]} <rootless-podman-user>")
+        sys.exit(f"usage: sudo {sys.argv[0]} <rootless-podman-user>")
     user = sys.argv[1]
     pw = pwd.getpwnam(user)
     if pw.pw_uid == 0:
         sys.exit("target user must not be root (rootless podman is not root-owned)")
+    if os.geteuid() != 0:
+        sys.exit("run under sudo -- this probe is sudo-level (user+cap path deferred; see todo.md)")
 
-    print(f"== M4 privilege probe: target user {user!r} (uid={pw.pw_uid}) ==", flush=True)
-    report("launch")
+    print(f"== M4 bridge probe: user {user!r} (uid={pw.pw_uid}), networks {NETWORKS} ==")
+    report("launch (root)")
 
-    become_user_with_cap(pw)
-    report("after top-layer drop")
-    if not _capeff_has_net_admin():
-        sys.exit("no CAP_NET_ADMIN after drop: launch via sudo or with ambient CAP_NET_ADMIN")
+    # Phase 1: podman world -- a child creates a router netns per network and ships the
+    # fds back, then exits. Parent collects the {network: fd} mapping.
+    netns_fds = collect_fds_from_child(lambda: netns_branch(pw, NETWORKS))
+    report("after phase 1 (child exited; fds still valid)")
+    print(f"  fd mapping: {netns_fds}", flush=True)
 
-    # Fork the two branches. parent = host-edge (keeps cap); child = netns (drops).
-    parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-    pid = os.fork()
-    if pid == 0:
-        parent_sock.close()
-        code = 0
-        try:
-            netns_branch(pw, child_sock)
-        except BaseException:
-            import traceback
-
-            traceback.print_exc()
-            code = 1
-        finally:
-            child_sock.close()
-            sys.stdout.flush()
-        os._exit(code)
-
-    child_sock.close()
-    host_code = 0
-    try:
-        host_edge_branch(parent_sock)
-    except BaseException:
-        import traceback
-
-        traceback.print_exc()
-        host_code = 1
-    finally:
-        parent_sock.close()
-
-    _, status = os.waitpid(pid, 0)
-    child_ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
-    if host_code == 0 and child_ok:
-        print("== PROBE OK: both branches succeeded, fd round-trip + cross-userns move proven ==")
-    else:
-        sys.exit(f"== PROBE FAILED: host_code={host_code} child_ok={child_ok} ==")
+    # Phase 2: init world (root) -- host edge per network, using the collected fds.
+    host_edge(netns_fds)
+    print("== PROBE OK: podman->host fd bridge proven (sequential, sudo-level) ==")
 
 
 if __name__ == "__main__":
