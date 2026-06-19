@@ -303,8 +303,18 @@ Net: the rewire drops the `verify` command; `up`/`down` remain.
   expansion. Fast, ungated.
 - **nftlib golden** (`tests/test_nftlib.py`): regenerated at milestone 3 against
   the example config; the diff is the review artifact. Plus the **parity** golden.
-- **Integration tests** — **hermetic NixOS VM tests** (`nix build
-  .#checks.<sys>.integration`), the authoritative regression gate. Structure:
+- **Integration tests** — **hermetic NixOS VM tests**, the authoritative regression
+  gate. Three derivations cover the whole surface (each `nix build .#checks.<sys>.<name>`):
+  - `integration` (single node) — routed flow matrix (allow/deny reachability) +
+    all link types that need no off-box peer (veth→bridge, veth→host, phys) +
+    negative validation rejects (bad anchor, phys-on-primary, macvlan⊕ipvlan).
+  - `integration-uplink` (host + world, two VLANs) — uplink egress (default-deny) +
+    ingress DNAT + macvlan/ipvlan reachability on a real LAN.
+  - `integration-podman` (single node + a nix-built OCI image) — the real
+    container-attach contract: a podman container joins a netns via
+    `run-container.sh` and resolves peers by name via the generated `/etc/hosts`.
+  (This suite immediately caught a real bug: a flow-less network rendered an empty
+  nft verdict map nft rejects — fixed in `nftlib.render`.) Structure:
   - **uv2nix** packages turnip from `uv.lock` (`packages.turnip` — the env with the
     `turnip` console script); the test nodes install it (no source mount).
   - **`nix/turnip-host.nix`** is the shared substrate (rootless podman + `homelab` +
