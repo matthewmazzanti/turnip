@@ -158,6 +158,21 @@ class Endpoint:
 
 
 @dataclass
+class Uplink:
+    """A network's host edge: a point-to-point /31 veth between its router netns and
+    the init (host) netns. The host end + masquerade/DNAT are wired by the privileged
+    parent in phase 2; the router end + its default route live in the router netns.
+    The two /31 addresses are derived from the config base: host = base, router =
+    base+1, and the router default-routes via the host end."""
+
+    host_if: str  # veth end in the init netns
+    router_if: str  # veth end in the router netns
+    host_ip: str  # /31 host (init) end -- the router's gateway out
+    router_ip: str  # /31 router end
+    nat: bool  # host-side masquerade (vs routed)
+
+
+@dataclass
 class Network:
     """A router netns: its gateway, the endpoints hung off it, and its flow policy."""
 
@@ -167,6 +182,7 @@ class Network:
     gateway_if: str
     endpoints: list[Endpoint]
     flows: list[Flow]
+    uplink: Uplink | None = None  # the host edge, if this network has one
     netns: NetNS | None = None  # bound only inside `with model.bound():`
 
     @property
@@ -282,6 +298,16 @@ def build_model(turnip: Turnip, state_dir: Path) -> Model:
             Endpoint(containers[cname], router_if(cname), att.interface, str(att.ip))
             for cname, att in net.attach.items()
         ]
+        uplink = None
+        if net.uplink is not None:
+            base = net.uplink.link  # the even /31 base (validated in config)
+            uplink = Uplink(
+                host_if=net.uplink.host_if,
+                router_if=net.uplink.router_if,
+                host_ip=str(base),  # host (init) end = base; the router's gateway out
+                router_ip=str(base + 1),  # router end = base+1
+                nat=net.uplink.nat,
+            )
         networks.append(
             Network(
                 name=net_name,
@@ -290,6 +316,7 @@ def build_model(turnip: Turnip, state_dir: Path) -> Model:
                 gateway_if=net.gateway_if,
                 endpoints=endpoints,
                 flows=list(net.flows),
+                uplink=uplink,
             )
         )
     return Model(list(containers.values()), networks)

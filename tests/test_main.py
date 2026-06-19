@@ -67,6 +67,40 @@ def test_build_model_lowers_endpoints() -> None:
     assert eps["zwave"].container is next(c for c in model.containers if c.name == "zwave")
 
 
+def test_build_model_lowers_uplink() -> None:
+    model = _model(
+        {"hass": {}},
+        {
+            "lan": {
+                "gateway": "10.0.0.1",
+                "gateway_if": "gw0",
+                "uplink": {
+                    "host_if": "veth-lan-host",
+                    "router_if": "vethR-lan-up",
+                    "link": "169.254.1.0",  # the even /31 base
+                    "nat": True,
+                },
+                "attach": {"hass": {"ip": "10.0.0.12", "interface": "eth0", "egress": True}},
+            }
+        },
+    )
+    up = model.networks[0].uplink
+    assert up is not None
+    assert (up.host_if, up.router_if) == ("veth-lan-host", "vethR-lan-up")
+    # /31 ends derived from the base: host = base, router = base+1
+    assert (up.host_ip, up.router_ip) == ("169.254.1.0", "169.254.1.1")
+    assert up.nat is True
+
+
+def test_build_model_no_uplink_is_none() -> None:
+    model = _model(
+        {"hass": {}},
+        {"lan": {"gateway": "10.0.0.1", "gateway_if": "gw0",
+                 "attach": {"hass": {"ip": "10.0.0.12", "interface": "eth0"}}}},
+    )
+    assert model.networks[0].uplink is None
+
+
 def test_links_only_container_still_gets_a_netns() -> None:
     # a container with no network attachment is still in the `containers` map, so it
     # still gets its netns (its links land there in milestone 5)
