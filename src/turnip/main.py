@@ -595,18 +595,26 @@ def host_edge_connect(network: Network, router_fd: int) -> None:
     """Wire a network's uplink veth across the init<->router boundary -- the host edge,
     run in the privileged init-side parent (phase 2). No-op without an uplink.
 
-    The veth is born in the init netns; the router end is moved into the router netns by
-    fd (IFLA_NET_NS_FD -- needs only CAP_NET_ADMIN, which root holds in init, flowing
-    down to podman's userns). The host end is addressed on the /31 init-side; the router
-    end + its default route via the host end are set inside the router netns, entered by
-    fd (setns, which root may do from the init userns). No nft/masquerade yet."""
+    The host end is born in the init netns and the router end DIRECTLY in the router
+    netns (peer net_ns_fd -- IFLA_NET_NS_FD, which needs only CAP_NET_ADMIN, held in
+    init and flowing down to podman's userns). Birthing the router end in place (rather
+    than creating both in init then moving one) keeps the router-scoped name out of the
+    init netns entirely, so it can't collide there. The host end is addressed on the /31
+    init-side; the router end + its default route via the host end are set inside the
+    router netns, entered by fd (setns, which root may do from the init userns). No
+    nft/masquerade yet."""
     up = network.uplink
     if up is None:
         return
     ipr = IPRoute()
     try:
-        ipr.link("add", ifname=up.host_if, kind="veth", peer={"ifname": up.router_if})
-        ipr.link("set", index=ipr.link_lookup(ifname=up.router_if)[0], net_ns_fd=router_fd)
+        # host end in init, router end born directly in the router netns via the fd
+        ipr.link(
+            "add",
+            ifname=up.host_if,
+            kind="veth",
+            peer={"ifname": up.router_if, "net_ns_fd": router_fd},
+        )
         hidx = ipr.link_lookup(ifname=up.host_if)[0]
         ipr.addr("add", index=hidx, address=up.host_ip, prefixlen=LINK_PREFIX)
         ipr.link("set", index=hidx, state="up")
