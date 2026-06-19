@@ -32,6 +32,7 @@ podman's rootless user+mount namespaces in-process (netns.in_podman_context):
     uv run turnip down      # remove them
 """
 
+import argparse
 import contextlib
 import json
 import os
@@ -80,10 +81,11 @@ HOST_KEY = ["ipv4_addr", "ipv4_addr"]
 # --- IO: config discovery + runtime resolution (kept here, out of the modules) ---
 
 
-def load_config() -> Turnip:
-    """Read + validate the config. Discovery: $TURNIP_CONFIG, else ./turnip.json.
-    The file/env reads live here; `config` only validates the parsed data."""
-    path = Path(os.environ.get("TURNIP_CONFIG", "turnip.json"))
+def load_config(path: Path | None = None) -> Turnip:
+    """Read + validate the config. Discovery: an explicit `path` (--config), else
+    $TURNIP_CONFIG, else ./turnip.json. The file/env reads live here; `config` only
+    validates the parsed data."""
+    path = path or Path(os.environ.get("TURNIP_CONFIG", "turnip.json"))
     return Turnip.model_validate(json.loads(path.read_text()))
 
 
@@ -656,13 +658,35 @@ def down(model: Model, runtime: ResolvedRuntime) -> None:
     in_podman_context(runtime, model.teardown)
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """The CLI surface. Subcommands `up`/`down`; bare `turnip` defaults to `up`.
+    `--config` overrides the $TURNIP_CONFIG / ./turnip.json discovery."""
+    parser = argparse.ArgumentParser(
+        prog="turnip",
+        description="A persistent rootless container network for podman -- routed L3, "
+        "default-deny, driven by a declarative turnip.json.",
+    )
+    parser.add_argument(
+        "-c",
+        "--config",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="config file (default: $TURNIP_CONFIG, else ./turnip.json)",
+    )
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("up", help="create + wire the namespaces the config implies")
+    sub.add_parser("down", help="tear them down")
+    return parser.parse_args(argv)
+
+
 def main() -> None:
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "up"
+    args = parse_args()
 
     # Resolve everything env-dependent here in the PARENT (env + passwd db intact),
     # build the runtime model, then run the command -- which forks into podman for the
     # netns work and does the host edge here in the init netns.
-    turnip = load_config()
+    turnip = load_config(args.config)
     runtime = resolve_runtime(turnip.runtime)
     # The host edge (any uplink/links) needs the init netns -> privilege. For now that
     # means sudo; CAP_NET_ADMIN-as-user is deferred (todo.md).
@@ -670,13 +694,11 @@ def main() -> None:
         sys.exit("config needs the host edge (uplink/links) -- run via sudo")
     model = build_model(turnip, runtime.state_dir)
 
-    match cmd:
-        case "up":
-            up(model, runtime)
+    match args.command:
         case "down":
             down(model, runtime)
-        case _:
-            sys.exit(f"usage: {sys.argv[0]} {{up|down}}")
+        case _:  # "up", or no subcommand -> default to up
+            up(model, runtime)
 
 
 if __name__ == "__main__":
