@@ -120,6 +120,30 @@ def test_build_model_lowers_egress() -> None:
     assert rules[0].proto == [Proto.UDP, Proto.TCP] and rules[0].port == 53
 
 
+def test_build_model_lowers_ingress() -> None:
+    model = _model(
+        {"proxy": {}},
+        {
+            "lan": {
+                "gateway": "10.0.0.1",
+                "gateway_if": "gw0",
+                "uplink": {"host_if": "h", "router_if": "r", "link": "169.254.1.0"},
+                "attach": {
+                    "proxy": {
+                        "ip": "10.0.0.13",
+                        "interface": "eth0",
+                        "ingress": [{"proto": "tcp", "host_port": 8443, "port": 443}],
+                    }
+                },
+            }
+        },
+    )
+    ep = model.networks[0].endpoints[0]
+    assert len(ep.ingress) == 1
+    ing = ep.ingress[0]
+    assert (ing.proto, ing.host_port, ing.port) == (Proto.TCP, 8443, 443)
+
+
 def test_build_model_no_uplink_is_none() -> None:
     model = _model(
         {"hass": {}},

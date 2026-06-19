@@ -39,7 +39,7 @@ import os
 import pwd
 import sys
 from collections.abc import Callable, Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Self
 
@@ -51,6 +51,7 @@ from .config import (
     LINK_PREFIX,
     Egress,
     Flow,
+    IngressRule,
     NetworkType,
     Proto,
     ResolvedRuntime,
@@ -170,6 +171,8 @@ class Endpoint:
     cont_if: str  # container-side iface name (from attach.interface)
     ip: str  # the container's /32 on this network
     egress: Egress = False  # outbound allowance out this network's uplink (bool | rules)
+    # host_port -> container DNATs (published ports)
+    ingress: list[IngressRule] = field(default_factory=list[IngressRule])
 
 
 @dataclass
@@ -310,7 +313,14 @@ def build_model(turnip: Turnip, state_dir: Path) -> Model:
         if net.gateway_if is None:  # validator guarantees this for a router network
             raise ValueError(f"router network {net_name!r} has no gateway_if")
         endpoints = [
-            Endpoint(containers[cname], router_if(cname), att.interface, str(att.ip), att.egress)
+            Endpoint(
+                containers[cname],
+                router_if(cname),
+                att.interface,
+                str(att.ip),
+                att.egress,
+                att.ingress,
+            )
             for cname, att in net.attach.items()
         ]
         uplink = None
@@ -451,30 +461,45 @@ def build_nft(network: Network) -> nft.Ruleset:
     sd = [nft.payload("ip", "saddr"), nft.payload("ip", "daddr")]  # shared saddr.daddr key
     table = nft.Table("inet", NFT_TABLE)
 
-    # egress: a container with egress may INITIATE out the uplink (oif = the router's
-    # uplink veth). `True` = any dest/proto/port; a list = scoped to (proto, port). The
-    # return path rides ct established/related (no reverse rule). Appended after the
-    # intra-network vmaps, before the policy drop.
-    egress_rules: list[nft.Add] = []
+    # The host-edge allow rules (only meaningful with an uplink), appended after the
+    # intra-network vmaps, before the policy drop. The return path always rides ct
+    # established/related, so these are one-directional.
+    #   egress  -- a container may INITIATE out the uplink (oif = uplink, saddr =
+    #              container). `True` = any; a list = scoped to (proto, port).
+    #   ingress -- post-DNAT, allow IN the uplink to a published container port (iif =
+    #              uplink, daddr = container, the CONTAINER port). Keyed on dest, since
+    #              the client source is a wildcard after the host's DNAT.
+    edge_rules: list[nft.Add] = []
     if network.uplink is not None:
         uplink_if = network.uplink.router_if
         for ep in network.endpoints:
-            if not ep.egress:
-                continue
-            scope = (
-                nft.ct_state("new"),
-                nft.match(nft.meta("oifname"), uplink_if),
-                nft.match(nft.payload("ip", "saddr"), ep.ip),
-            )
-            if ep.egress is True:
-                egress_rules.append(table.rule("forward", *scope, nft.accept()))
-            else:
-                for er in ep.egress:
-                    for proto in er.proto:
-                        exprs = [*scope, nft.match(nft.meta("l4proto"), proto.value)]
-                        if proto is not Proto.ICMP and er.port not in (None, "any"):
-                            exprs.append(nft.match(nft.payload("th", "dport"), er.port))
-                        egress_rules.append(table.rule("forward", *exprs, nft.accept()))
+            if ep.egress:
+                scope = (
+                    nft.ct_state("new"),
+                    nft.match(nft.meta("oifname"), uplink_if),
+                    nft.match(nft.payload("ip", "saddr"), ep.ip),
+                )
+                if ep.egress is True:
+                    edge_rules.append(table.rule("forward", *scope, nft.accept()))
+                else:
+                    for er in ep.egress:
+                        for proto in er.proto:
+                            exprs = [*scope, nft.match(nft.meta("l4proto"), proto.value)]
+                            if proto is not Proto.ICMP and er.port not in (None, "any"):
+                                exprs.append(nft.match(nft.payload("th", "dport"), er.port))
+                            edge_rules.append(table.rule("forward", *exprs, nft.accept()))
+            for ing in ep.ingress:
+                edge_rules.append(
+                    table.rule(
+                        "forward",
+                        nft.ct_state("new"),
+                        nft.match(nft.meta("iifname"), uplink_if),
+                        nft.match(nft.payload("ip", "daddr"), ep.ip),
+                        nft.match(nft.meta("l4proto"), ing.proto.value),
+                        nft.match(nft.payload("th", "dport"), ing.port or ing.host_port),
+                        nft.accept(),
+                    )
+                )
 
     return nft.ruleset(
         [
@@ -499,7 +524,7 @@ def build_nft(network: Network) -> nft.Ruleset:
                     "allowed_flows",
                 ),
             ),
-            *egress_rules,
+            *edge_rules,
         ]
     )
 
@@ -543,19 +568,40 @@ def apply_dataplane_fd(network: Network, router_fd: int) -> None:
 
 def build_host_nft(network: Network) -> nft.Ruleset:
     """The host-side nat zone for a network's uplink, in the init netns: one
-    `ip turnip_host_<net>` table that masquerades traffic forwarded IN from the uplink
-    (so egressing container sources are SNAT'd to the host's WAN address). iif-matched,
-    not subnet-matched -- the routed /32 model declares no subnet."""
+    `ip turnip_host_<net>` table. Postrouting masquerades traffic forwarded IN from the
+    uplink (egress SNAT; iif-matched -- the routed /32 model declares no subnet).
+    Prerouting DNATs published host ports to container:port (ingress / port forwards),
+    added only when some attachment has ingress. The egress (iif uplink) vs ingress
+    (iif WAN) split means masquerade fires only on egress, DNAT only on ingress, and
+    each connection's NAT is decided on its first packet -- they don't collide."""
     up = network.uplink
     assert up is not None  # only called for uplinked networks
     table = nft.Table("ip", f"turnip_host_{network.name}")
-    return nft.ruleset(
-        [
-            *table.reload(),
-            table.chain("postrouting", type="nat", hook="postrouting", prio=100, policy="accept"),
-            table.rule("postrouting", nft.match(nft.meta("iifname"), up.host_if), nft.masquerade()),
-        ]
-    )
+
+    dnat_rules: list[nft.Add] = []
+    for ep in network.endpoints:
+        for ing in ep.ingress:
+            exprs: list[nft.Expr] = []
+            if str(ing.listen) != "0.0.0.0":  # default 0.0.0.0 = any host address
+                exprs.append(nft.match(nft.payload("ip", "daddr"), str(ing.listen)))
+            exprs += [
+                nft.match(nft.meta("l4proto"), ing.proto.value),
+                nft.match(nft.payload("th", "dport"), ing.host_port),
+                nft.dnat(ep.ip, ing.port or ing.host_port),  # port defaults to host_port
+            ]
+            dnat_rules.append(table.rule("prerouting", *exprs))
+
+    cmds: list[nft.Command] = [
+        *table.reload(),
+        table.chain("postrouting", type="nat", hook="postrouting", prio=100, policy="accept"),
+        table.rule("postrouting", nft.match(nft.meta("iifname"), up.host_if), nft.masquerade()),
+    ]
+    if dnat_rules:
+        cmds.append(
+            table.chain("prerouting", type="nat", hook="prerouting", prio=-100, policy="accept")
+        )
+        cmds.extend(dnat_rules)
+    return nft.ruleset(cmds)
 
 
 def configure_host_nat(network: Network) -> None:

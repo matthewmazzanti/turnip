@@ -156,6 +156,15 @@ class Masquerade:
     outgoing interface's address. The host-edge egress primitive. No-options form."""
 
 
+@dataclass(frozen=True)
+class Dnat:
+    """The `dnat` nat statement (a prerouting/dstnat chain): rewrite the destination to
+    `addr:port`. The host-edge ingress (port-forward) primitive."""
+
+    addr: str
+    port: int
+
+
 # --- object types -----------------------------------------------------------
 
 
@@ -260,7 +269,7 @@ class Table:
 
 # Expressions; what an op accepts as an operand (Value); table-level objects;
 # command verbs. render() is total over Value | Object | Command.
-Expr = Payload | Meta | Ct | Concat | Match | Vmap | Verdict | Masquerade
+Expr = Payload | Meta | Ct | Concat | Match | Vmap | Verdict | Masquerade | Dnat
 Value = Expr | Lit | list[str | int]
 Object = Table | Chain | VerdictMap | Rule
 Command = Add | Delete
@@ -290,6 +299,8 @@ def render(x: Value | Object | Command | Ruleset) -> Any:
             return {x.kind: {"target": x.target} if x.target is not None else None}
         case Masquerade():
             return {"masquerade": None}
+        case Dnat():
+            return {"dnat": {"addr": x.addr, "port": x.port}}
         case Table():
             return {"table": {"family": x.family, "name": x.name}}
         case Chain():
@@ -384,6 +395,10 @@ def ct_state(*states: str) -> Match:
 
 def masquerade() -> Masquerade:
     return Masquerade()
+
+
+def dnat(addr: str, port: int) -> Dnat:
+    return Dnat(addr, port)
 
 
 def accept() -> Verdict:
