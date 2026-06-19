@@ -24,7 +24,7 @@ import os
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager, suppress
 
 # A socket server that accepts (and immediately drops) connections until a deadline,
@@ -104,6 +104,14 @@ class Probe:
     def iface_exists(self, container: str, ifname: str) -> bool:
         return self._run(container, ["ip", "link", "show", "dev", ifname]).returncode == 0
 
+    def link_kind(self, container: str, ifname: str) -> str | None:
+        """IFLA_INFO_KIND of `ifname` in `container` ('macvlan', 'ipvlan', ...) -- the
+        kernel's own device type, for asserting a link landed as the right kind."""
+        cp = self._run(container, ["ip", "-d", "-j", "link", "show", "dev", ifname])
+        if cp.returncode != 0:
+            return None
+        return json.loads(cp.stdout)[0].get("linkinfo", {}).get("info_kind")
+
     # --- the host INIT netns (the probe's own netns; no podman-unshare) ----------
     # For devices that live host-side: a phys device moved OUT of init (and returned on
     # down), a veth->host host end, the uplink host end.
@@ -130,7 +138,7 @@ class Probe:
     # --- reachability (the external property a lowering bug cannot fake) ---
 
     @contextmanager
-    def listener(self, container: str, port: int, seconds: float = 15) -> Iterator[None]:
+    def listener(self, container: str, port: int, seconds: float = 15) -> Generator[None]:
         """Run a TCP listener on `port` inside `container` for the block's duration."""
         proc = subprocess.Popen(
             self._wrap(container, ["python3", "-c", _LISTEN, str(port), str(seconds)]),

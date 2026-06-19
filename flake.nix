@@ -88,6 +88,10 @@
             inherit lib;
             turnipEnv = self.packages.${system}.turnip;
           });
+          integration-uplink = pkgs.testers.runNixOSTest (import ./tests/nixos/uplink.nix {
+            inherit lib;
+            turnipEnv = self.packages.${system}.turnip;
+          });
         });
 
       devShells = forAllSystems (system:

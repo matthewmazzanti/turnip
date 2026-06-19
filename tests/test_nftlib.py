@@ -102,6 +102,18 @@ def test_vmap_renders_set_reference() -> None:
     assert nft.render(nft.vmap(sd, "allowed_hosts"))["vmap"]["data"] == "@allowed_hosts"
 
 
+def test_verdict_map_omits_elem_when_empty() -> None:
+    # nft rejects `"elem": []` ("Invalid set elem expression"); an empty map must
+    # render with no `elem` key (a flow-less network -- uplink egress/ingress only --
+    # produces exactly this empty allowed_flows map). A non-empty map keeps `elem`.
+    table = nft.Table("inet", "turnip")
+    empty = nft.render(table.verdict_map("allowed_flows", ["ipv4_addr"], []))
+    assert "elem" not in empty["add"]["map"]
+    elems: list[tuple[nft.Expr, nft.Expr]] = [(nft.concat("1.2.3.4", "5.6.7.8"), nft.accept())]
+    full = nft.render(table.verdict_map("m", ["ipv4_addr", "ipv4_addr"], elems))
+    assert "elem" in full["add"]["map"]
+
+
 def test_verdicts_render() -> None:
     assert nft.render(nft.accept()) == {"accept": None}
     assert nft.render(nft.drop()) == {"drop": None}

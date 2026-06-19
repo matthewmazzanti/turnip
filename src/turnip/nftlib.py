@@ -319,16 +319,20 @@ def render(x: Value | Object | Command | Ruleset) -> Any:
                 spec["policy"] = x.policy
             return {"chain": spec}
         case VerdictMap():
-            return {
-                "map": {
-                    "family": x.family,
-                    "table": x.table,
-                    "name": x.name,
-                    "map": "verdict",
-                    "type": list(x.key_type),
-                    "elem": [[render(k), render(v)] for k, v in x.elements],
-                }
+            spec = {
+                "family": x.family,
+                "table": x.table,
+                "name": x.name,
+                "map": "verdict",
+                "type": list(x.key_type),
             }
+            # Omit `elem` entirely when empty: nft rejects `"elem": []` ("Invalid set
+            # elem expression"), but a map declared with no elements is valid -- a vmap
+            # into it just falls through. (A flow-less network -- e.g. uplink egress/
+            # ingress only -- produces exactly this empty allowed_flows map.)
+            if x.elements:
+                spec["elem"] = [[render(k), render(v)] for k, v in x.elements]
+            return {"map": spec}
         case Rule():
             return {
                 "rule": {
