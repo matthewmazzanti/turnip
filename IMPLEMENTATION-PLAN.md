@@ -320,12 +320,17 @@ Net: the rewire drops the `verify` command; `up`/`down` remain.
   - **`nix/turnip-host.nix`** is the shared substrate (rootless podman + `homelab` +
     nft/ip) imported by both the interactive dev VM (`nix/testvm.nix`, which stays
     on the *live* 9p source for the fast manual loop) and the test nodes.
-  - **`tests/integration/probe.py`** is the black-box probe toolkit (live `ip -j` /
-    `nft` introspection + real reachability via `podman unshare nsenter`), taking
-    *explicit* hand-authored expectations. **`tests/nixos/integration.nix`** boots a
-    fresh host and runs scenarios: `turnip up` → probe script → `turnip down`.
-  - The dev VM + the same probe toolkit remain the fast manual-debug loop; pure
-    helper/golden tests stay host `pytest`, ungated.
+  - **Scenarios are pytest** (one source, thin runners): `tests/integration/probe.py`
+    (black-box `ip -j`/`nft` introspection + reachability via `podman unshare nsenter`),
+    `scenarios.py` (the registry — `Scenario(config, check, anchors, marks)` with
+    hand-authored `assert`s), `conftest.py` (the `integration`/`needs_world`/`needs_image`
+    gating + a `turnip` fixture with **guaranteed teardown**), `test_integration.py`
+    (parametrized). Runners: **`just itest`** in the persistent dev VM (fast loop) and
+    **`pytest -m …`** inside the NixOS nodes (`integration.nix`/`podman.nix`/`uplink.nix`,
+    which now just provision + run pytest on the `turnip-test` env). Adding a `Scenario`
+    runs it everywhere with no `.nix` edit.
+  - Pure helper/golden tests stay host `pytest` (integration tests skip there, no
+    `TURNIP_INTEGRATION`).
 
 ## Still open
 

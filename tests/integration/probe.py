@@ -22,7 +22,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import time
 from collections.abc import Generator
 from contextlib import contextmanager, suppress
@@ -156,24 +155,3 @@ class Probe:
         """True if a TCP connect from inside `src` to `dst_ip:port` succeeds."""
         cp = self._run(src, ["python3", "-c", _CONNECT, dst_ip, str(port), str(timeout)])
         return cp.returncode == 0
-
-
-class Checks:
-    """A tiny pass/fail accumulator -- prints each result, exits nonzero if any failed
-    (so a scenario is a process the test driver runs and checks the exit code of)."""
-
-    def __init__(self) -> None:
-        self.failed: list[str] = []
-
-    def ok(self, condition: bool, label: str) -> None:  # noqa: FBT001
-        print(f"  [{'PASS' if condition else 'FAIL'}] {label}")
-        if not condition:
-            self.failed.append(label)
-
-    def done(self) -> None:
-        if self.failed:
-            print(f"\n{len(self.failed)} check(s) FAILED:")
-            for f in self.failed:
-                print(f"  - {f}")
-            sys.exit(1)
-        print("\nall checks passed")

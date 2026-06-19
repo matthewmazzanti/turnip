@@ -44,18 +44,12 @@ in
     # the LAN is up + the listener is reachable from the host before turnip runs
     host.wait_until_succeeds("python3 /etc/turnip-tests/_connect.py 192.168.1.2 8888 2")
 
-    def scenario(name, config):
-        cfg = f"/etc/turnip-tests/configs/{config}"
-        with subtest(name):
-            host.succeed(f"TURNIP_CONFIG={cfg} turnip up")
-            host.succeed(f"PYTHONPATH=/etc/turnip-tests python3 /etc/turnip-tests/{name}.py")
-            host.succeed(f"TURNIP_CONFIG={cfg} turnip down")
-
-    # egress: only an `egress` container reaches world; default-deny otherwise.
-    scenario("scenario_uplink", "uplink.json")
-
-    # macvlan / ipvlan children reach world directly over their LANs (bypassing host).
-    scenario("scenario_linklan", "linklan.json")
+    # the needs_world scenarios (uplink egress + macvlan/ipvlan LAN reachability) live in
+    # the pytest registry; run them on the host (world is the off-box peer they reach).
+    host.succeed(
+        "TURNIP_INTEGRATION=1 TURNIP_WORLD=1 PYTHONDONTWRITEBYTECODE=1 "
+        "pytest -p no:cacheprovider -v -m needs_world /etc/turnip-tests"
+    )
 
     # ingress DNAT: world -> host:8080 -> svc:80. The svc-side listener lives in the
     # container netns (a transient unit so it outlives the start command); world is the

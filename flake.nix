@@ -92,15 +92,15 @@
         {
           integration = pkgs.testers.runNixOSTest (import ./tests/nixos/integration.nix {
             inherit lib;
-            turnipEnv = self.packages.${system}.turnip;
+            turnipEnv = self.packages.${system}.turnip-test;
           });
           integration-uplink = pkgs.testers.runNixOSTest (import ./tests/nixos/uplink.nix {
             inherit lib;
-            turnipEnv = self.packages.${system}.turnip;
+            turnipEnv = self.packages.${system}.turnip-test;
           });
           integration-podman = pkgs.testers.runNixOSTest (import ./tests/nixos/podman.nix {
             inherit lib;
-            turnipEnv = self.packages.${system}.turnip;
+            turnipEnv = self.packages.${system}.turnip-test;
             # a registry-free OCI image (python3 only) + a tiny connect-by-host:port
             # script inside it, referenced by absolute path to dodge shell quoting.
             image = pkgs.dockerTools.buildLayeredImage {
