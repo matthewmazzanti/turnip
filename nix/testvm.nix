@@ -17,13 +17,14 @@
 #   homelab@turnip$ turnip up        # runs /mnt/turnip/src against turnip.example.json
 { pkgs, ... }:
 let
-  # turnip's runtime deps from nixpkgs -- no uv / network needed in the VM. We run the
-  # live-mounted src/ directly rather than the packaged wheel (that's what the dev VM
-  # is FOR; the tests use the uv2nix package instead).
+  # turnip's runtime deps from nixpkgs -- we run the live-mounted src/ directly (the dev
+  # VM's whole purpose), so this is a plain python+deps, NOT the uv2nix `turnip-test` env:
+  # that env ships its own packaged `turnip` bin, which would collide with the live-source
+  # `turnip` wrapper below. (The hermetic tests use the uv2nix package instead.)
   pyEnv = pkgs.python314.withPackages (ps: [
     ps.pydantic
     ps.pyroute2
-    ps.pytest # run the unit suite inside the VM against the live-mounted source
+    ps.pytest # `just itest` runs the integration suite in-VM against the live source
   ]);
 
   # `turnip` on PATH: run the live source as the package, defaulting the config to the
