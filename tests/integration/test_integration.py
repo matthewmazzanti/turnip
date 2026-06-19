@@ -1,8 +1,9 @@
 """Integration tests -- one explicit function per scenario, with the network config
 written INLINE (turnip({...})) right next to its hand-authored expectations (asserts via
-Probe; never derived from turnip's model -- see probe.py). Skipped unless
-TURNIP_INTEGRATION (conftest). Everything runs on one host: the `world` fixture is an
-in-host netns peer for the uplink + LAN-link scenarios.
+Probe; never derived from turnip's model -- see harness.py). Skipped unless
+TURNIP_INTEGRATION (conftest). The helpers (turnip/world/ensure_anchors/Probe) are
+imported from harness -- explicit, no fixtures. Everything runs on one host: `world()` is
+an in-host netns peer for the uplink + LAN-link scenarios.
 
 Run them: `just itest` (dev VM, fast loop) or `nix build .#checks.<sys>.integration` (CI).
 """
@@ -13,7 +14,10 @@ import os
 import subprocess
 
 import pytest
-from probe import Probe
+from harness import Probe, Seg, ensure_anchors, turnip, turnip_attempt, world
+
+# the world peer the two uplink tests reach over the host edge (routed, so host_cidr set).
+WORLD_UPLINK = Seg("w-up", "198.51.100.2/24", "198.51.100.1/24")
 
 # shared by more than one test, so lifted to a constant; single-use configs stay inline.
 ROUTER = {
@@ -55,7 +59,7 @@ UPLINK = {
 }
 
 
-def test_router(turnip) -> None:
+def test_router() -> None:
     # routed /32s + default routes, then the directional flow matrix vs live listeners.
     with turnip(ROUTER):
         p = Probe()
@@ -69,9 +73,9 @@ def test_router(turnip) -> None:
             assert not p.connects("proxy", "10.0.0.12", 443), "proxy->hass:443 DROPPED (1-way)"
 
 
-def test_links(turnip, anchors) -> None:
+def test_links() -> None:
     # links are the L2 trust escape -- OUTSIDE every router's nft policy.
-    anchors([("bridge", "br-lan"), ("dummy", "net-phys")])
+    ensure_anchors([("bridge", "br-lan"), ("dummy", "net-phys")])
     with turnip({
         "containers": {
             "br1": {"links": [{"type": "veth", "bridge": "br-lan", "name": "eth0",
@@ -99,24 +103,24 @@ def test_links(turnip, anchors) -> None:
         assert not p.init_iface_exists("net-phys"), "net-phys moved into ph"
 
 
-def test_uplink_egress(turnip, world) -> None:
+def test_uplink_egress() -> None:
     # default-deny across the uplink: only an `egress` container reaches world.
-    with turnip(UPLINK):
+    with world(WORLD_UPLINK), turnip(UPLINK):
         p = Probe()
-        assert p.connects("out", world.ip, 8888), "out has egress -> world reachable"
-        assert not p.connects("quiet", world.ip, 8888), "quiet has no egress -> dropped"
+        assert p.connects("out", "198.51.100.2", 8888), "out has egress -> world reachable"
+        assert not p.connects("quiet", "198.51.100.2", 8888), "quiet has no egress -> dropped"
 
 
-def test_uplink_ingress(turnip, world) -> None:
+def test_uplink_ingress() -> None:
     # world -> host:8080 -> DNAT -> svc:80 (world is the external client).
-    with turnip(UPLINK), Probe().listener("svc", 80):
-        assert world.connects(world.host_uplink_ip, 8080), "published port DNATs to svc"
-        assert not world.connects(world.host_uplink_ip, 9999), "unpublished port refused"
+    with world(WORLD_UPLINK) as w, turnip(UPLINK), Probe().listener("svc", 80):
+        assert w.connects("198.51.100.1", 8080), "published port DNATs to svc"
+        assert not w.connects("198.51.100.1", 9999), "unpublished port refused"
 
 
-def test_linklan(turnip, world) -> None:
+def test_linklan() -> None:
     # macvlan / ipvlan children reach world directly over their parent LANs (bypass host).
-    with turnip({
+    with world(Seg("mv-par", "192.168.1.2/24"), Seg("iv-par", "192.168.2.2/24")), turnip({
         "containers": {
             "mv": {"links": [{"type": "macvlan", "parent": "mv-par", "name": "lan0",
                               "address": "192.168.1.50/24"}]},
@@ -155,11 +159,11 @@ _REJECTED = {
 
 
 @pytest.mark.parametrize("config", _REJECTED.values(), ids=_REJECTED.keys())
-def test_config_rejected(config, turnip_attempt) -> None:
+def test_config_rejected(config) -> None:
     assert turnip_attempt(config) != 0
 
 
-def test_podman_attach(turnip) -> None:
+def test_podman_attach() -> None:
     # a real container joins zwave's netns via run-container.sh and resolves hass BY NAME
     # through the generated /etc/hosts; the denied peer is still dropped. Needs the image.
     image = os.environ.get("TURNIP_TEST_IMAGE")
