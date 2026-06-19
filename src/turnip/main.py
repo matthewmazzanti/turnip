@@ -75,9 +75,8 @@ from .netns import (
 IFNAMSIZ = 15  # kernel cap on an interface name; a derived veth name must fit
 NFT_TABLE = "turnip"  # the per-router-netns nft table (one per netns; constant name)
 
-# Map key types of the two verdict maps (the `type ...` of each).
+# Map key type of the allowed_flows verdict map (its `type ...`).
 FLOW_KEY = ["ipv4_addr", "ipv4_addr", "inet_proto", "inet_service"]
-HOST_KEY = ["ipv4_addr", "ipv4_addr"]
 
 
 # --- IO: config discovery + runtime resolution (kept here, out of the modules) ---
@@ -432,13 +431,13 @@ def router_sysctls(network: Network) -> dict[str, str]:
 def build_nft(network: Network) -> nft.Ruleset:
     """The `inet turnip` ruleset for one router netns: the forward flow matrix.
 
-    flush-and-reload (Table.reload) so re-applying replaces the table atomically.
-    Maps precede the rules that use them. The forward chain (policy drop) accepts:
-    established/related (conntrack return path -- so flows are one-way in the maps);
-    drops invalid; then for new conns -- ICMP only between gateway-authorized pairs,
-    any-port gateway pairs (allowed_hosts), and service-scoped pairs (allowed_flows;
-    `th dport` covers tcp AND udp). Else policy drop."""
-    gw = network.gateway
+    flush-and-reload (Table.reload) so re-applying replaces the table atomically. The
+    forward chain (policy drop) accepts: established/related (the conntrack return path
+    -- so flows are one-way in the map); drops invalid; then for new conns the
+    service-scoped intra-network flows (allowed_flows; `th dport` covers tcp AND udp)
+    and the host-edge egress/ingress allows. Else policy drop. (Container<->gateway
+    traffic targets the router's OWN address -- INPUT/OUTPUT, not the forward chain --
+    so it isn't gated here; with no INPUT base chain it defaults to accept.)"""
     ip = {ep.container.name: ep.ip for ep in network.endpoints}
 
     # allowed_flows: one entry per flow, DIRECTIONAL -- `from` may initiate to
@@ -451,12 +450,6 @@ def build_nft(network: Network) -> nft.Ruleset:
             raise NotImplementedError("icmp / port='any' in flows is not wired yet")
         key = nft.concat(ip[flow.from_], ip[flow.to], flow.proto.value, flow.port)
         flow_elem.append((key, nft.accept()))
-
-    # allowed_hosts: every attached container <-> the gateway, both directions.
-    host_elem: list[tuple[nft.Expr, nft.Expr]] = []
-    for cip in ip.values():
-        host_elem.append((nft.concat(cip, gw), nft.accept()))
-        host_elem.append((nft.concat(gw, cip), nft.accept()))
 
     sd = [nft.payload("ip", "saddr"), nft.payload("ip", "daddr")]  # shared saddr.daddr key
     table = nft.Table("inet", NFT_TABLE)
@@ -506,16 +499,8 @@ def build_nft(network: Network) -> nft.Ruleset:
             *table.reload(),
             table.chain("forward", type="filter", hook="forward", prio=0, policy="drop"),
             table.verdict_map("allowed_flows", FLOW_KEY, flow_elem),
-            table.verdict_map("allowed_hosts", HOST_KEY, host_elem),
             table.rule("forward", nft.ct_state("established", "related"), nft.accept()),
             table.rule("forward", nft.ct_state("invalid"), nft.drop()),
-            table.rule(
-                "forward",
-                nft.ct_state("new"),
-                nft.match(nft.meta("l4proto"), "icmp"),
-                nft.vmap(nft.concat(*sd), "allowed_hosts"),
-            ),
-            table.rule("forward", nft.ct_state("new"), nft.vmap(nft.concat(*sd), "allowed_hosts")),
             table.rule(
                 "forward",
                 nft.ct_state("new"),
