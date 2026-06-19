@@ -96,7 +96,7 @@ import sys
 import traceback
 from collections.abc import Callable
 
-from pyroute2 import NetNS, netns
+from pyroute2 import IPRoute, NetNS, netns
 
 from .config import ResolvedRuntime
 
@@ -296,8 +296,9 @@ def remove_netns(p: str) -> None:
                 pass
 
 
-def find_ifindex(ns: NetNS, ifname: str) -> int | None:
-    """ifindex of `ifname` in `ns`, or None if absent.
+def find_ifindex(ns: IPRoute, ifname: str) -> int | None:
+    """ifindex of `ifname` in `ns`, or None if absent. `ns` is any netlink socket --
+    a `NetNS` bound into a netns, or a plain `IPRoute` (the init netns / host edge).
 
     Raises if MORE than one link matches: a lookup by name should be unique, so
     >1 is an ambiguity we surface rather than silently taking the first. Absent
@@ -316,7 +317,7 @@ def find_ifindex(ns: NetNS, ifname: str) -> int | None:
     return found[0] if found else None
 
 
-def ifindex(ns: NetNS, ifname: str) -> int:
+def ifindex(ns: IPRoute, ifname: str) -> int:
     """ifindex of `ifname` in `ns`; raise if absent. Use where it must exist."""
     idx = find_ifindex(ns, ifname)
     if idx is None:

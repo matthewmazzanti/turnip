@@ -59,6 +59,7 @@ from .netns import (
     collect_fds_from_child,
     create_netns,
     enter_podman,
+    find_ifindex,
     ifindex,
     in_podman_context,
     remove_netns,
@@ -580,15 +581,12 @@ def teardown_host_edge(model: Model) -> None:
     uplinks = [net.uplink for net in model.networks if net.uplink is not None]
     if not uplinks:
         return
-    ipr = IPRoute()
-    try:
+    with IPRoute() as ipr:
         for up in uplinks:
-            found = ipr.link_lookup(ifname=up.host_if)
-            if found:
-                ipr.link("del", index=found[0])
+            idx = find_ifindex(ipr, up.host_if)
+            if idx is not None:
+                ipr.link("del", index=idx)
                 print(f"  removed host uplink veth {up.host_if}")
-    finally:
-        ipr.close()
 
 
 def host_edge_connect(network: Network, router_fd: int) -> None:
@@ -606,30 +604,24 @@ def host_edge_connect(network: Network, router_fd: int) -> None:
     up = network.uplink
     if up is None:
         return
-    ipr = IPRoute()
-    try:
-        # host end in init, router end born directly in the router netns via the fd
+    # host end in init, router end born directly in the router netns via the fd
+    with IPRoute() as ipr:
         ipr.link(
             "add",
             ifname=up.host_if,
             kind="veth",
             peer={"ifname": up.router_if, "net_ns_fd": router_fd},
         )
-        hidx = ipr.link_lookup(ifname=up.host_if)[0]
+        hidx = ifindex(ipr, up.host_if)
         ipr.addr("add", index=hidx, address=up.host_ip, prefixlen=LINK_PREFIX)
         ipr.link("set", index=hidx, state="up")
-    finally:
-        ipr.close()
 
     def configure_router_end() -> str:
-        r = IPRoute()
-        try:
-            ridx = r.link_lookup(ifname=up.router_if)[0]
+        with IPRoute() as r:
+            ridx = ifindex(r, up.router_if)
             r.addr("add", index=ridx, address=up.router_ip, prefixlen=LINK_PREFIX)
             r.link("set", index=ridx, state="up")
             r.route("add", dst="default", gateway=up.host_ip, oif=ridx)
-        finally:
-            r.close()
         return ""
 
     run_in_netns_fd(router_fd, configure_router_end)
@@ -666,9 +658,6 @@ def down(model: Model, runtime: ResolvedRuntime) -> None:
 
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "up"
-    fn = {"up": up, "down": down}.get(cmd)
-    if fn is None:
-        sys.exit(f"usage: {sys.argv[0]} {{up|down}}")
 
     # Resolve everything env-dependent here in the PARENT (env + passwd db intact),
     # build the runtime model, then run the command -- which forks into podman for the
@@ -680,7 +669,14 @@ def main() -> None:
     if turnip.requires_root and os.geteuid() != 0:
         sys.exit("config needs the host edge (uplink/links) -- run via sudo")
     model = build_model(turnip, runtime.state_dir)
-    fn(model, runtime)
+
+    match cmd:
+        case "up":
+            up(model, runtime)
+        case "down":
+            down(model, runtime)
+        case _:
+            sys.exit(f"usage: {sys.argv[0]} {{up|down}}")
 
 
 if __name__ == "__main__":
