@@ -44,6 +44,9 @@ reportIndexIssue = "none"
 reportUnknownMemberType = "none"
 reportUnknownVariableType = "none"
 reportUnknownArgumentType = "none"
+# pytest fixtures arrive as test-function params -- untyped by convention.
+reportMissingParameterType = "none"
+reportUnknownParameterType = "none"
 
 [tool.ruff]
 line-length = 100

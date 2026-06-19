@@ -1,44 +1,38 @@
-"""Integration-test gating + fixtures, shared by the dev-VM `just itest` loop and the
-hermetic NixOS checks.
+"""Integration-test fixtures + gating.
 
 Integration tests shell the `turnip` CLI on PATH (black-box) and probe the live system,
 so they only run in a rootful env with rootless podman. They are SKIPPED unless
 TURNIP_INTEGRATION is set -- a bare host `uv run pytest` runs only the pure unit tests
-and shows these as skipped. Scenarios that need extra resources self-skip too:
-TURNIP_WORLD (a peer node) and TURNIP_TEST_IMAGE (a loaded OCI image).
+and shows these (in tests/integration/) as skipped.
+
+Everything runs on ONE host: the `world` fixture provisions a peer in its own netns
+(not a second machine) for the uplink + LAN-link scenarios -- a netns peer exercises the
+same kernel forwarding/NAT/bridge paths as a separate box.
 """
 
 from __future__ import annotations
 
 import os
 import subprocess
+import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
-CONFIGS = Path(__file__).parent / "configs"
-
-# marker -> (env var that enables it, human description)
-_GATES = {
-    "integration": ("TURNIP_INTEGRATION", "a live rootful env"),
-    "needs_world": ("TURNIP_WORLD", "a peer `world` node"),
-    "needs_image": ("TURNIP_TEST_IMAGE", "a loaded OCI image"),
-}
-
-
-def pytest_configure(config: pytest.Config) -> None:
-    # registered here (not pyproject) so `pytest <dir>` works standalone in a node.
-    for mark, (_env, desc) in _GATES.items():
-        config.addinivalue_line("markers", f"{mark}: requires {desc}")
+HERE = Path(__file__).parent
+CONFIGS = HERE / "configs"
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Skip everything under tests/integration/ unless TURNIP_INTEGRATION is set."""
+    if os.environ.get("TURNIP_INTEGRATION"):
+        return
+    skip = pytest.mark.skip(reason="set TURNIP_INTEGRATION (live rootful env) to run")
     for item in items:
-        for mark, (env, desc) in _GATES.items():
-            if mark in item.keywords and not os.environ.get(env):
-                item.add_marker(pytest.mark.skip(reason=f"set {env} ({desc}) to run"))
+        if str(item.fspath).startswith(str(HERE)):
+            item.add_marker(skip)
 
 
 def _turnip(action: str, config: str) -> subprocess.CompletedProcess[str]:
@@ -48,8 +42,8 @@ def _turnip(action: str, config: str) -> subprocess.CompletedProcess[str]:
 
 @pytest.fixture
 def turnip() -> Callable[[str], object]:
-    """Factory: `with turnip("net.json"):` brings the network up and ALWAYS tears it down
-    (teardown in a finally -- a failing assertion can't leak a live netns)."""
+    """`with turnip("net.json"):` brings the network up and ALWAYS tears it down (a
+    failing assertion in the body can't leak a live netns -- teardown is in a finally)."""
 
     @contextmanager
     def _up_down(config: str) -> Generator[None]:
@@ -66,7 +60,7 @@ def turnip() -> Callable[[str], object]:
 @pytest.fixture
 def turnip_attempt() -> Callable[[str], int]:
     """Run `turnip up` for a config expected to FAIL, then always `down`; return the up
-    return code. For the negative (validation-reject) scenarios."""
+    return code (for the negative / validation-reject tests)."""
 
     def _attempt(config: str) -> int:
         rc = _turnip("up", config).returncode
@@ -77,13 +71,73 @@ def turnip_attempt() -> Callable[[str], int]:
 
 
 @pytest.fixture
-def ensure_anchors() -> Callable[[list[tuple[str, str]]], None]:
-    """Create each borrowed link anchor if absent (idempotent) -- a host bridge / a dummy
-    NIC. Self-contained on the dev VM; a no-op on a NixOS node that already has them."""
+def anchors() -> Callable[[list[tuple[str, str]]], None]:
+    """Create each borrowed link anchor if absent (idempotent) -- a host bridge / dummy
+    NIC. Self-contained on any rootful host; reaped with the host on teardown."""
 
-    def _ensure(anchors: list[tuple[str, str]]) -> None:
-        for kind, name in anchors:
+    def _ensure(specs: list[tuple[str, str]]) -> None:
+        for kind, name in specs:
             subprocess.run(["ip", "link", "add", name, "type", kind], capture_output=True)
             subprocess.run(["ip", "link", "set", name, "up"], capture_output=True)
 
     return _ensure
+
+
+# --- the `world` peer (an in-host netns, not a second machine) ---------------
+# Reachable three ways, one veth per role: via the host uplink (w-up, an L3 subnet the
+# host routes + masquerades to / DNATs from), and as the macvlan / ipvlan parents (mv-par
+# / iv-par -- L2 only, the child talks straight to world over the veth).
+
+_SEGMENTS = [
+    # (host_veth, world_veth, world_cidr, host_cidr | None)
+    ("w-up", "w-up-p", "198.51.100.2/24", "198.51.100.1/24"),  # uplink egress/ingress
+    ("mv-par", "mv-par-p", "192.168.1.2/24", None),  # macvlan parent LAN
+    ("iv-par", "iv-par-p", "192.168.2.2/24", None),  # ipvlan parent LAN
+]
+
+
+class World:
+    """Handle to the peer netns. `ip` is its uplink-facing address (the egress target);
+    `connects()` originates a TCP connect FROM world (the external client for ingress)."""
+
+    ip = "198.51.100.2"
+    host_uplink_ip = "198.51.100.1"
+
+    def connects(self, dst_ip: str, port: int, timeout: float = 3.0) -> bool:
+        cp = subprocess.run(
+            ["ip", "netns", "exec", "world", "python3", str(HERE / "_connect.py"),
+             dst_ip, str(port), str(timeout)],
+            capture_output=True,
+        )
+        return cp.returncode == 0
+
+
+@pytest.fixture
+def world() -> Generator[World]:
+    subprocess.run(["ip", "netns", "del", "world"], capture_output=True)  # clear any stale peer
+    subprocess.run(["ip", "netns", "add", "world"], check=True)
+    listener = None
+    try:
+        for host_v, world_v, world_cidr, host_cidr in _SEGMENTS:
+            subprocess.run(
+                ["ip", "link", "add", host_v, "type", "veth", "peer", "name", world_v,
+                 "netns", "world"], check=True,
+            )
+            subprocess.run(["ip", "link", "set", host_v, "up"], check=True)
+            subprocess.run(["ip", "-n", "world", "link", "set", world_v, "up"], check=True)
+            subprocess.run(
+                ["ip", "-n", "world", "addr", "add", world_cidr, "dev", world_v], check=True
+            )
+            if host_cidr:
+                subprocess.run(["ip", "addr", "add", host_cidr, "dev", host_v], check=True)
+        subprocess.run(["ip", "-n", "world", "link", "set", "lo", "up"], check=True)
+        # a listener on :8888 (all of world's addresses) -- the egress + LAN-link target.
+        listener = subprocess.Popen(
+            ["ip", "netns", "exec", "world", "python3", str(HERE / "_serve.py"), "8888"]
+        )
+        time.sleep(1)
+        yield World()
+    finally:
+        if listener is not None:
+            listener.kill()
+        subprocess.run(["ip", "netns", "del", "world"], capture_output=True)  # reaps the veths

@@ -303,34 +303,30 @@ Net: the rewire drops the `verify` command; `up`/`down` remain.
   expansion. Fast, ungated.
 - **nftlib golden** (`tests/test_nftlib.py`): regenerated at milestone 3 against
   the example config; the diff is the review artifact. Plus the **parity** golden.
-- **Integration tests** — **hermetic NixOS VM tests**, the authoritative regression
-  gate. Three derivations cover the whole surface (each `nix build .#checks.<sys>.<name>`):
-  - `integration` (single node) — routed flow matrix (allow/deny reachability) +
-    all link types that need no off-box peer (veth→bridge, veth→host, phys) +
-    negative validation rejects (bad anchor, phys-on-primary, macvlan⊕ipvlan).
-  - `integration-uplink` (host + world, two VLANs) — uplink egress (default-deny) +
-    ingress DNAT + macvlan/ipvlan reachability on a real LAN.
-  - `integration-podman` (single node + a nix-built OCI image) — the real
-    container-attach contract: a podman container joins a netns via
-    `run-container.sh` and resolves peers by name via the generated `/etc/hosts`.
-  (This suite immediately caught a real bug: a flow-less network rendered an empty
-  nft verdict map nft rejects — fixed in `nftlib.render`.) Structure:
+- **Integration tests** — **ONE hermetic NixOS gate** (`nix build
+  .#checks.<sys>.integration`) runs the WHOLE pytest suite on a single host: routed
+  flow matrix (allow/deny), all link types (veth→bridge/veth→host/phys/macvlan/ipvlan),
+  uplink egress + ingress DNAT, real podman attach, and the validation-reject negatives.
+  No multi-node test — the `world` peer is an in-host **netns fixture** (a netns peer
+  exercises the same kernel forwarding/NAT/bridge paths as a separate box). (The suite
+  immediately caught a real bug: a flow-less network rendered an empty nft verdict map
+  nft rejects — fixed in `nftlib.render`.) Structure:
   - **uv2nix** packages turnip from `uv.lock` (`packages.turnip` — the env with the
     `turnip` console script); the test nodes install it (no source mount).
   - **`nix/turnip-host.nix`** is the shared substrate (rootless podman + `homelab` +
     nft/ip) imported by both the interactive dev VM (`nix/testvm.nix`, which stays
     on the *live* 9p source for the fast manual loop) and the test nodes.
-  - **Scenarios are pytest** (one source, thin runners): `tests/integration/probe.py`
-    (black-box `ip -j`/`nft` introspection + reachability via `podman unshare nsenter`),
-    `scenarios.py` (the registry — `Scenario(config, check, anchors, marks)` with
-    hand-authored `assert`s), `conftest.py` (the `integration`/`needs_world`/`needs_image`
-    gating + a `turnip` fixture with **guaranteed teardown**), `test_integration.py`
-    (parametrized). Runners: **`just itest`** in the persistent dev VM (fast loop) and
-    **`pytest -m …`** inside the NixOS nodes (`integration.nix`/`podman.nix`/`uplink.nix`,
-    which now just provision + run pytest on the `turnip-test` env). Adding a `Scenario`
-    runs it everywhere with no `.nix` edit.
-  - Pure helper/golden tests stay host `pytest` (integration tests skip there, no
-    `TURNIP_INTEGRATION`).
+  - **Scenarios are explicit pytest functions** in `tests/integration/test_integration.py`
+    (`test_router`/`test_links`/`test_uplink_egress`/`test_uplink_ingress`/`test_linklan`/
+    `test_podman_attach` + parametrized negatives), with hand-authored `assert`s.
+    `probe.py` is the black-box toolkit (`ip -j`/`nft` introspection + reachability via
+    `podman unshare nsenter`). `conftest.py` holds the fixtures: `turnip` (up/down with
+    **guaranteed teardown**), `turnip_attempt` (negatives), `anchors` (bridge/dummy), and
+    **`world`** (the in-host netns peer), plus a skip-unless-`TURNIP_INTEGRATION` gate.
+  - Runners: **`just itest [-k …]`** in the persistent dev VM (fast loop) and the single
+    NixOS node, which just sets the env + runs `pytest` on the `turnip-test` env. The dev
+    VM runs everything except `test_podman_attach` (it self-skips without the OCI image).
+  - Pure helper/golden tests stay host `pytest` (integration tests skip there).
 
 ## Still open
 
