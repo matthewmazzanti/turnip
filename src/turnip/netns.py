@@ -90,6 +90,7 @@ pyroute2 notes
 """
 
 import os
+import socket
 import subprocess
 import sys
 import traceback
@@ -166,6 +167,67 @@ def in_podman_context(fn: Callable[[], None]) -> None:
     _, status = os.waitpid(child, 0)
     if not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0):
         sys.exit("operation failed inside podman namespace context")
+
+
+# --- the host<->podman fd bridge (SCM_RIGHTS over SOCK_SEQPACKET) -----------
+# The rootful two-phase flow's join: a podman-side child opens router-netns fds (the
+# bind-mounts live in podman's MOUNT ns, invisible to the init ns) and ships them to
+# the init-side parent, which can't see those paths but can use the fds directly.
+# Fd-passing needs no privilege -- creds are checked at open() and at the privileged
+# op (the veth move), never at transfer. One (name, fd) per message so name<->fd can't
+# be misaligned, over SEQPACKET for explicit per-message framing.
+
+
+def send_fds_by_name(sock: socket.socket, fds: dict[str, int]) -> None:
+    """Send a {name: fd} mapping, one entry per message -- each name rides in the SAME
+    SCM_RIGHTS message as its fd, so the two cannot be misaligned in transit."""
+    for name, fd in fds.items():
+        socket.send_fds(sock, [name.encode()], [fd])
+
+
+def recv_fds_by_name(sock: socket.socket) -> dict[str, int]:
+    """Receive what send_fds_by_name sent -> {name: fd}, looping until EOF (the sender
+    closes the socket after the last entry). SEQPACKET => one message per recv."""
+    out: dict[str, int] = {}
+    while True:
+        msg, fds, _flags, _addr = socket.recv_fds(sock, 4096, 1)
+        if not fds:  # EOF: peer closed after the last fd
+            return out
+        out[msg.decode()] = fds[0]
+
+
+def collect_fds_from_child(produce_fds: Callable[[], dict[str, int]]) -> dict[str, int]:
+    """Fork; the child runs `produce_fds()` -> {name: fd}, which THIS function ships
+    over the socket, then exits. The parent collects the mapping, waits for the child,
+    and returns it. The returned fds outlive the child (independent open file
+    descriptions; the netns they refer to are pinned by their bind-mounts), so the
+    init-side caller can use them with the child long gone.
+
+    Generic over what the child produces -- the podman entry + netns creation are the
+    `produce_fds` callback's job, kept out of here so the bridge is testable without
+    podman."""
+    parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    pid = os.fork()
+    if pid == 0:
+        parent_sock.close()
+        code = 0
+        try:
+            send_fds_by_name(child_sock, produce_fds())
+        except BaseException:
+            traceback.print_exc()
+            code = 1
+        finally:
+            child_sock.close()
+            sys.stdout.flush()
+            sys.stderr.flush()
+        os._exit(code)
+    child_sock.close()
+    fds = recv_fds_by_name(parent_sock)
+    parent_sock.close()
+    _, status = os.waitpid(pid, 0)
+    if not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0):
+        raise RuntimeError("fd-producing child failed (see its output above)")
+    return fds
 
 
 # --- netns lifecycle + handles ---------------------------------------------
