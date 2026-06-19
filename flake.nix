@@ -4,9 +4,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-    # uv2nix: build turnip + its locked deps straight from uv.lock (real nix
-    # packaging, replacing the old "run the live source" wrapper). pyproject.nix is
-    # the lock/metadata layer; build-system-pkgs supplies build backends (hatchling).
+    # uv2nix: build turnip + its locked deps straight from uv.lock -> the packaged env
+    # used by `nix build .#turnip` and the integration test node. (The interactive dev VM
+    # still runs the live 9p source.) pyproject.nix is the lock/metadata layer;
+    # build-system-pkgs supplies build backends (hatchling).
     pyproject-nix = {
       url = "github:pyproject-nix/pyproject.nix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -61,7 +62,7 @@
           # config.system.build.vm exists) plus testvm.nix. It deliberately runs the
           # LIVE 9p-mounted source (no rebuild on edit) -- the hermetic packaged env
           # is for the integration tests, not the interactive dev box.
-          testVM = nixpkgs.lib.nixosSystem {
+          testVM = lib.nixosSystem {
             inherit system;
             modules = [
               "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"
