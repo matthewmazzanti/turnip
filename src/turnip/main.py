@@ -38,7 +38,7 @@ import json
 import os
 import pwd
 import sys
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
@@ -49,6 +49,7 @@ from . import nftlib as nft
 from .config import (
     HOST_PREFIX,
     LINK_PREFIX,
+    Egress,
     Flow,
     NetworkType,
     Proto,
@@ -168,6 +169,7 @@ class Endpoint:
     router_if: str  # router-side veth name (vethR-<container>)
     cont_if: str  # container-side iface name (from attach.interface)
     ip: str  # the container's /32 on this network
+    egress: Egress = False  # outbound allowance out this network's uplink (bool | rules)
 
 
 @dataclass
@@ -308,7 +310,7 @@ def build_model(turnip: Turnip, state_dir: Path) -> Model:
         if net.gateway_if is None:  # validator guarantees this for a router network
             raise ValueError(f"router network {net_name!r} has no gateway_if")
         endpoints = [
-            Endpoint(containers[cname], router_if(cname), att.interface, str(att.ip))
+            Endpoint(containers[cname], router_if(cname), att.interface, str(att.ip), att.egress)
             for cname, att in net.attach.items()
         ]
         uplink = None
@@ -409,6 +411,11 @@ def router_sysctls(network: Network) -> dict[str, str]:
     for ep in network.endpoints:
         sysctls[f"net.ipv4.conf.{ep.router_if}.proxy_arp"] = "1"
         sysctls[f"net.ipv4.conf.{ep.router_if}.rp_filter"] = "1"
+    if network.uplink is not None:
+        # strict rp_filter on the uplink too: the reverse path for an internet source
+        # is the default route = the uplink, while a container-spoofed source resolves
+        # to its own /32 veth (not the uplink) and is dropped -- the anti-spoof pin.
+        sysctls[f"net.ipv4.conf.{network.uplink.router_if}.rp_filter"] = "1"
     return sysctls
 
 
@@ -443,6 +450,32 @@ def build_nft(network: Network) -> nft.Ruleset:
 
     sd = [nft.payload("ip", "saddr"), nft.payload("ip", "daddr")]  # shared saddr.daddr key
     table = nft.Table("inet", NFT_TABLE)
+
+    # egress: a container with egress may INITIATE out the uplink (oif = the router's
+    # uplink veth). `True` = any dest/proto/port; a list = scoped to (proto, port). The
+    # return path rides ct established/related (no reverse rule). Appended after the
+    # intra-network vmaps, before the policy drop.
+    egress_rules: list[nft.Add] = []
+    if network.uplink is not None:
+        uplink_if = network.uplink.router_if
+        for ep in network.endpoints:
+            if not ep.egress:
+                continue
+            scope = (
+                nft.ct_state("new"),
+                nft.match(nft.meta("oifname"), uplink_if),
+                nft.match(nft.payload("ip", "saddr"), ep.ip),
+            )
+            if ep.egress is True:
+                egress_rules.append(table.rule("forward", *scope, nft.accept()))
+            else:
+                for er in ep.egress:
+                    for proto in er.proto:
+                        exprs = [*scope, nft.match(nft.meta("l4proto"), proto.value)]
+                        if proto is not Proto.ICMP and er.port not in (None, "any"):
+                            exprs.append(nft.match(nft.payload("th", "dport"), er.port))
+                        egress_rules.append(table.rule("forward", *exprs, nft.accept()))
+
     return nft.ruleset(
         [
             *table.reload(),
@@ -466,21 +499,16 @@ def build_nft(network: Network) -> nft.Ruleset:
                     "allowed_flows",
                 ),
             ),
+            *egress_rules,
         ]
     )
 
 
-def configure_dataplane(network: Network) -> None:
-    """Write a router netns's sysctls + load its nft table, run from WITHIN podman's
-    userns (phase 1) via a forked setns-by-path hop. This stays in phase 1 -- not the
-    init-side parent -- because entering a netns (setns CLONE_NEWNET) needs CAP_SYS_ADMIN
-    in the CALLER's own userns: the rootless user has it only inside podman's userns
-    (owner-match grants caps in the TARGET userns, not the caller's). Both ops need the
-    veths to already exist, so it runs after all wiring.
-
-    (When uplink nft lands, the uplink-dependent rules -- which need the uplink veth,
-    created host-side in phase 2 -- get re-applied by the ROOT parent over the fd; root
-    *does* hold CAP_SYS_ADMIN in the init userns. That split is rootful-only.)"""
+def _apply_router_dataplane(network: Network, run: Callable[[Callable[[], str]], str]) -> None:
+    """Write a router netns's sysctls + load its nft table, entering the netns via
+    `run` (a run_in_netns / run_in_netns_fd hop). Both need the veths to already exist
+    (per-veth conf.* dirs, rp_filter's reverse-path lookup) -- and for an uplinked
+    network, the uplink veth too, which is why that case runs in phase 2."""
     sysctls = router_sysctls(network)
     rules = build_nft(network)
 
@@ -489,10 +517,66 @@ def configure_dataplane(network: Network) -> None:
         nft.load(rules)
         return ""
 
-    run_in_netns(network.netns_path, apply)
+    run(apply)
     print(
         f"  {network.name} dataplane: ip_forward + per-veth proxy_arp/rp_filter + "
         f"ipv6 off + nft '{NFT_TABLE}'"
+    )
+
+
+def configure_dataplane(network: Network) -> None:
+    """Apply a router's dataplane from WITHIN podman's userns (phase 1), entering the
+    netns by PATH. Used for networks without an uplink: entering a netns (setns
+    CLONE_NEWNET) needs CAP_SYS_ADMIN in the CALLER's own userns, which the rootless
+    user holds only inside podman's userns (owner-match grants caps in the TARGET
+    userns, not the caller's)."""
+    _apply_router_dataplane(network, lambda apply: run_in_netns(network.netns_path, apply))
+
+
+def apply_dataplane_fd(network: Network, router_fd: int) -> None:
+    """Apply a router's dataplane from the init-side parent (phase 2), entering the
+    netns by FD. Used for UPLINKED networks: their dataplane (egress rules + the uplink
+    veth's rp_filter) needs the uplink veth, created host-side in phase 2 -- and root
+    *does* hold CAP_SYS_ADMIN in the init userns, so it may setns by fd."""
+    _apply_router_dataplane(network, lambda apply: run_in_netns_fd(router_fd, apply))
+
+
+def build_host_nft(network: Network) -> nft.Ruleset:
+    """The host-side nat zone for a network's uplink, in the init netns: one
+    `ip turnip_host_<net>` table that masquerades traffic forwarded IN from the uplink
+    (so egressing container sources are SNAT'd to the host's WAN address). iif-matched,
+    not subnet-matched -- the routed /32 model declares no subnet."""
+    up = network.uplink
+    assert up is not None  # only called for uplinked networks
+    table = nft.Table("ip", f"turnip_host_{network.name}")
+    return nft.ruleset(
+        [
+            *table.reload(),
+            table.chain("postrouting", type="nat", hook="postrouting", prio=100, policy="accept"),
+            table.rule("postrouting", nft.match(nft.meta("iifname"), up.host_if), nft.masquerade()),
+        ]
+    )
+
+
+def configure_host_nat(network: Network) -> None:
+    """ip_forward + the host masquerade zone + host routes to the containers, in the
+    init netns (phase 2, root parent). Runs directly (the parent IS in the init netns)
+    -- no setns hop. The /32 routes (container via the router end) let the host forward
+    TO containers (ingress/DNAT) and satisfy rp_filter for egress -- the reverse path to
+    a container source resolves back out the uplink. They die with the host veth on
+    teardown. ip_forward is a host-global capability we set on (not turnip per-run
+    state), so `down` leaves it; the masquerade table is flushed."""
+    up = network.uplink
+    assert up is not None
+    write_sysctls({"net.ipv4.ip_forward": "1"})
+    nft.load(build_host_nft(network))
+    with IPRoute() as ipr:
+        oif = ifindex(ipr, up.host_if)
+        for ep in network.endpoints:
+            ipr.route("add", dst=f"{ep.ip}/{HOST_PREFIX}", gateway=up.router_ip, oif=oif)
+    print(
+        f"  {network.name} host nat: ip_forward + masquerade iif {up.host_if} + "
+        f"{len(network.endpoints)} container route(s) via {up.router_ip}"
     )
 
 
@@ -568,27 +652,35 @@ def wire_in_podman(model: Model, runtime: ResolvedRuntime) -> dict[str, int]:
             create_gateway(network)
             for ep in network.endpoints:
                 connect(network, ep)
-    # sockets closed; dataplane (sysctls + nft) per router, still inside podman's userns
+    # sockets closed; dataplane (sysctls + nft) for NON-uplinked routers, here inside
+    # podman's userns. Uplinked routers defer their dataplane to phase 2 (it needs the
+    # uplink veth, which the parent creates), applied by the root parent over the fd.
     for network in model.networks:
-        configure_dataplane(network)
+        if network.uplink is None:
+            configure_dataplane(network)
     return {net.name: os.open(net.netns_path, os.O_RDONLY) for net in model.networks}
 
 
 def teardown_host_edge(model: Model) -> None:
-    """Remove host-side uplink state in the init netns -- the host veth end, which does
-    NOT die with the router netns (its peer does, the host end persists). Runs in the
-    privileged parent, before re-wiring (up = down + build) and on `down`. Idempotent:
-    skips a veth that's already gone. A no-op for networks without an uplink, so the
-    rootless path never touches the init netns here."""
-    uplinks = [net.uplink for net in model.networks if net.uplink is not None]
-    if not uplinks:
+    """Remove host-side uplink state in the init netns: the host veth end (which does
+    NOT die with the router netns -- its peer does, the host end persists) and the host
+    nat zone. Runs in the privileged parent, before re-wiring (up = down + build) and on
+    `down`. Idempotent -- skips an absent veth, and adds-then-deletes each nft table so
+    the delete always succeeds. A no-op without uplinks, so the rootless path never
+    touches the init netns here."""
+    uplinked = [(net.name, up) for net in model.networks if (up := net.uplink) is not None]
+    if not uplinked:
         return
     with IPRoute() as ipr:
-        for up in uplinks:
+        for _name, up in uplinked:
             idx = find_ifindex(ipr, up.host_if)
             if idx is not None:
                 ipr.link("del", index=idx)
                 print(f"  removed host uplink veth {up.host_if}")
+    for name, _up in uplinked:
+        table = nft.Table("ip", f"turnip_host_{name}")
+        nft.load(nft.ruleset([nft.Add(table), nft.Delete(table)]))
+        print(f"  flushed host nat zone turnip_host_{name}")
 
 
 def host_edge_connect(network: Network, router_fd: int) -> None:
@@ -641,11 +733,15 @@ def up(model: Model, runtime: ResolvedRuntime) -> None:
     needs only CAP_NET_ADMIN (the IFLA_NET_NS_FD move) which root holds in the init
     netns, and is a no-op for networks without an uplink. Clean slate spans both halves
     (up = down + build): the host-edge teardown here + the netns teardown in phase 1."""
-    teardown_host_edge(model)  # parent: clear prior host state (no-op until uplinks)
+    teardown_host_edge(model)  # parent: clear prior host state (no-op without uplinks)
     router_fds = collect_fds_from_child(lambda: wire_in_podman(model, runtime))
     try:
         for network in model.networks:
-            host_edge_connect(network, router_fds[network.name])
+            if network.uplink is None:
+                continue  # fully wired (incl. dataplane) in phase 1
+            host_edge_connect(network, router_fds[network.name])  # uplink veth
+            configure_host_nat(network)  # ip_forward + host masquerade (init netns)
+            apply_dataplane_fd(network, router_fds[network.name])  # router dataplane via fd
     finally:
         for fd in router_fds.values():
             os.close(fd)

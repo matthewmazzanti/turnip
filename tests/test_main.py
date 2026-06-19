@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 
 from turnip import main
-from turnip.config import Runtime, Turnip
+from turnip.config import Proto, Runtime, Turnip
 
 STATE = Path("/n")
 
@@ -90,6 +90,34 @@ def test_build_model_lowers_uplink() -> None:
     # /31 ends derived from the base: host = base, router = base+1
     assert (up.host_ip, up.router_ip) == ("169.254.1.0", "169.254.1.1")
     assert up.nat is True
+
+
+def test_build_model_lowers_egress() -> None:
+    model = _model(
+        {"hass": {}, "zwave": {}, "quiet": {}},
+        {
+            "lan": {
+                "gateway": "10.0.0.1",
+                "gateway_if": "gw0",
+                "uplink": {"host_if": "h", "router_if": "r", "link": "169.254.1.0"},
+                "attach": {
+                    "hass": {"ip": "10.0.0.12", "interface": "eth0", "egress": True},
+                    "zwave": {
+                        "ip": "10.0.0.11",
+                        "interface": "eth0",
+                        "egress": [{"proto": ["udp", "tcp"], "port": 53}],
+                    },
+                    "quiet": {"ip": "10.0.0.13", "interface": "eth0"},  # no egress
+                },
+            }
+        },
+    )
+    eps = {ep.container.name: ep for ep in model.networks[0].endpoints}
+    assert eps["hass"].egress is True
+    assert eps["quiet"].egress is False
+    rules = eps["zwave"].egress  # scoped -> a list of EgressRule (proto fanned to a list)
+    assert isinstance(rules, list) and len(rules) == 1
+    assert rules[0].proto == [Proto.UDP, Proto.TCP] and rules[0].port == 53
 
 
 def test_build_model_no_uplink_is_none() -> None:

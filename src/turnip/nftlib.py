@@ -150,6 +150,12 @@ class Verdict:
             raise ValueError(f"{self.kind} verdict takes no target")
 
 
+@dataclass(frozen=True)
+class Masquerade:
+    """The `masquerade` nat statement (a postrouting/srcnat chain): SNAT to the
+    outgoing interface's address. The host-edge egress primitive. No-options form."""
+
+
 # --- object types -----------------------------------------------------------
 
 
@@ -254,7 +260,7 @@ class Table:
 
 # Expressions; what an op accepts as an operand (Value); table-level objects;
 # command verbs. render() is total over Value | Object | Command.
-Expr = Payload | Meta | Ct | Concat | Match | Vmap | Verdict
+Expr = Payload | Meta | Ct | Concat | Match | Vmap | Verdict | Masquerade
 Value = Expr | Lit | list[str | int]
 Object = Table | Chain | VerdictMap | Rule
 Command = Add | Delete
@@ -282,6 +288,8 @@ def render(x: Value | Object | Command | Ruleset) -> Any:
             return {"vmap": {"key": render(x.key), "data": f"@{x.setname}"}}
         case Verdict():
             return {x.kind: {"target": x.target} if x.target is not None else None}
+        case Masquerade():
+            return {"masquerade": None}
         case Table():
             return {"table": {"family": x.family, "name": x.name}}
         case Chain():
@@ -372,6 +380,10 @@ def ct_state(*states: str) -> Match:
         raise ValueError("ct_state needs at least one state")
     right: Value = states[0] if len(states) == 1 else list[str | int](states)
     return Match(Ct("state"), right, "in")
+
+
+def masquerade() -> Masquerade:
+    return Masquerade()
 
 
 def accept() -> Verdict:
