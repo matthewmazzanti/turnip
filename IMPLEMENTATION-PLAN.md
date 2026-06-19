@@ -281,10 +281,14 @@ malformed config at load — so it can only confirm `up` applied the config, nev
 that the config means what you wanted. With `verify` no longer a multi-consumer,
 its two real jobs split and leave the CLI:
 
-- **Convergence / drift** → **project integration tests** (env-gated: `up` →
-  assert the dataplane → `down`). The per-milestone "Check (integration)" lines
-  above. They need the live rootless podman context, so they're gated and kept
-  separate from the pure helper/golden tests.
+- **Convergence / drift** → **hermetic NixOS integration tests** (`up` → assert →
+  `down`), landed as `nix build .#checks.<sys>.integration`. Crucially these are
+  **black-box**, NOT model-derived: each scenario pairs a config (the network to
+  build) with a **hand-authored expectation** (the properties it must have), so a
+  `build_model` bug can't hide — the very identity trap that made structural
+  `verify` near-tautological. Reachability (real TCP connects against live
+  listeners) is the backbone, since it's behaviour, not a restatement of config.
+  See "Testing strategy" for the harness.
 - **Effective-policy projection (intent)** → **deferred personal script.** Re-project
   policy into a view *orthogonal* to authoring — the per-container "what can this
   reach" grid, optionally probe-backed (zwave→hass:443 accepted, zwave→proxy
@@ -299,9 +303,19 @@ Net: the rewire drops the `verify` command; `up`/`down` remain.
   expansion. Fast, ungated.
 - **nftlib golden** (`tests/test_nftlib.py`): regenerated at milestone 3 against
   the example config; the diff is the review artifact. Plus the **parity** golden.
-- **Integration tests** (env-gated — require live rootless podman): the inheritor
-  of structural `verify`, one per milestone from 2 on. Skipped where podman/caps
-  are absent, so they never block the unit + golden tests.
+- **Integration tests** — **hermetic NixOS VM tests** (`nix build
+  .#checks.<sys>.integration`), the authoritative regression gate. Structure:
+  - **uv2nix** packages turnip from `uv.lock` (`packages.turnip` — the env with the
+    `turnip` console script); the test nodes install it (no source mount).
+  - **`nix/turnip-host.nix`** is the shared substrate (rootless podman + `homelab` +
+    nft/ip) imported by both the interactive dev VM (`nix/testvm.nix`, which stays
+    on the *live* 9p source for the fast manual loop) and the test nodes.
+  - **`tests/integration/probe.py`** is the black-box probe toolkit (live `ip -j` /
+    `nft` introspection + real reachability via `podman unshare nsenter`), taking
+    *explicit* hand-authored expectations. **`tests/nixos/integration.nix`** boots a
+    fresh host and runs scenarios: `turnip up` → probe script → `turnip down`.
+  - The dev VM + the same probe toolkit remain the fast manual-debug loop; pure
+    helper/golden tests stay host `pytest`, ungated.
 
 ## Still open
 
