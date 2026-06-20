@@ -41,9 +41,14 @@
   security.sudo.wheelNeedsPassword = false;
   services.openssh.enable = true;
 
-  # `just itest` runs the suite against the live 9p source; the shared base provides
-  # TURNIP_TEST_IMAGE + PYTHONDONTWRITEBYTECODE and loads the OCI image at boot, and the
-  # recipe passes TURNIP_INTEGRATION itself.
+  # `just itest` runs `sudo pytest` against the live 9p source; the shared base provides
+  # TURNIP_INTEGRATION + TURNIP_TEST_IMAGE + PYTHONDONTWRITEBYTECODE and loads the OCI
+  # image at boot. sudo's env_reset strips the first two from the login env, so tell sudo
+  # to preserve them -- otherwise the suite skips entirely (no TURNIP_INTEGRATION) and the
+  # image scenario skips (no TURNIP_TEST_IMAGE).
+  security.sudo.extraConfig = ''
+    Defaults env_keep += "TURNIP_INTEGRATION TURNIP_TEST_IMAGE"
+  '';
 
   virtualisation = {
     memorySize = 2048;

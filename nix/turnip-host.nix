@@ -47,11 +47,13 @@
       pkgs.jq # inspect `nft -j`
     ];
 
-    # Test config shared by both consumers (the dev VM + the check): suppress bytecode
-    # writes (sources are read-only -- a store path or a ro 9p mount) and name the OCI
-    # image this host loads at boot, derived from the image itself so it can't drift.
-    # TURNIP_INTEGRATION (un-skip the live scenarios) is each consumer's call, not the base.
+    # Test config shared by both consumers (the dev VM + the check): un-skip the live
+    # scenarios, suppress bytecode writes (sources are read-only -- a store path or a ro 9p
+    # mount), and name the OCI image this host loads at boot, derived from the image itself
+    # so it can't drift. The check's backdoor shell sources /etc/profile so these reach
+    # pytest; the dev VM's `sudo pytest` strips them, so nix/testvm.nix adds a sudo env_keep.
     environment.variables = {
+      TURNIP_INTEGRATION = "1";
       PYTHONDONTWRITEBYTECODE = "1";
       TURNIP_TEST_IMAGE = "${config.turnip.testImage.imageName}:${config.turnip.testImage.imageTag}";
     };

@@ -108,10 +108,9 @@
               turnip.testImage = testImage; # shared base loads it into rootless podman at boot
               virtualisation.memorySize = 3072; # podman image + container + several netns
               virtualisation.cores = 2;
-              # Un-skip the live scenarios. The base sets TURNIP_TEST_IMAGE + bytecode opt-out;
-              # the backdoor shell behind machine.succeed sources /etc/profile, so both reach
-              # pytest. (Image name + bytecode are shared, so they live in the base.)
-              environment.variables.TURNIP_INTEGRATION = "1";
+              # TURNIP_INTEGRATION (un-skip the live scenarios) + TURNIP_TEST_IMAGE + bytecode
+              # opt-out all come from the base; the backdoor shell behind machine.succeed sources
+              # /etc/profile, so they reach pytest with nothing extra needed here.
             };
 
             # The shared base loads the OCI image at boot (turnip.testImage on the node); we
