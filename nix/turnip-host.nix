@@ -2,44 +2,67 @@
 # user, plus the nft / ip tooling turnip drives. Imported by BOTH the interactive dev
 # VM (nix/testvm.nix) and the hermetic NixOS integration tests (tests/nixos/*).
 #
-# It deliberately does NOT decide how `turnip` itself is delivered: the dev VM runs
-# the live 9p-mounted source (no rebuild on edit), the tests install the uv2nix-built
-# package. Each consumer puts a `turnip` on PATH; this module is everything else.
-{ pkgs, ... }:
+# Two REQUIRED options let each consumer supply what differs, while the base does the
+# common wiring. Both consumers of this base are test hosts that always set them:
+#   turnip.env       -- the turnip venv to put on PATH. The base stays agnostic about WHICH:
+#                       the dev VM gives an editable env (live 9p source), the check the
+#                       uv2nix-built package.
+#   turnip.testImage -- the test OCI image; a boot-time oneshot loads it into homelab's
+#                       rootless podman (the dev VM for `just itest`, the check before pytest).
+{ config, lib, pkgs, ... }:
 {
-  system.stateVersion = "25.05";
-
-  # Don't let the host firewall interfere with turnip's netns/nft experiments.
-  networking.firewall.enable = false;
-
-  # Rootless podman, owned by `homelab` (the runtime.user in the configs). linger =>
-  # /run/user/<uid> + the pause process exist with no active login; autoSubUidGidRange
-  # => the subuid/subgid range podman maps. uid is pinned so state paths
-  # (/run/user/1001/turnip/...) are deterministic for the probes.
-  virtualisation.podman.enable = true;
-  users.users.homelab = {
-    isNormalUser = true;
-    uid = 1001;
-    linger = true;
-    autoSubUidGidRange = true;
+  options.turnip = {
+    env = lib.mkOption {
+      type = lib.types.package;
+      description = "The turnip venv to put on PATH (editable for the dev VM, packaged for the check).";
+    };
+    testImage = lib.mkOption {
+      type = lib.types.package;
+      description = "Integration test OCI image (a dockerTools image), loaded into rootless podman at boot.";
+    };
   };
 
-  environment.systemPackages = [
-    pkgs.nftables # `nft` -- turnip shells out to it (nftlib.load)
-    pkgs.iproute2 # ip/ss -- probes read `ip -j`
-    pkgs.jq # inspect `nft -j`
-  ];
+  config = {
+    system.stateVersion = "25.05";
 
-  # The integration test OCI image: a registry-free layered image of just python3, for
-  # the real container-attach test (the container runs `python3 -c <connect>`; the test
-  # supplies the snippet, PATH set so bare `python3` resolves). It lives on this SHARED
-  # base so both consumers load the IDENTICAL image straight from their own
-  # `config.system.build.testImage` -- the dev VM at boot (`just itest`), the hermetic
-  # check via `podman load` in its testScript -- with no flake plumbing between them.
-  system.build.testImage = pkgs.dockerTools.buildLayeredImage {
-    name = "turnip-test";
-    tag = "latest";
-    contents = [ pkgs.python3Minimal ];
-    config.Env = [ "PATH=${pkgs.python3Minimal}/bin" ];
+    # Don't let the host firewall interfere with turnip's netns/nft experiments.
+    networking.firewall.enable = false;
+
+    # Rootless podman, owned by `homelab` (the runtime.user in the configs). linger =>
+    # /run/user/<uid> + the pause process exist with no active login; autoSubUidGidRange
+    # => the subuid/subgid range podman maps. uid is pinned so state paths
+    # (/run/user/1001/turnip/...) are deterministic for the probes.
+    virtualisation.podman.enable = true;
+    users.users.homelab = {
+      isNormalUser = true;
+      uid = 1001;
+      linger = true;
+      autoSubUidGidRange = true;
+    };
+
+    environment.systemPackages = [
+      config.turnip.env # `turnip` + python3 + pytest (editable or packaged, per consumer)
+      pkgs.nftables # `nft` -- turnip shells out to it (nftlib.load)
+      pkgs.iproute2 # ip/ss -- probes read `ip -j`
+      pkgs.jq # inspect `nft -j`
+    ];
+
+    # Load the test OCI image into homelab's rootless store at boot, so both consumers get
+    # the identical image with no per-host loader.
+    systemd.services.turnip-test-image = {
+      description = "load the integration test OCI image into homelab's rootless podman";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "user@1001.service" ];
+      wants = [ "user@1001.service" ];
+      serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+      # rootless podman needs the setuid newuidmap/newgidmap (/run/wrappers/bin) + podman
+      # itself (/run/current-system/sw/bin) -- the system PATH, which a unit otherwise lacks.
+      script = ''
+        until test -d /run/user/1001; do sleep 0.2; done
+        export PATH=/run/wrappers/bin:/run/current-system/sw/bin
+        runuser -u homelab -- env XDG_RUNTIME_DIR=/run/user/1001 HOME=/home/homelab PATH="$PATH" \
+          podman load -i ${config.turnip.testImage}
+      '';
+    };
   };
 }

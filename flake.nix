@@ -43,23 +43,38 @@
         let
           python = pkgs.python314;
 
-          # turnip installed EDITABLE against the live 9p source at /mnt/turnip: deps + dev
-          # tools are baked, but `turnip` itself resolves to the live mount (no rebuild on edit).
-          editableEnv = mkUvEnv {
-            inherit pkgs;
-            name = "turnip-dev";
-            deps = w: w.deps.all;
-            editableRoot = "/mnt/turnip";
+          # A registry-free OCI image (just python3) for the real container-attach test: the
+          # container runs `python3 -c <connect>` (the test supplies the snippet). PATH set so
+          # bare `python3` resolves. Loaded into both hosts' rootless podman (dev VM at boot,
+          # the check in its testScript).
+          testImage = pkgs.dockerTools.buildLayeredImage {
+            name = "turnip-test";
+            tag = "latest";
+            contents = [ pkgs.python3Minimal ];
+            config.Env = [ "PATH=${pkgs.python3Minimal}/bin" ];
           };
 
-          # The dev VM: a NixOS system (qemu-vm module + testvm.nix) running the editable env.
-          # The test OCI image comes from the shared base (nix/turnip-host.nix), not threaded here.
+          # The dev VM, layered explicitly: the qemu-vm machinery, the shared turnip host base,
+          # the dev-VM specifics, then this build's customizations (which env + image). The
+          # editable env and test OCI image are supplied via the shared turnip.{env,testImage}
+          # options -- no specialArgs threading.
           testVM = lib.nixosSystem {
             inherit system;
-            specialArgs = { turnipEnv = editableEnv; };
             modules = [
               "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"
-              ./nix/testvm.nix
+              ./nix/turnip-host.nix # base: rootless podman host + the turnip.* options
+              ./nix/testvm.nix # dev VM: 9p mount, ssh/console, login users
+              {
+                # turnip installed EDITABLE against the live 9p source at /mnt/turnip: deps +
+                # dev tools are baked, but `turnip` resolves to the live mount (no rebuild on edit).
+                turnip.env = mkUvEnv {
+                  inherit pkgs;
+                  name = "turnip-dev";
+                  deps = w: w.deps.all;
+                  editableRoot = "/mnt/turnip";
+                };
+                turnip.testImage = testImage;
+              }
             ];
           };
         in
@@ -75,21 +90,46 @@
           };
 
           # NixOS integration tests (hermetic, CI-able): `nix build .#checks.<sys>.<name>`.
-          checks = {
-            # one gate: a single NixOS host runs the whole pytest suite (the `world` peer is
-            # an in-host netns fixture, so no multi-node test is needed).
-            integration = pkgs.testers.runNixOSTest (import ./tests/nixos/integration.nix {
-              inherit lib;
-              turnipEnv = self.packages.${system}.turnip-test;
-            });
+          # one gate: a single NixOS host runs the WHOLE pytest suite. Everything runs on
+          # this one machine -- the `world` peer for the uplink + LAN-link scenarios is an
+          # in-host netns fixture (tests/integration/conftest.py), so there is no multi-node
+          # test to maintain. The node only sets up the environment + runs `pytest`.
+          checks.integration = pkgs.testers.runNixOSTest {
+            name = "turnip-integration";
+
+            # turnip-test = the uv2nix env carrying both `turnip` and `pytest`. pytest runs
+            # as root (the link/uplink scenarios are rootful); the podman-attach test drops
+            # to the rootless owner itself for run-container.sh.
+            nodes.machine = { ... }: {
+              imports = [ ./nix/turnip-host.nix ];
+              turnip.env = self.packages.${system}.turnip-test; # turnip + pytest on PATH
+              turnip.testImage = testImage; # shared base loads it into rootless podman at boot
+              virtualisation.memorySize = 3072; # podman image + container + several netns
+              virtualisation.cores = 2;
+              environment.etc."turnip-tests".source = ./tests/integration;
+              environment.etc."turnip-run-container.sh".source = ./run-container.sh;
+            };
+
+            # The shared base loads the OCI image at boot (turnip.testImage on the node); we
+            # wait for that unit, then run the suite.
+            testScript = ''
+              start_all()
+              machine.wait_for_unit("multi-user.target")
+              machine.wait_until_succeeds("test -d /run/user/1001")  # rootless runtime dir up
+              machine.wait_for_unit("turnip-test-image.service")     # image in the rootless store
+              machine.succeed(
+                  "TURNIP_INTEGRATION=1 TURNIP_TEST_IMAGE=turnip-test:latest "
+                  "TURNIP_RUNCONTAINER=/etc/turnip-run-container.sh "
+                  "PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider -v /etc/turnip-tests"
+              )
+            '';
           };
 
           devShells.default = pkgs.mkShell {
             packages = [
               python
               pkgs.uv
-              pkgs.just # task runner (see ./justfile)
-              self.packages.${system}.vm # the dev VM: `run-turnip-vm`
+              pkgs.just # task runner (see ./justfile); `just vm` builds + boots the dev VM
               pkgs.qemu-utils # qemu-img: qcow2 info + snapshot/rollback (savevm)
             ];
 
