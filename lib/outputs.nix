@@ -11,7 +11,8 @@
 # you instead describe one system's outputs once; it replicates + transposes them into
 # the schema shape, threading in `system` and the matching `pkgs`.
 #
-#   mkOutputs { nonSystem ? { }, perSystem }
+#   mkOutputs { systems, nonSystem ? { }, perSystem }
+#     systems   :: [ string ]                 -- systems to replicate per-system outputs across
 #     nonSystem :: attrs                      -- merged into the result verbatim
 #                                                (optional; defaults to no top-level outputs)
 #     perSystem :: { system, pkgs } -> attrs  -- evaluated once per system, then
@@ -20,6 +21,7 @@
 #
 # Example:
 #   mkOutputs {
+#     systems = [ "x86_64-linux" "aarch64-linux" ];
 #     nonSystem.nixosConfigurations.foo = ...;
 #     perSystem = { system, pkgs }: {
 #       packages.default = pkgs.hello;
@@ -31,12 +33,11 @@
 #        packages.<system>.default  = ...;          # transposed per system
 #        devShells.<system>.default = ...;
 #      }
-{ lib, nixpkgs, systems }:
+{ lib, nixpkgs }:
+{ systems, nonSystem ? { }, perSystem }:
 let
   forAllSystems = lib.genAttrs systems;
-in
-{ nonSystem ? { }, perSystem }:
-let
+
   # perSystem evaluated for every supported system:
   #   bySystem :: { <system> = { <category> = { <name> = drv; }; }; }
   bySystem = forAllSystems (system:
