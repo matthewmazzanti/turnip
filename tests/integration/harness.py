@@ -125,17 +125,22 @@ class Probe:
     def _netns(self, container: str) -> str:
         return f"/run/user/{self.uid}/turnip/containers/{container}/netns"
 
-    def _wrap(self, container: str, argv: list[str]) -> list[str]:
-        """argv to run INSIDE `container`'s netns, via podman's mount+user ns. As root we
-        sudo to the owner first (podman unshare must run as the rootless user)."""
-        inner = ["podman", "unshare", "nsenter", f"--net={self._netns(container)}", *argv]
+    def _as_owner(self, argv: list[str]) -> list[str]:
+        """Run argv as the rootless-podman owner when we're root (podman + its netns live
+        under that user); a no-op when already that user."""
         if os.geteuid() == 0:
             return [
                 "sudo", "-u", self.user,
                 "env", f"XDG_RUNTIME_DIR=/run/user/{self.uid}", f"HOME=/home/{self.user}",
-                *inner,
+                *argv,
             ]
-        return inner
+        return argv
+
+    def _wrap(self, container: str, argv: list[str]) -> list[str]:
+        """argv to run INSIDE `container`'s netns, via podman's mount+user ns (as the owner)."""
+        return self._as_owner(
+            ["podman", "unshare", "nsenter", f"--net={self._netns(container)}", *argv]
+        )
 
     def _run(self, container: str, argv: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -207,6 +212,21 @@ class Probe:
     def connects(self, src: str, dst_ip: str, port: int, timeout: float = 2.0) -> bool:
         """True if a TCP connect from inside `src` to `dst_ip:port` succeeds."""
         return self._run(src, connect_argv(dst_ip, port, timeout)).returncode == 0
+
+    def run_container(self, container: str, image: str, argv: list[str]) -> int:
+        """Start a podman container JOINED to `container`'s persistent turnip netns, run
+        `argv` in it, and return its exit code. `--network ns:<path>` inherits the ns's
+        address + routes (no fresh ns); the generated hosts file is bind-mounted to
+        /etc/hosts so the container resolves its reachable peers BY NAME. Reachability is
+        then governed by the router's nft flow matrix, same as an in-ns probe."""
+        base = f"/run/user/{self.uid}/turnip/containers/{container}"
+        return subprocess.run(self._as_owner([
+            "podman", "run", "--rm",
+            "--network", f"ns:{base}/netns",
+            "-v", f"{base}/hosts:/etc/hosts:ro",
+            "--cap-add=net_raw", "--name", f"iot-{container}", "--hostname", container,
+            image, *argv,
+        ]), cwd="/tmp").returncode
 
 
 # --- the `world` peer (an in-host netns, not a second machine) ---------------

@@ -90,38 +90,42 @@
           };
 
           # NixOS integration tests (hermetic, CI-able): `nix build .#checks.<sys>.<name>`.
-          # one gate: a single NixOS host runs the WHOLE pytest suite. Everything runs on
-          # this one machine -- the `world` peer for the uplink + LAN-link scenarios is an
-          # in-host netns fixture (tests/integration/conftest.py), so there is no multi-node
-          # test to maintain. The node only sets up the environment + runs `pytest`.
+          # one gate: a single NixOS host runs the WHOLE pytest suite -- the pure unit tests
+          # (tests/*.py) AND the live integration scenarios (tests/integration/, enabled by
+          # TURNIP_INTEGRATION below). Everything runs on this one machine -- the `world` peer
+          # for the uplink + LAN-link scenarios is an in-host netns fixture
+          # (tests/integration/conftest.py), so there is no multi-node test to maintain. The
+          # node only sets up the environment + runs `pytest` over the whole tree.
           checks.integration = pkgs.testers.runNixOSTest {
             name = "turnip-integration";
 
             # turnip-test = the uv2nix env carrying both `turnip` and `pytest`. pytest runs
             # as root (the link/uplink scenarios are rootful); the podman-attach test drops
-            # to the rootless owner itself for run-container.sh.
+            # to the rootless owner itself to drive podman.
             nodes.machine = { ... }: {
               imports = [ ./nix/turnip-host.nix ];
               turnip.env = self.packages.${system}.turnip-test; # turnip + pytest on PATH
               turnip.testImage = testImage; # shared base loads it into rootless podman at boot
               virtualisation.memorySize = 3072; # podman image + container + several netns
               virtualisation.cores = 2;
-              environment.etc."turnip-tests".source = ./tests/integration;
-              environment.etc."turnip-run-container.sh".source = ./run-container.sh;
+              # Un-skip the live scenarios. The base sets TURNIP_TEST_IMAGE + bytecode opt-out;
+              # the backdoor shell behind machine.succeed sources /etc/profile, so both reach
+              # pytest. (Image name + bytecode are shared, so they live in the base.)
+              environment.variables.TURNIP_INTEGRATION = "1";
             };
 
             # The shared base loads the OCI image at boot (turnip.testImage on the node); we
-            # wait for that unit, then run the suite.
+            # wait for that unit, then run the WHOLE suite (unit + integration) straight from
+            # the source store path -- the guest shares the host store, so ${./tests} is visible
+            # in-VM with no mount. A flake copies only git-tracked files (no __pycache__), and a
+            # single real dir keeps the tests' `Path(__file__).resolve()` lookups self-consistent
+            # (turnip.example.json at parents-of-dir, golden/ beside the test).
             testScript = ''
               start_all()
               machine.wait_for_unit("multi-user.target")
               machine.wait_until_succeeds("test -d /run/user/1001")  # rootless runtime dir up
               machine.wait_for_unit("turnip-test-image.service")     # image in the rootless store
-              machine.succeed(
-                  "TURNIP_INTEGRATION=1 TURNIP_TEST_IMAGE=turnip-test:latest "
-                  "TURNIP_RUNCONTAINER=/etc/turnip-run-container.sh "
-                  "PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider -v /etc/turnip-tests"
-              )
+              machine.succeed("pytest -p no:cacheprovider -v ${./tests}")
             '';
           };
 

@@ -98,7 +98,7 @@ part it needs (M2 → `Endpoint`, M3 → `NetworkLayout`, M4 → uplink/egress, 
   runtime state belongs; the netns can't outlive a reboot anyway) holds
   `routers/<network>` (router netns) + `containers/<container>/{netns,hosts}` — a
   per-container dir with its netns and generated hosts file. Symmetric,
-  collision-free. `run-container.sh` joins `containers/<name>/netns` and bind-mounts
+  collision-free. A container joins `containers/<name>/netns` and bind-mounts
   `containers/<name>/hosts` → `/etc/hosts`. Teardown removes the netns + hosts but
   LEAVES the dir: rmdir hits EBUSY while the netns lazily unmounts (`MNT_DETACH`),
   and `create()`'s `makedirs(exist_ok)` reuses it.
@@ -143,7 +143,7 @@ grows), and how it's checked.
   `down` removes them. `main()` loads config → resolves runtime → runs inside
   `in_podman_context`. Drags in: `state_dir` from `runtime.state_dir` (threaded as
   an arg, not a global); the current-user `resolve_runtime` fallback;
-  `run-container.sh` → `containers/` path.
+  the container-attach `containers/` path.
 - **Refactor (done):** netns naming/paths are pure helpers in `main`
   (`router_netns_path`/`container_netns_path`/`netns_paths`); the two-scope shape
   (a `containers` loop + a `networks` loop) fell out naturally — the proto-IR, no

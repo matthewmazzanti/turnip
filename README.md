@@ -44,7 +44,7 @@ proxy  netns:  eth0 10.0.0.13/32  default via 10.0.0.1
 The example flow matrix is hub-and-spoke with `hass` as the hub: `zwave`→`hass`
 and `hass`→`proxy` on tcp/443 (flows are **directional** — `from` initiates to
 `to`). Every container may reach the gateway. Edit `containers`/`networks`/`flows`
-in `turnip.json` to change it (see `turnip.example.json`). The `inet fabric` table
+in `turnip.json` to change it (see `tests/turnip.example.json`). The `inet fabric` table
 in the diagram is now `inet turnip`, one per router netns.
 
 ## Usage
@@ -59,13 +59,9 @@ uv run turnip up        # create + wire everything, write hosts files
 uv run turnip down      # tear it all down
 ```
 
-Attach a container to its namespace (joins via `--network ns:<path>` and mounts
-its generated hosts file to `/etc/hosts`):
-
-```sh
-./run-container.sh            # hass netns, netshoot shell
-./run-container.sh zwave      # zwave netns
-```
+A container attaches to a router netns by joining it (`podman run --network
+ns:<state_dir>/containers/<name>/netns`) with its generated hosts file bind-mounted
+to `/etc/hosts`; the integration suite drives this directly (`Probe.run_container`).
 
 `down` removes every netns the config implies. Since each router netns owns its
 gateway, veths, routes, sysctls, and nft table, removing it is a complete teardown
@@ -81,7 +77,6 @@ All package modules live under `src/turnip/`.
 | `config.py`     | The declarative model: pure pydantic `Turnip` (types + validation, no IO) for `turnip.json` — containers, networks, attachments, runtime. This *is* the model the mechanism consumes. |
 | `netns.py`      | The namespace layer (pure mechanism, explicit args): enter podman's namespaces (`in_podman_context`), netns lifecycle (`create_netns`/`remove_netns`), ifindex lookups, run-code/write-sysctls inside a netns (`run_in_netns`/`write_sysctls`). Plus the rootless / pyroute2 rationale. |
 | `nftlib.py`     | A use-case-agnostic, data-oriented DSL for libnftables JSON (`render` over frozen-dataclass sums) and the `nft` executor (`load`/`find_nft`). The app policy that uses it (`build_nft`) lives in `main.py`. |
-| `run-container.sh` (repo root) | Launch a podman container attached to its netns, with its generated hosts file bind-mounted to `/etc/hosts`. |
 | `*.py.bak`      | The old literal-driven `main.py`/`verify.py`, parked as reference for the remaining milestones (M4/M5); to be removed when those land. |
 | `typings/`      | Local partial pyroute2 stubs (it ships none); scoped to the API surface we use. |
 

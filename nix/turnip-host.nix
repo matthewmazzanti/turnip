@@ -47,6 +47,15 @@
       pkgs.jq # inspect `nft -j`
     ];
 
+    # Test config shared by both consumers (the dev VM + the check): suppress bytecode
+    # writes (sources are read-only -- a store path or a ro 9p mount) and name the OCI
+    # image this host loads at boot, derived from the image itself so it can't drift.
+    # TURNIP_INTEGRATION (un-skip the live scenarios) is each consumer's call, not the base.
+    environment.variables = {
+      PYTHONDONTWRITEBYTECODE = "1";
+      TURNIP_TEST_IMAGE = "${config.turnip.testImage.imageName}:${config.turnip.testImage.imageTag}";
+    };
+
     # Load the test OCI image into homelab's rootless store at boot, so both consumers get
     # the identical image with no per-host loader.
     systemd.services.turnip-test-image = {

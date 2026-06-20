@@ -23,7 +23,7 @@ from turnip.config import (
     Turnip,
 )
 
-EXAMPLE = Path(__file__).resolve().parents[1] / "turnip.example.json"
+EXAMPLE = Path(__file__).resolve().parent / "turnip.example.json"
 
 
 # --- helpers --------------------------------------------------------------

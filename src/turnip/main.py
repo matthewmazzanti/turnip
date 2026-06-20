@@ -733,7 +733,7 @@ def hosts_file(model: Model, container: Container) -> str:
 
 def write_hosts(model: Model) -> None:
     """Write each container's hosts file into its state dir (created by
-    model.create()); run-container.sh bind-mounts it to /etc/hosts."""
+    model.create()); a container joined to the netns bind-mounts it to /etc/hosts."""
     for container in model.containers:
         Path(container.hosts_path).write_text(hosts_file(model, container))
         print(f"  wrote hosts: {container.hosts_path}")

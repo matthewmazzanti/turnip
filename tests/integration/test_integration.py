@@ -11,7 +11,6 @@ Run them: `just itest` (dev VM, fast loop) or `nix build .#checks.<sys>.integrat
 from __future__ import annotations
 
 import os
-import subprocess
 
 import pytest
 from harness import Probe, Seg, connect_argv, ensure_anchors, turnip, turnip_attempt, world
@@ -168,22 +167,16 @@ def test_reject_macvlan_ipvlan_share_parent() -> None:
 
 
 def test_podman_attach() -> None:
-    # a real container joins zwave's netns via run-container.sh and resolves hass BY NAME
-    # through the generated /etc/hosts; the denied peer is still dropped. Needs the image.
+    # a real container joins zwave's netns and resolves hass BY NAME through the generated
+    # /etc/hosts; the denied peer is still dropped. Needs the image (just python3 -- the
+    # connect snippet is supplied here as `python3 -c ...`, not baked into the image).
     image = os.environ.get("TURNIP_TEST_IMAGE")
     if not image:
         pytest.skip("needs a loaded OCI image (set TURNIP_TEST_IMAGE)")
-    runc = os.environ["TURNIP_RUNCONTAINER"]
-
-    def reaches(dst_ip: str) -> int:
-        # the image is just python3; the connect snippet is supplied here (bootstrapped
-        # into the container as `python3 -c ...`), not baked into the image.
-        argv = ["bash", runc, "zwave", image, "--", *connect_argv(dst_ip, 443, 3)]
-        if os.geteuid() == 0:  # run-container.sh drives rootless podman -> run as the owner
-            argv = ["sudo", "-u", "homelab", "env", "XDG_RUNTIME_DIR=/run/user/1001",
-                    "HOME=/home/homelab", *argv]
-        return subprocess.run(argv).returncode
+    probe = Probe()
 
     with turnip(ROUTER), Probe().listener("hass", 443), Probe().listener("proxy", 443):
-        assert reaches("hass") == 0, "real container reaches hass BY NAME (generated /etc/hosts)"
-        assert reaches("10.0.0.13") != 0, "denied peer (proxy) dropped even from a real container"
+        assert probe.run_container("zwave", image, connect_argv("hass", 443, 3)) == 0, \
+            "real container reaches hass BY NAME (generated /etc/hosts)"
+        assert probe.run_container("zwave", image, connect_argv("10.0.0.13", 443, 3)) != 0, \
+            "denied peer (proxy) dropped even from a real container"

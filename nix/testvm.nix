@@ -41,15 +41,9 @@
   security.sudo.wheelNeedsPassword = false;
   services.openssh.enable = true;
 
-  # `just itest` runs the full suite, podman-attach included. The shared base loads the test
-  # OCI image into homelab's rootless store at boot (via turnip.testImage); here we just
-  # point the test at it + run-container.sh.
-  # (PYTHONDONTWRITEBYTECODE: the live src is a ro 9p mount, so suppress bytecode writes.)
-  environment.variables = {
-    PYTHONDONTWRITEBYTECODE = "1";
-    TURNIP_TEST_IMAGE = "turnip-test:latest";
-    TURNIP_RUNCONTAINER = "/mnt/turnip/run-container.sh";
-  };
+  # `just itest` runs the suite against the live 9p source; the shared base provides
+  # TURNIP_TEST_IMAGE + PYTHONDONTWRITEBYTECODE and loads the OCI image at boot, and the
+  # recipe passes TURNIP_INTEGRATION itself.
 
   virtualisation = {
     memorySize = 2048;
