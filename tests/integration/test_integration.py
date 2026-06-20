@@ -15,6 +15,13 @@ import os
 import pytest
 from harness import Probe, Seg, connect_argv, ensure_anchors, turnip, turnip_attempt, world
 
+# A DROPPED SYN never gets a reply, so a negative `connects` blocks for its WHOLE timeout
+# (vs an allowed one that returns in ~ms). Everything here is a single-host netns where the
+# RTT is microseconds, so this short deadline is still ~1000x the round trip -- ample to tell
+# DROPPED from ALLOWED without paying the 2s default on every deny assertion. Positive
+# connects keep the generous default (headroom against a false negative on a loaded box).
+DENY_TIMEOUT = 0.5
+
 # the world peer the two uplink tests reach over the host edge (routed, so host_cidr set).
 WORLD_UPLINK = Seg("w-up", "198.51.100.2/24", "198.51.100.1/24")
 
@@ -68,8 +75,10 @@ def test_router() -> None:
         assert p.has_default_via("zwave", "10.0.0.1")
         with p.listener("hass", 443), p.listener("proxy", 443):
             assert p.connects("zwave", "10.0.0.12", 443), "zwave->hass:443 ALLOWED (the flow)"
-            assert not p.connects("zwave", "10.0.0.13", 443), "zwave->proxy:443 DROPPED (no flow)"
-            assert not p.connects("proxy", "10.0.0.12", 443), "proxy->hass:443 DROPPED (1-way)"
+            assert not p.connects("zwave", "10.0.0.13", 443, DENY_TIMEOUT), \
+                "zwave->proxy:443 DROPPED (no flow)"
+            assert not p.connects("proxy", "10.0.0.12", 443, DENY_TIMEOUT), \
+                "proxy->hass:443 DROPPED (1-way)"
 
 
 def test_links() -> None:
@@ -107,14 +116,15 @@ def test_uplink_egress() -> None:
     with world(WORLD_UPLINK), turnip(UPLINK):
         p = Probe()
         assert p.connects("out", "198.51.100.2", 8888), "out has egress -> world reachable"
-        assert not p.connects("quiet", "198.51.100.2", 8888), "quiet has no egress -> dropped"
+        assert not p.connects("quiet", "198.51.100.2", 8888, DENY_TIMEOUT), \
+            "quiet has no egress -> dropped"
 
 
 def test_uplink_ingress() -> None:
     # world -> host:8080 -> DNAT -> svc:80 (world is the external client).
     with world(WORLD_UPLINK) as w, turnip(UPLINK), Probe().listener("svc", 80):
         assert w.connects("198.51.100.1", 8080), "published port DNATs to svc"
-        assert not w.connects("198.51.100.1", 9999), "unpublished port refused"
+        assert not w.connects("198.51.100.1", 9999, DENY_TIMEOUT), "unpublished port refused"
 
 
 def test_linklan() -> None:

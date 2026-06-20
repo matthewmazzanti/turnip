@@ -56,6 +56,21 @@ def connect_argv(dst_ip: str, port: int, timeout: float) -> list[str]:
     return ["python3", "-c", _CONNECT, str(dst_ip), str(port), str(timeout)]
 
 
+def _wait_listening(run, port: int, where: str, deadline: float = 5.0) -> None:
+    """Block until a socket is LISTENing on `port`, polling `ss` via `run` (a callable
+    argv -> CompletedProcess that executes inside the right netns). Purely local -- no
+    connect, so the router's nft policy is never in the readiness path -- which replaces a
+    fixed settle sleep: we proceed the instant the bind/listen lands, and raise if it never
+    does (a real bug) rather than racing a connect against an un-bound port."""
+    end = time.monotonic() + deadline
+    while time.monotonic() < end:
+        cp = run(["ss", "-H", "-ltn", f"sport = :{port}"])
+        if cp.returncode == 0 and cp.stdout.strip():
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"listener on {where} never came up within {deadline}s")
+
+
 # --- driving the turnip CLI on an in-test config dict ------------------------
 
 
@@ -202,7 +217,9 @@ class Probe:
             self._wrap(container, _listen_argv(port, seconds)), cwd="/tmp", start_new_session=True
         )
         try:
-            time.sleep(1.0)  # let the bind/listen settle before any connect
+            # proceed the moment the socket is LISTENing (no fixed settle guess). A connect
+            # succeeds off the listen backlog as soon as listen() lands, before any accept().
+            _wait_listening(lambda a: self._run(container, a), port, f"{container}:{port}")
             yield
         finally:
             with suppress(ProcessLookupError):
@@ -278,7 +295,12 @@ def world(*segments: Seg) -> Generator[WorldHandle]:
                 subprocess.run(["ip", "addr", "add", seg.host_cidr, "dev", seg.host_if], check=True)
         subprocess.run(["ip", "-n", "world", "link", "set", "lo", "up"], check=True)
         listener = subprocess.Popen(["ip", "netns", "exec", "world", *_listen_argv(8888)])
-        time.sleep(1)
+        _wait_listening(
+            lambda a: subprocess.run(
+                ["ip", "netns", "exec", "world", *a], capture_output=True, text=True
+            ),
+            8888, "world:8888",
+        )
         yield WorldHandle()
     finally:
         if listener is not None:
