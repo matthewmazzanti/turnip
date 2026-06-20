@@ -14,7 +14,7 @@ test:
 # e.g. `just itest -k links`. needs_world / needs_image scenarios self-skip here.
 # (Boot the VM first: `just vm`.)
 itest *args:
-    nix/ssh-vm.sh dev "sudo env TURNIP_INTEGRATION=1 PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -p no:cacheprovider -v /mnt/turnip/tests/integration {{args}}"
+    nix/ssh-vm.sh dev "sudo pytest -p no:cacheprovider -v /mnt/turnip/tests/integration {{args}}"
 
 # Boot the dev VM: build `.#vm` and exec its run-turnip-vm. Mounts THIS repo
 # (read-only, 9p tag `turnip`) by injecting its absolute path -- captured here
