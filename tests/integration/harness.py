@@ -52,7 +52,7 @@ def _listen_argv(port: int, seconds: float | None = None) -> list[str]:
     return ["python3", "-c", _LISTEN, str(port), *extra]
 
 
-def _connect_argv(dst_ip: str, port: int, timeout: float) -> list[str]:
+def connect_argv(dst_ip: str, port: int, timeout: float) -> list[str]:
     return ["python3", "-c", _CONNECT, str(dst_ip), str(port), str(timeout)]
 
 
@@ -206,7 +206,7 @@ class Probe:
 
     def connects(self, src: str, dst_ip: str, port: int, timeout: float = 2.0) -> bool:
         """True if a TCP connect from inside `src` to `dst_ip:port` succeeds."""
-        return self._run(src, _connect_argv(dst_ip, port, timeout)).returncode == 0
+        return self._run(src, connect_argv(dst_ip, port, timeout)).returncode == 0
 
 
 # --- the `world` peer (an in-host netns, not a second machine) ---------------
@@ -230,7 +230,7 @@ class WorldHandle:
     the ingress-DNAT test."""
 
     def connects(self, dst_ip: str, port: int, timeout: float = 3.0) -> bool:
-        argv = ["ip", "netns", "exec", "world", *_connect_argv(dst_ip, port, timeout)]
+        argv = ["ip", "netns", "exec", "world", *connect_argv(dst_ip, port, timeout)]
         return subprocess.run(argv, capture_output=True).returncode == 0
 
 

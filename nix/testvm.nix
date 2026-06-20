@@ -14,32 +14,18 @@
 # Drive it:
 #   ssh -i nix/testvm_key -p 2222 dev@localhost        # admin (sudo)
 #   ssh -i nix/testvm_key -p 2222 homelab@localhost    # the rootless run user
-#   homelab@turnip$ turnip up        # runs /mnt/turnip/src against turnip.example.json
-{ pkgs, ... }:
-let
-  # turnip's runtime deps from nixpkgs -- we run the live-mounted src/ directly (the dev
-  # VM's whole purpose), so this is a plain python+deps, NOT the uv2nix `turnip-test` env:
-  # that env ships its own packaged `turnip` bin, which would collide with the live-source
-  # `turnip` wrapper below. (The hermetic tests use the uv2nix package instead.)
-  pyEnv = pkgs.python314.withPackages (ps: [
-    ps.pydantic
-    ps.pyroute2
-    ps.pytest # `just itest` runs the integration suite in-VM against the live source
-  ]);
-
-  # `turnip` on PATH: run the live source as the package, defaulting the config to the
-  # bundled example (override with TURNIP_CONFIG). State goes under $XDG_RUNTIME_DIR.
-  turnip = pkgs.writeShellScriptBin "turnip" ''
-    export PYTHONPATH=/mnt/turnip/src''${PYTHONPATH:+:$PYTHONPATH}
-    export TURNIP_CONFIG=''${TURNIP_CONFIG:-/mnt/turnip/turnip.example.json}
-    export PYTHONDONTWRITEBYTECODE=1 # don't litter __pycache__ into the 9p-mounted repo
-    exec ${pyEnv}/bin/python -m turnip.main "$@"
-  '';
-in
+#   homelab@turnip$ TURNIP_CONFIG=... turnip up        # `turnip` is the live /mnt/turnip/src
+#
+# turnipEnv (the uv2nix env with turnip installed EDITABLE against /mnt/turnip) + testImage
+# (the integration test OCI image) come from the flake via specialArgs.
+{ pkgs, turnipEnv, testImage, ... }:
 {
   imports = [ ./turnip-host.nix ];
 
   networking.hostName = "turnip";
+
+  # `turnip` / `python3` / `pytest` are the editable uv2nix env (below) -- they run the
+  # LIVE /mnt/turnip/src with uv.lock-pinned deps (no wrapper, no nixpkgs/lock skew).
 
   # Admin user for console/ssh debugging.
   users.users.dev = {
@@ -57,10 +43,31 @@ in
   security.sudo.wheelNeedsPassword = false;
   services.openssh.enable = true;
 
-  environment.systemPackages = [
-    pyEnv # `python` with turnip's deps, for ad-hoc poking
-    turnip # the live-source `turnip` wrapper above
-  ];
+  environment.systemPackages = [ turnipEnv ]; # editable turnip + python3 + pytest
+
+  # `just itest` runs the full suite, podman-attach included, so carry the test OCI image:
+  # load it into homelab's rootless store at boot, and point the test at it + run-container.sh.
+  # (PYTHONDONTWRITEBYTECODE: the live src is a ro 9p mount, so suppress bytecode writes.)
+  environment.variables = {
+    PYTHONDONTWRITEBYTECODE = "1";
+    TURNIP_TEST_IMAGE = "turnip-test:latest";
+    TURNIP_RUNCONTAINER = "/mnt/turnip/run-container.sh";
+  };
+  systemd.services.turnip-test-image = {
+    description = "load the integration test OCI image into homelab's rootless podman";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "user@1001.service" ];
+    wants = [ "user@1001.service" ];
+    serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+    # rootless podman needs the setuid newuidmap/newgidmap (/run/wrappers/bin) + podman
+    # itself (/run/current-system/sw/bin) -- the system PATH, which a unit otherwise lacks.
+    script = ''
+      until test -d /run/user/1001; do sleep 0.2; done
+      export PATH=/run/wrappers/bin:/run/current-system/sw/bin
+      runuser -u homelab -- env XDG_RUNTIME_DIR=/run/user/1001 HOME=/home/homelab PATH="$PATH" \
+        podman load -i ${testImage}
+    '';
+  };
 
   virtualisation = {
     memorySize = 2048;

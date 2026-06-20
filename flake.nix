@@ -54,16 +54,53 @@
       # A self-contained venv (bin/turnip, bin/python, ...) for the chosen dep groups.
       # `default` = runtime only; `all` = + the dev group (pytest etc.) for tests.
       mkEnv = system: deps: (pythonSetFor system).mkVirtualEnv "turnip-env" deps;
+
+      # The dev VM's env: turnip installed EDITABLE against /mnt/turnip (the runtime 9p
+      # mount), so `turnip`/`python`/`pytest` run the LIVE source with uv.lock-pinned deps
+      # -- one env, no separate wrapper, no nixpkgs/lock dep skew. The editable .pth holds
+      # the root as a string, so it needn't exist at build time, only at runtime.
+      editableEnvFor = system:
+        let
+          editable = workspace.mkEditablePyprojectOverlay { root = "/mnt/turnip"; };
+          # hatchling's editable build imports `editables`, so add it to turnip's build
+          # inputs (the standard uv2nix editable step).
+          addEditables = final: prev: {
+            turnip = prev.turnip.overrideAttrs (old: {
+              nativeBuildInputs = old.nativeBuildInputs ++ final.resolveBuildSystem { editables = [ ]; };
+            });
+          };
+          pset = (pythonSetFor system).overrideScope
+            (lib.composeManyExtensions [ editable addEditables ]);
+        in
+        pset.mkVirtualEnv "turnip-dev" workspace.deps.all;
+
+      # A registry-free OCI image (just python3) for the real container-attach test: the
+      # container runs `python3 -c <connect>` (the test supplies the snippet). PATH set so
+      # bare `python3` resolves. Shared by the dev VM (just itest) + the nixos check.
+      testImageFor = system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        pkgs.dockerTools.buildLayeredImage {
+          name = "turnip-test";
+          tag = "latest";
+          contents = [ pkgs.python3Minimal ];
+          config.Env = [ "PATH=${pkgs.python3Minimal}/bin" ];
+        };
     in
     {
       packages = forAllSystems (system:
         let
           # The turnip dev VM: a NixOS system importing the qemu-vm module (so
-          # config.system.build.vm exists) plus testvm.nix. It deliberately runs the
-          # LIVE 9p-mounted source (no rebuild on edit) -- the hermetic packaged env
-          # is for the integration tests, not the interactive dev box.
+          # config.system.build.vm exists) plus testvm.nix. It runs turnip EDITABLE against
+          # the live 9p source (turnipEnv), and carries the test OCI image so `just itest`
+          # runs the whole suite (podman attach included).
           testVM = lib.nixosSystem {
             inherit system;
+            specialArgs = {
+              turnipEnv = editableEnvFor system;
+              testImage = testImageFor system;
+            };
             modules = [
               "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"
               ./nix/testvm.nix
@@ -83,27 +120,14 @@
       checks = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          # a tiny "connect to argv[1]:argv[2], exit 0/1" baked into the test OCI image
-          # for the podman-attach test (referenced by absolute path to dodge shell quoting).
-          tconnect = pkgs.writeScriptBin "tconnect" ''
-            #!${pkgs.python3Minimal}/bin/python3
-            import socket, sys
-            socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3).close()
-          '';
-          # a registry-free OCI image (python3 only) for the real container-attach test.
-          image = pkgs.dockerTools.buildLayeredImage {
-            name = "turnip-test";
-            tag = "latest";
-            contents = [ pkgs.python3Minimal tconnect ];
-          };
         in
         {
           # one gate: a single NixOS host runs the whole pytest suite (the `world` peer is
           # an in-host netns fixture, so no multi-node test is needed).
           integration = pkgs.testers.runNixOSTest (import ./tests/nixos/integration.nix {
-            inherit lib image;
+            inherit lib;
+            image = testImageFor system;
             turnipEnv = self.packages.${system}.turnip-test;
-            tconnect = "${tconnect}/bin/tconnect";
           });
         });
 

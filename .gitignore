@@ -12,3 +12,4 @@ dist/
 turnip.qcow2
 nix/testvm_key
 result
+result-*

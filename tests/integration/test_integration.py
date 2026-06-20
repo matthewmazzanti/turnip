@@ -14,7 +14,7 @@ import os
 import subprocess
 
 import pytest
-from harness import Probe, Seg, ensure_anchors, turnip, turnip_attempt, world
+from harness import Probe, Seg, connect_argv, ensure_anchors, turnip, turnip_attempt, world
 
 # the world peer the two uplink tests reach over the host edge (routed, so host_cidr set).
 WORLD_UPLINK = Seg("w-up", "198.51.100.2/24", "198.51.100.1/24")
@@ -173,18 +173,17 @@ def test_podman_attach() -> None:
     image = os.environ.get("TURNIP_TEST_IMAGE")
     if not image:
         pytest.skip("needs a loaded OCI image (set TURNIP_TEST_IMAGE)")
-    tconnect = os.environ["TURNIP_TCONNECT"]
     runc = os.environ["TURNIP_RUNCONTAINER"]
 
-    def run_container(*args: str) -> int:
-        argv = ["bash", runc, *args]
+    def reaches(dst_ip: str) -> int:
+        # the image is just python3; the connect snippet is supplied here (bootstrapped
+        # into the container as `python3 -c ...`), not baked into the image.
+        argv = ["bash", runc, "zwave", image, "--", *connect_argv(dst_ip, 443, 3)]
         if os.geteuid() == 0:  # run-container.sh drives rootless podman -> run as the owner
             argv = ["sudo", "-u", "homelab", "env", "XDG_RUNTIME_DIR=/run/user/1001",
                     "HOME=/home/homelab", *argv]
         return subprocess.run(argv).returncode
 
     with turnip(ROUTER), Probe().listener("hass", 443), Probe().listener("proxy", 443):
-        ok = run_container("zwave", image, "--", tconnect, "hass", "443")
-        assert ok == 0, "real container should reach hass BY NAME (generated /etc/hosts)"
-        denied = run_container("zwave", image, "--", tconnect, "10.0.0.13", "443")
-        assert denied != 0, "denied peer (proxy) dropped even from a real container"
+        assert reaches("hass") == 0, "real container reaches hass BY NAME (generated /etc/hosts)"
+        assert reaches("10.0.0.13") != 0, "denied peer (proxy) dropped even from a real container"

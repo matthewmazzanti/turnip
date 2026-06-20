@@ -9,7 +9,7 @@
 # `turnipEnv` is the uv2nix `turnip-test` env (both `turnip` and `pytest`). pytest runs
 # as root (the link/uplink scenarios are rootful); the podman-attach test drops to the
 # rootless owner itself for run-container.sh.
-{ lib, turnipEnv, image, tconnect }:
+{ lib, turnipEnv, image }:
 let
   asHomelab = "sudo -u homelab env XDG_RUNTIME_DIR=/run/user/1001 HOME=/home/homelab";
 in
@@ -32,7 +32,7 @@ in
     machine.succeed("${asHomelab} podman load -i ${image}")  # registry-free, rootless store
     machine.succeed(
         "TURNIP_INTEGRATION=1 TURNIP_TEST_IMAGE=turnip-test:latest "
-        "TURNIP_TCONNECT=${tconnect} TURNIP_RUNCONTAINER=/etc/turnip-run-container.sh "
+        "TURNIP_RUNCONTAINER=/etc/turnip-run-container.sh "
         "PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider -v /etc/turnip-tests"
     )
   '';
