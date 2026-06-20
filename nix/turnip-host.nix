@@ -29,4 +29,17 @@
     pkgs.iproute2 # ip/ss -- probes read `ip -j`
     pkgs.jq # inspect `nft -j`
   ];
+
+  # The integration test OCI image: a registry-free layered image of just python3, for
+  # the real container-attach test (the container runs `python3 -c <connect>`; the test
+  # supplies the snippet, PATH set so bare `python3` resolves). It lives on this SHARED
+  # base so both consumers load the IDENTICAL image straight from their own
+  # `config.system.build.testImage` -- the dev VM at boot (`just itest`), the hermetic
+  # check via `podman load` in its testScript -- with no flake plumbing between them.
+  system.build.testImage = pkgs.dockerTools.buildLayeredImage {
+    name = "turnip-test";
+    tag = "latest";
+    contents = [ pkgs.python3Minimal ];
+    config.Env = [ "PATH=${pkgs.python3Minimal}/bin" ];
+  };
 }

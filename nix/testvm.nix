@@ -16,9 +16,10 @@
 #   ssh -i nix/testvm_key -p 2222 homelab@localhost    # the rootless run user
 #   homelab@turnip$ TURNIP_CONFIG=... turnip up        # `turnip` is the live /mnt/turnip/src
 #
-# turnipEnv (the uv2nix env with turnip installed EDITABLE against /mnt/turnip) + testImage
-# (the integration test OCI image) come from the flake via specialArgs.
-{ pkgs, turnipEnv, testImage, ... }:
+# turnipEnv (the uv2nix env with turnip installed EDITABLE against /mnt/turnip) comes from
+# the flake via specialArgs. The test OCI image is defined on the shared base
+# (turnip-host.nix) -- read it from `config.system.build.testImage` below.
+{ config, pkgs, turnipEnv, ... }:
 {
   imports = [ ./turnip-host.nix ];
 
@@ -65,7 +66,7 @@
       until test -d /run/user/1001; do sleep 0.2; done
       export PATH=/run/wrappers/bin:/run/current-system/sw/bin
       runuser -u homelab -- env XDG_RUNTIME_DIR=/run/user/1001 HOME=/home/homelab PATH="$PATH" \
-        podman load -i ${testImage}
+        podman load -i ${config.system.build.testImage}
     '';
   };
 
