@@ -134,6 +134,12 @@
               pkgs.uv
               pkgs.just # task runner (see ./justfile); `just vm` builds + boots the dev VM
               pkgs.qemu-utils # qemu-img: qcow2 info + snapshot/rollback (savevm)
+
+              # Go toolchain for the netlink/nft rewrite spike (spike/go-netns-bootstrap).
+              # nixpkgs stable go is fine for a spike; gopls finds the std lib on its own,
+              # so no RUST_SRC_PATH-style env is needed.
+              pkgs.go
+              pkgs.gopls
             ];
 
             env = {
