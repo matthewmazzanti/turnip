@@ -227,6 +227,10 @@ func (t Table) render() any { return obj{"table": obj{"family": t.Family, "name"
 // Add adds the table object itself.
 func (t Table) Add() Node { return addCmd{t} }
 
+// Delete deletes the table (and everything in it). Pair with Add for an idempotent flush:
+// Rules(t.Add(), t.Delete()) removes the table whether or not it existed.
+func (t Table) Delete() Node { return deleteCmd{t} }
+
 // Reload is the flush-and-reload triple: add (ensure exists) / delete / add -- so applying
 // it replaces the whole table atomically and idempotently, even on a fresh netns.
 func (t Table) Reload() []Node { return []Node{addCmd{t}, deleteCmd{t}, addCmd{t}} }
@@ -236,14 +240,14 @@ func (t Table) Reload() []Node { return []Node{addCmd{t}, deleteCmd{t}, addCmd{t
 func (t Table) Chain(name, typ, hook string, prio int, policy string) Node {
 	return addCmd{
 		chain{
-			family: t.Family,
-			table: t.Name,
-			name: name,
-			typ: typ,
-			hook: hook,
-			prio: prio,
+			family:  t.Family,
+			table:   t.Name,
+			name:    name,
+			typ:     typ,
+			hook:    hook,
+			prio:    prio,
 			hasPrio: hook != "",
-			policy: policy,
+			policy:  policy,
 		},
 	}
 }
@@ -252,11 +256,11 @@ func (t Table) Chain(name, typ, hook string, prio int, policy string) Node {
 func (t Table) Map(name string, keyType []string, elems [][2]Node) Node {
 	return addCmd{
 		verdictMap{
-			family: t.Family,
-			table: t.Name,
-			name: name,
+			family:  t.Family,
+			table:   t.Name,
+			name:    name,
 			keyType: keyType,
-			elems: elems,
+			elems:   elems,
 		},
 	}
 }
@@ -266,9 +270,9 @@ func (t Table) Rule(chainName string, exprs ...Node) Node {
 	return addCmd{
 		ruleObj{
 			family: t.Family,
-			table: t.Name,
-			chain: chainName,
-			exprs: exprs,
+			table:  t.Name,
+			chain:  chainName,
+			exprs:  exprs,
 		},
 	}
 }

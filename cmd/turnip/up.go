@@ -116,8 +116,11 @@ func up(configPath string) error {
 	fmt.Printf("up: %d network(s), %d container(s); owner=%s, state=%s\n",
 		len(cfg.Networks), len(cfg.Containers), owner.User, stateDir)
 
-	// TODO(teardown): up = down + build -- clear prior host-edge state and rebuild the
-	// netns clean before the bootstrap below.
+	// up = down + build: clear prior host-edge state (init-netns veths + nat zones) before
+	// rebuilding. The netns themselves are recreated clean by Bootstrap (pinNetns is idempotent).
+	if err := clearHostEdge(cfg); err != nil {
+		return err
+	}
 
 	set, err := netns.Bootstrap(owner, specs)
 	if err != nil {
@@ -177,16 +180,43 @@ func up(configPath string) error {
 				cname, att.Interface, att.IP, config.HOSTPrefix, net.Gateway, defaultMark(ep.Default), rif)
 		}
 
+		// uplink (the host edge): the /31 veth across init<->router, host NAT (masquerade) +
+		// container routes. Wired here, before the router sysctls/nft, so the uplink veth
+		// exists when they reference it (its rp_filter + the egress allows).
+		uplinkRouterIf := ""
+		var edge *dataplane.Edge
+		if net.Uplink != nil {
+			uplink := dataplane.Uplink{
+				HostIf: net.Uplink.HostIf, RouterIf: net.Uplink.RouterIf,
+				HostIP: net.Uplink.Link, RouterIP: net.Uplink.Link.Next(),
+			}
+			if err := dataplane.HostEdgeConnect(routerFd, uplink); err != nil {
+				return fmt.Errorf("network %q uplink: %w", netName, err)
+			}
+			var containerIPs []netip.Addr
+			for _, cname := range sortedKeys(net.Attach) {
+				containerIPs = append(containerIPs, net.Attach[cname].IP)
+			}
+			if err := dataplane.ConfigureHostNAT(netName, uplink, containerIPs); err != nil {
+				return fmt.Errorf("network %q host nat: %w", netName, err)
+			}
+			uplinkRouterIf = uplink.RouterIf
+			edge = &dataplane.Edge{UplinkIf: uplink.RouterIf, Egress: buildEgressAllows(net)}
+			fmt.Printf("    uplink: %s <-> %s (%s/%d), host masquerade + %d route(s)\n",
+				uplink.HostIf, uplink.RouterIf, uplink.HostIP, config.LINKPrefix, len(containerIPs))
+		}
+
 		// sysctls: applied AFTER the veths exist (the per-veth conf.<if> dirs). /proc/sys is
 		// per-process-netns with no netlink verb, so it needs a setns episode (set.Enter).
-		sysctls := dataplane.RouterSysctls(routerIfs)
+		sysctls := dataplane.RouterSysctls(routerIfs, uplinkRouterIf)
 		if err := set.Enter("router:"+netName, func() error { return dataplane.WriteSysctls(sysctls) }); err != nil {
 			return fmt.Errorf("network %q sysctls: %w", netName, err)
 		}
 		fmt.Printf("    sysctls: ip_forward + per-veth proxy_arp/rp_filter (strict) + ipv6 off\n")
 
-		// nft: the forward flow matrix + the router's own-address lockdown. Resolve flow
-		// endpoints (container names) to IPs; icmp / port="any" in flows isn't wired yet.
+		// nft: the forward flow matrix + uplink egress allows + the router's own-address
+		// lockdown. Resolve flow endpoints (container names) to IPs; icmp / port="any" in
+		// flows isn't wired yet.
 		ip := map[string]netip.Addr{}
 		for cname, att := range net.Attach {
 			ip[cname] = att.IP
@@ -203,7 +233,7 @@ func up(configPath string) error {
 		}
 		// nft acts on the process netns, so apply it inside a set.Enter episode: the forked
 		// nft child inherits the router netns.
-		rs := dataplane.BuildNFT(flows)
+		rs := dataplane.BuildNFT(flows, edge)
 		if err := set.Enter("router:"+netName, func() error { return nftlib.Load(rs) }); err != nil {
 			return fmt.Errorf("network %q nft: %w", netName, err)
 		}
@@ -226,11 +256,7 @@ func up(configPath string) error {
 		fmt.Printf("  container %s: hosts written\n", cname)
 	}
 
-	// --- the host edge (uplink veth + masquerade/DNAT) -- TODO --------------------------
-	// per network with an uplink: the /31 veth across init<->router, host masquerade/DNAT,
-	// the router default route, the uplink rp_filter sysctl + nft egress/ingress edge rules.
-
-	fmt.Println("  (container links + host edge not yet implemented)")
+	fmt.Println("  (container links + uplink ingress/DNAT not yet implemented)")
 	return nil
 }
 
@@ -251,8 +277,12 @@ func down(configPath string) error {
 	for i, s := range specs {
 		paths[i] = s.Path
 	}
-	// TODO(host-edge): teardownHostEdge (init-netns parent) once uplinks/links are wired.
+	// clear the init-netns host edge (uplink veths + nat zones), then scrub the netns (which
+	// reaps everything inside: links, routes, sysctls, the nft table).
 	// TODO: refuse when a live podman container still holds a target netns (would orphan it).
+	if err := clearHostEdge(cfg); err != nil {
+		return err
+	}
 	if err := netns.Teardown(owner, paths); err != nil {
 		return err
 	}
@@ -293,6 +323,46 @@ func defaultMark(d bool) string {
 		return " (default)"
 	}
 	return ""
+}
+
+// clearHostEdge removes the init-netns host-edge state (uplink veths + nat zones) for every
+// uplinked network -- the parent half of teardown, used by down and up's clean slate.
+func clearHostEdge(cfg *config.Turnip) error {
+	for _, netName := range sortedKeys(cfg.Networks) {
+		net := cfg.Networks[netName]
+		if net.Uplink == nil {
+			continue
+		}
+		if err := dataplane.TeardownHostEdge(netName, net.Uplink.HostIf); err != nil {
+			return fmt.Errorf("network %q host edge teardown: %w", netName, err)
+		}
+	}
+	return nil
+}
+
+// buildEgressAllows translates each attachment's egress config into the dataplane edge
+// allows: a container that may initiate out the uplink, any (All) or scoped (proto, port).
+func buildEgressAllows(net config.Network) []dataplane.EgressAllow {
+	var allows []dataplane.EgressAllow
+	for _, cname := range sortedKeys(net.Attach) {
+		att := net.Attach[cname]
+		if !att.Egress.All && len(att.Egress.Rules) == 0 {
+			continue
+		}
+		a := dataplane.EgressAllow{IP: att.IP, All: att.Egress.All}
+		for _, r := range att.Egress.Rules {
+			sc := dataplane.EgressScope{}
+			for _, p := range r.Proto {
+				sc.Protos = append(sc.Protos, string(p))
+			}
+			if r.Port != nil && !r.Port.Any {
+				sc.Port = r.Port.Port
+			}
+			a.Rules = append(a.Rules, sc)
+		}
+		allows = append(allows, a)
+	}
+	return allows
 }
 
 // hostsFile is the /etc/hosts body for a container: localhost, the container's own name on

@@ -16,9 +16,11 @@ import (
 //   - then per fabric veth: proxy_arp=1 (answer the gateway ARP / a future uplink) and
 //     rp_filter=1 (STRICT -- the anti-spoof pin, paired with that veth's /32 route).
 //
-// Apply AFTER the veths exist (the per-veth conf.<if> dirs). The uplink veth's own
-// rp_filter is added by the host edge, when that veth is created -- not here.
-func RouterSysctls(routerIfs []string) map[string]string {
+// Apply AFTER the veths exist (the per-veth conf.<if> dirs). uplinkRouterIf is the uplink
+// veth's router-side name (or "" for no uplink); it gets strict rp_filter too -- the reverse
+// path for an internet source is the default route = the uplink, while a container-spoofed
+// source resolves to its own /32 veth (not the uplink) and is dropped (the anti-spoof pin).
+func RouterSysctls(routerIfs []string, uplinkRouterIf string) map[string]string {
 	s := map[string]string{
 		"net.ipv4.ip_forward":                "1",
 		"net.ipv4.conf.all.rp_filter":        "0",
@@ -28,6 +30,9 @@ func RouterSysctls(routerIfs []string) map[string]string {
 	for _, rif := range routerIfs {
 		s["net.ipv4.conf."+rif+".proxy_arp"] = "1"
 		s["net.ipv4.conf."+rif+".rp_filter"] = "1"
+	}
+	if uplinkRouterIf != "" {
+		s["net.ipv4.conf."+uplinkRouterIf+".rp_filter"] = "1"
 	}
 	return s
 }
