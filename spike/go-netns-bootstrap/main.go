@@ -137,11 +137,14 @@ func phase1(names []string) {
 			"inherited fd -- switch the bridge to an abstract-namespace socket", bridgeFd, err)
 	}
 
-	runtime.LockOSThread() // we mutate THIS thread's netns repeatedly; pin the goroutine
-	orig, err := netns.Get()
-	if err != nil {
-		fatalChild("get host netns: %v", err)
-	}
+	// We unshare THIS thread's netns repeatedly, so pin the goroutine to it. We do NOT
+	// restore the host netns between names and never return to it: phase 1 runs inside
+	// podman's userns, but the host netns is owned by the INIT userns (an ancestor),
+	// where our mapped-root holds no caps -- so setns BACK into it is EPERM. unshare,
+	// though, always mints a fresh netns regardless of the current one, so we just chain
+	// forward (each new netns is owned by podman's userns, which the root parent has caps
+	// over) and let this short-lived process exit in the last one.
+	runtime.LockOSThread()
 
 	for _, name := range names {
 		// A fresh netns on the current thread; no bind-mount -- the fd we ship keeps it
@@ -157,13 +160,10 @@ func phase1(names []string) {
 		if err := sendFdByName(bridgeFd, name, int(ns)); err != nil {
 			fatalChild("send fd for %q: %v", name, err)
 		}
-		ns.Close() // the parent received its own dup via SCM_RIGHTS
-		if err := netns.Set(orig); err != nil {
-			fatalChild("restore host netns before next unshare: %v", err)
-		}
+		ns.Close() // the parent received its own dup via SCM_RIGHTS (and the in-flight
+		// SCM ref keeps the netns alive until the parent receives it)
 		fmt.Fprintf(os.Stderr, "[phase1] created + sent %q\n", name)
 	}
-	orig.Close()
 	unix.Close(bridgeFd) // close -> EOF, unblocking the parent's recv loop
 }
 

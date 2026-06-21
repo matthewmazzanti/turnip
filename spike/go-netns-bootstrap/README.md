@@ -37,18 +37,31 @@ unshare`'s re-exec.
 As root, with `$SUDO_USER` = the rootless-podman owner (i.e. just `sudo` from that
 user's session), in a shell that has a Go toolchain + `podman`:
 
+`CGO_ENABLED=0` matters: `os/user.Lookup` defaults to the C `getpwnam` path, and the
+dev VM has no `gcc`. Disabling cgo switches it to the pure-Go `/etc/passwd` parser
+(fine for resolving the rootless owner); the netlink/netns/x/sys deps are all pure Go.
+
 ```sh
 cd spike/go-netns-bootstrap
-go mod tidy                  # resolve deps (needs network once)
-go build -o go-netns-bootstrap .
-sudo ./go-netns-bootstrap    # sudo sets $SUDO_USER for us
+go mod tidy                            # resolve deps (needs network once); commits go.sum
+CGO_ENABLED=0 go build -o /tmp/spike-bin .
+sudo ./...                             # see below
 ```
 
 Build first, then `sudo` the binary: `sudo go run .` would re-exec a binary under
 root's build cache that the dropped rootless user can't read, breaking the
-`podman unshare <self>` step. A world-readable built binary avoids that.
+`podman unshare <self>` step. A world-readable built binary avoids that. The dev VM
+mounts the repo read-only (9p), so build from a writable copy (`cp -r ... /tmp/...`).
 
-Expected tail:
+The parent reads `$SUDO_USER` to find the rootless-podman owner. Run it from that
+user's own `sudo` session and it's already correct; in the dev VM you `sudo` as `dev`
+but podman belongs to `homelab`, so override it:
+
+```sh
+sudo env SUDO_USER=homelab /tmp/spike-bin
+```
+
+Expected tail (validated in the dev VM, 2026-06-21 — **PASS**):
 
 ```
 [parent] collected 4 netns fd(s) in one place
@@ -59,13 +72,26 @@ Expected tail:
 PASS
 ```
 
+## Findings
+
+- **fd 3 survives `podman unshare`.** Ordinary `ExtraFiles` fd inheritance makes it
+  across podman's re-exec — the abstract-socket fallback below was NOT needed.
+- **No setns back to the host netns from inside podman's userns.** Phase 1 runs in
+  podman's userns; the host netns is owned by the INIT userns (an ancestor), where our
+  mapped-root holds no caps, so `setns` back into it is EPERM. `unshare(CLONE_NEWNET)`
+  always mints a fresh netns regardless of the current one, so phase 1 chains forward
+  (each new netns owned by podman's userns, which the root parent has caps over) and
+  exits in the last one — it never returns to the host netns. The real port's phase 1
+  must respect this when it adds bind-mounts.
+- **Rootful thesis holds.** The root parent enters every podman-userns-owned netns by
+  fd (`NewHandleAt`) and does CAP_NET_ADMIN ops — no in-process userns entry needed.
+
 ## Known risks / fallbacks
 
-- **fd 3 across `podman unshare`.** Rootless podman re-execs itself during setup
-  and may not forward inherited fds. If so, phase1 fails fast with `fd 3 is not a
-  socket` — the fix is an **abstract-namespace unix socket** whose name is passed via
-  an env var (env survives the re-exec) and dialed by the child; the SCM_RIGHTS
-  transfer is otherwise identical.
+- **fd 3 across `podman unshare`** (resolved above; kept for the record). If a future
+  podman drops inherited fds, phase1 fails fast with `fd 3 is not a socket` — the fix
+  is an **abstract-namespace unix socket** whose name is passed via an env var (env
+  survives the re-exec) and dialed by the child; the SCM_RIGHTS transfer is identical.
 - **No persistence.** These netns are anonymous, alive only while the parent holds
   the fds — fine for proving the bridge. The real tool must also **bind-mount** each
   netns under a user-writable state dir (`/run/user/<uid>/turnip/...`, NOT
