@@ -35,9 +35,11 @@ import (
 )
 
 const (
-	// ProvisionArg is the hidden subcommand the parent re-execs into; cmd/turnip routes it
-	// to RunProvisioner from its normal arg dispatch. Never user-typed.
+	// ProvisionArg / TeardownArg are the hidden subcommands the parent re-execs into;
+	// cmd/turnip routes them to RunProvisioner / RunTeardown from its normal arg dispatch.
+	// Never user-typed.
 	ProvisionArg = "__provision"
+	TeardownArg  = "__teardown"
 	bridgeFD     = 3 // the ExtraFiles SCM_RIGHTS socket in the re-exec'd child
 )
 
@@ -95,6 +97,33 @@ func (s *Set) Enter(name string, fn func() error) error {
 
 // --- parent side: the bootstrap -------------------------------------------
 
+// podmanUnshareCmd builds `podman unshare <self> <args...>` running as the rootless owner.
+// Dropping to the owner via SysProcAttr.Credential (not `sudo -u`, which would close passed
+// fds) makes `podman unshare` enter THAT user's persistent podman userns. USER/LOGNAME are
+// set too, not just HOME/XDG_RUNTIME_DIR: under sudo they're still "root", and podman
+// consults $USER for the subuid/subgid range -- left as root it finds none and falls back
+// to a single uid mapping, whose userns disagrees with the autoSubUidGidRange `podman run`
+// uses. (self is os.Executable, NOT "/proc/self/exe", which execve resolves against podman.)
+func podmanUnshareCmd(owner Owner, args ...string) (*exec.Cmd, error) {
+	self, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("resolve self: %w", err)
+	}
+	cmd := exec.Command("podman", append([]string{"unshare", self}, args...)...)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	cmd.Dir = "/" // the child runs as the (dropped) owner; don't inherit a CWD it can't chdir into (e.g. root's home under sudo)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: uint32(owner.UID), Gid: uint32(owner.GID)},
+	}
+	cmd.Env = append(os.Environ(),
+		"HOME="+owner.Home,
+		"USER="+owner.User,
+		"LOGNAME="+owner.User,
+		fmt.Sprintf("XDG_RUNTIME_DIR=/run/user/%d", owner.UID),
+	)
+	return cmd, nil
+}
+
 // Bootstrap re-execs this binary under `podman unshare` as owner; the provisioner child
 // pins each netns at its Path and ships the fds back over SCM_RIGHTS. Returns the live Set.
 func Bootstrap(owner Owner, specs []Spec) (*Set, error) {
@@ -109,31 +138,13 @@ func Bootstrap(owner Owner, specs []Spec) (*Set, error) {
 	parentSock := pair[0]
 	childFile := os.NewFile(uintptr(pair[1]), "netns-bridge") // owns pair[1]; -> fd 3 in child
 
-	self, err := os.Executable() // NOT "/proc/self/exe": execve resolves that against podman
+	cmd, err := podmanUnshareCmd(owner, append([]string{ProvisionArg}, encodeSpecs(specs)...)...)
 	if err != nil {
 		childFile.Close()
 		unix.Close(parentSock)
-		return nil, fmt.Errorf("resolve self: %w", err)
+		return nil, err
 	}
-
-	// Drop to the rootless owner so `podman unshare` enters THAT user's persistent podman
-	// userns. In-process drop via Credential, not `sudo -u` (sudo would close fd 3).
-	cmd := exec.Command("podman", append([]string{"unshare", self, ProvisionArg}, encodeSpecs(specs)...)...)
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-	cmd.ExtraFiles = []*os.File{childFile}
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Credential: &syscall.Credential{Uid: uint32(owner.UID), Gid: uint32(owner.GID)},
-	}
-	// USER/LOGNAME too, not just HOME/XDG_RUNTIME_DIR: under sudo they're still "root", and
-	// podman consults $USER for the subuid/subgid range -- left as root it finds none and
-	// falls back to a single uid mapping, which can create a pause process whose userns
-	// disagrees with the full autoSubUidGidRange that `podman run` uses.
-	cmd.Env = append(os.Environ(),
-		"HOME="+owner.Home,
-		"USER="+owner.User,
-		"LOGNAME="+owner.User,
-		fmt.Sprintf("XDG_RUNTIME_DIR=/run/user/%d", owner.UID),
-	)
+	cmd.ExtraFiles = []*os.File{childFile} // -> fd 3 in the child
 
 	if err := cmd.Start(); err != nil {
 		childFile.Close()
@@ -162,6 +173,24 @@ func Bootstrap(owner Owner, specs []Spec) (*Set, error) {
 	return &Set{fds: fds}, nil
 }
 
+// Teardown re-execs under `podman unshare` as owner to remove each pinned netns inside
+// podman's mount ns -- the counterpart to Bootstrap/Provision. Unmounting a netns destroys
+// it and everything inside (links, routes, sysctls, the nft table), so this is the whole
+// netns teardown.
+func Teardown(owner Owner, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	cmd, err := podmanUnshareCmd(owner, append([]string{TeardownArg}, paths...)...)
+	if err != nil {
+		return err
+	}
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("teardown (`podman unshare`) failed: %w", err)
+	}
+	return nil
+}
+
 // --- child side: the provisioner ------------------------------------------
 
 // RunProvisioner is the provisioner subcommand entrypoint: cmd/turnip's arg dispatch routes
@@ -170,6 +199,18 @@ func Bootstrap(owner Owner, specs []Spec) (*Set, error) {
 // caller's normal exit handling does the rest.
 func RunProvisioner(args []string) error {
 	return Provision(decodeSpecs(args), bridgeFD)
+}
+
+// RunTeardown is the teardown subcommand entrypoint (the TeardownArg re-exec): inside
+// podman's mount ns it unmounts + removes each pinned netns. Best-effort -- a lazy unmount
+// always detaches the netns (destroying it once unreferenced), and a leftover empty file is
+// harmless (the next up's pin reclaims it).
+func RunTeardown(paths []string) error {
+	for _, p := range paths {
+		_ = unix.Unmount(p, unix.MNT_DETACH)
+		_ = os.Remove(p)
+	}
+	return nil
 }
 
 // Provision is the in-podman provisioner: inside podman's user+mount ns it creates and

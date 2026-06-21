@@ -61,6 +61,9 @@ func run(args []string) error {
 		// the re-exec'd provisioner child (inside podman's userns) -- not a user command;
 		// the name/path specs are the positional args after the sentinel.
 		return netns.RunProvisioner(fs.Args()[1:])
+	case netns.TeardownArg:
+		// the re-exec'd teardown child (inside podman's userns); the paths to scrub follow.
+		return netns.RunTeardown(fs.Args()[1:])
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)

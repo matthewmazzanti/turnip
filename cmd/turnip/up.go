@@ -124,46 +124,55 @@ func up(configPath string) error {
 
 	// The dataplane -- skeletoned, NOT implemented. Each step drives the live Set the
 	// rootful parent holds (set.Enter for sysctls, netlink/nft over the fd).
-	if err := configureRouters(cfg, set); err != nil {
+	if err := configureNetworks(cfg, set); err != nil {
 		return err
 	}
-	if err := wireContainers(cfg, set); err != nil {
-		return err
-	}
-	if err := configureLinks(cfg, set); err != nil {
+	if err := configureContainers(cfg, set); err != nil {
 		return err
 	}
 	if err := configureHostEdge(cfg, set); err != nil {
 		return err
 	}
 
-	fmt.Println("  (skeleton: routers/containers/links/host-edge dataplane not yet implemented)")
+	fmt.Println("  (skeleton: nft + container-local setup + host edge not yet implemented)")
 	return nil
 }
 
-// down tears it all down. Skeleton: the host-edge state lives in the init netns (parent),
-// the netns themselves are removed inside podman (unmount + rm the bind-mounts) -- the
-// sibling of Bootstrap/Provision.
+// down scrubs the netns: removing each pinned netns destroys everything inside it (links,
+// routes, sysctls, the future nft table), so this is the whole teardown for the routed
+// fabric. The host-edge state (in the init netns) is a separate, later concern.
 func down(configPath string) error {
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		return err
 	}
-	if _, _, err := resolveRuntime(cfg.Runtime); err != nil {
+	owner, stateDir, err := resolveRuntime(cfg.Runtime)
+	if err != nil {
 		return err
 	}
-	// TODO(teardown): teardownHostEdge (parent) + a podman-unshare phase that unmounts +
-	// removes each netns pin (the Provision counterpart).
-	return fmt.Errorf("down: teardown not implemented yet (Go port in progress)")
+	specs := netnsSpecs(cfg, stateDir)
+	paths := make([]string, len(specs))
+	for i, s := range specs {
+		paths[i] = s.Path
+	}
+	// TODO(host-edge): teardownHostEdge (init-netns parent) once uplinks/links are wired.
+	// TODO: refuse when a live podman container still holds a target netns (would orphan it).
+	if err := netns.Teardown(owner, paths); err != nil {
+		return err
+	}
+	fmt.Printf("down: scrubbed %d netns under %s\n", len(paths), stateDir)
+	return nil
 }
 
 // --- dataplane skeleton (not implemented) ----------------------------------
 
-// configureRouters wires each router netns: the dummy gateway holding <gateway>/32 and a
-// /32 routed veth per attached container (router end + container end + the routes). The
-// router dataplane -- sysctls (ip_forward, per-veth proxy_arp + strict rp_filter, ipv6 off)
-// and the nft forward flow matrix -- is still TODO.
-func configureRouters(cfg *config.Turnip, set *netns.Set) error {
+// configureNetworks wires each network's L3 fabric in its router netns: the dummy gateway
+// holding <gateway>/32, a /32 routed veth per attached container (the router end here, the
+// container end born directly in the container netns -- a network attachment), and the
+// router sysctls (ip_forward, per-veth proxy_arp + strict rp_filter, ipv6 off). The nft
+// forward flow matrix is still TODO. This owns the container-side veth because the veth IS
+// the attachment; container-LOCAL setup (lo/links/hosts) is configureContainers.
+func configureNetworks(cfg *config.Turnip, set *netns.Set) error {
 	counts := interfaceCounts(cfg)
 	for _, netName := range sortedKeys(cfg.Networks) {
 		net := cfg.Networks[netName]
@@ -247,18 +256,14 @@ func defaultMark(d bool) string {
 	return ""
 }
 
-// wireContainers brings up loopback in each container netns and writes its generated
-// /etc/hosts (its own names per network + the peers its outbound flows may reach).
-func wireContainers(cfg *config.Turnip, set *netns.Set) error {
-	// TODO: ports main.py set_lo_up / container_peers / hosts_file / write_hosts.
-	return nil
-}
-
-// configureLinks moves a host netdev into each container's netns -- the deliberate L2 trust
-// escape, outside every router and its nft policy. veth->bridge / veth->host / macvlan /
-// ipvlan are owned (reaped with the netns); phys is borrowed (returned to the host on down).
-func configureLinks(cfg *config.Turnip, set *netns.Set) error {
-	// TODO: ports main.py validate_link_anchors / link_connect.
+// configureContainers does the per-container, network-INDEPENDENT setup -- distinct from
+// configureNetworks, which owns the attachment veths. Per container: bring up loopback;
+// move any host-netdev links into the container netns (the deliberate L2 trust escape,
+// outside every router and its nft policy -- veth/macvlan/ipvlan owned, phys borrowed); and
+// write the generated /etc/hosts (its own names + the peers its flows may reach). NOT
+// IMPLEMENTED.
+func configureContainers(cfg *config.Turnip, set *netns.Set) error {
+	// TODO: ports main.py set_lo_up / validate_link_anchors / link_connect / hosts_file.
 	return nil
 }
 
