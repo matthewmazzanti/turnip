@@ -48,13 +48,21 @@
     ];
 
     # Test config shared by both consumers (the dev VM + the check): un-skip the live
-    # scenarios, suppress bytecode writes (sources are read-only -- a store path or a ro 9p
-    # mount), and name the OCI image this host loads at boot, derived from the image itself
-    # so it can't drift. The check's backdoor shell sources /etc/profile so these reach
-    # pytest; the dev VM's `sudo pytest` strips them, so nix/testvm.nix adds a sudo env_keep.
-    environment.variables = {
+    # scenarios, redirect the bytecode cache off the read-only sources, and name the OCI
+    # image this host loads at boot, derived from the image itself so it can't drift.
+    #
+    # sessionVariables (NOT environment.variables) so these land in BOTH /etc/set-environment
+    # (the check's machine.succeed backdoor sources /etc/profile) AND /etc/pam/environment --
+    # the latter is pam_env's file, so `just itest`'s `sudo pytest` inherits them with no
+    # env_keep. pam_env expands @{HOME} to the sudo TARGET, so root's cache lands in /root.
+    environment.sessionVariables = {
       TURNIP_INTEGRATION = "1";
-      PYTHONDONTWRITEBYTECODE = "1";
+      # The sources are read-only (store path / ro 9p), so Python can't cache .pyc beside
+      # them -- WITHOUT this every `turnip` invocation recompiles the heavy import graph
+      # (pydantic + pyroute2 + turnip), ~1s of every up/down. Redirect the cache to a
+      # writable, $HOME-relative dir so it compiles ONCE per boot and is reused -- and so
+      # root and homelab keep SEPARATE, self-writable caches (no cross-user .pyc clobber).
+      PYTHONPYCACHEPREFIX = "$HOME/.cache/turnip/pycache";
       TURNIP_TEST_IMAGE = "${config.turnip.testImage.imageName}:${config.turnip.testImage.imageTag}";
     };
 
