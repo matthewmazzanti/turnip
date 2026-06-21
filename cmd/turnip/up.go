@@ -17,6 +17,7 @@ import (
 	"git.lan/mmazzanti/turnip/internal/config"
 	"git.lan/mmazzanti/turnip/internal/dataplane"
 	"git.lan/mmazzanti/turnip/internal/netns"
+	"git.lan/mmazzanti/turnip/internal/nftlib"
 )
 
 // loadConfig discovers, reads, and validates the config: an explicit --config, else
@@ -237,7 +238,11 @@ func configureNetworks(cfg *config.Turnip, set *netns.Set) error {
 				Proto: string(fl.Proto), Port: uint16(fl.Port.Port),
 			})
 		}
-		if err := dataplane.ConfigureNFT(routerFd, flows); err != nil {
+		// nft applies inside the router netns: nft acts on the process's netns, so we run
+		// it in a set.Enter episode (the same setns the sysctls used) where the forked nft
+		// child inherits the router netns.
+		rs := dataplane.BuildNFT(flows)
+		if err := set.Enter("router:"+netName, func() error { return nftlib.Load(rs) }); err != nil {
 			return fmt.Errorf("network %q nft: %w", netName, err)
 		}
 		fmt.Printf("    nft: forward flow matrix (%d flow(s)) + input lockdown\n", len(flows))
