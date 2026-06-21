@@ -14,6 +14,7 @@ import (
 	"strconv"
 
 	"git.lan/mmazzanti/turnip/internal/config"
+	"git.lan/mmazzanti/turnip/internal/dataplane"
 	"git.lan/mmazzanti/turnip/internal/netns"
 )
 
@@ -158,14 +159,82 @@ func down(configPath string) error {
 
 // --- dataplane skeleton (not implemented) ----------------------------------
 
-// configureRouters wires each router netns: the dummy gateway holding <gateway>/32, a /32
-// routed veth per attached container (router end + container end + the link-scope route to
-// the gateway), then the router dataplane -- sysctls (ip_forward, per-veth proxy_arp +
-// strict rp_filter, ipv6 off) and the nft forward flow matrix. All over the netns fd
-// (set.Enter + netlink/nft).
+// configureRouters wires each router netns: the dummy gateway holding <gateway>/32 and a
+// /32 routed veth per attached container (router end + container end + the routes). The
+// router dataplane -- sysctls (ip_forward, per-veth proxy_arp + strict rp_filter, ipv6 off)
+// and the nft forward flow matrix -- is still TODO.
 func configureRouters(cfg *config.Turnip, set *netns.Set) error {
-	// TODO: ports main.py create_gateway / connect / router_sysctls / build_nft.
+	counts := interfaceCounts(cfg)
+	for _, netName := range sortedKeys(cfg.Networks) {
+		net := cfg.Networks[netName]
+		routerFd, ok := set.FD("router:" + netName)
+		if !ok {
+			return fmt.Errorf("router netns %q missing from the bootstrap set", netName)
+		}
+		if err := dataplane.CreateGateway(routerFd, dataplane.Gateway{IfName: net.GatewayIf, Addr: net.Gateway}); err != nil {
+			return fmt.Errorf("network %q: %w", netName, err)
+		}
+		fmt.Printf("  router %s: gateway %s/%d on %s\n", netName, net.Gateway, config.HOSTPrefix, net.GatewayIf)
+
+		for _, cname := range sortedKeys(net.Attach) {
+			att := net.Attach[cname]
+			contFd, ok := set.FD("container:" + cname)
+			if !ok {
+				return fmt.Errorf("container netns %q missing from the bootstrap set", cname)
+			}
+			rif, err := routerIf(cname)
+			if err != nil {
+				return err
+			}
+			// effective default-route ownership: configured default, OR the container's
+			// sole interface (config guarantees at most one configured default).
+			ep := dataplane.Endpoint{
+				RouterIf: rif,
+				ContIf:   att.Interface,
+				IP:       att.IP,
+				Default:  att.Default || counts[cname] == 1,
+			}
+			if err := dataplane.Connect(routerFd, contFd, net.Gateway, ep); err != nil {
+				return fmt.Errorf("network %q connect %q: %w", netName, cname, err)
+			}
+			fmt.Printf("    %s: %s %s/%d -> gw %s%s <-> %s\n",
+				cname, att.Interface, att.IP, config.HOSTPrefix, net.Gateway, defaultMark(ep.Default), rif)
+		}
+	}
 	return nil
+}
+
+// routerIf is the router-side veth name for a container's attachment. It must fit IFNAMSIZ
+// (15); reject an over-long name rather than letting the kernel truncate it into a silent
+// collision. (Ports main.py router_if; the general (net,container) scheme is deferred.)
+func routerIf(container string) (string, error) {
+	name := "vethR-" + container
+	if len(name) > 15 {
+		return "", fmt.Errorf("router veth name %q exceeds IFNAMSIZ (15); shorten %q", name, container)
+	}
+	return name, nil
+}
+
+// interfaceCounts is the total interface count per container (links + attachments across
+// every network) -- what resolves "sole interface implies default". (Seed of build_model.)
+func interfaceCounts(cfg *config.Turnip) map[string]int {
+	counts := map[string]int{}
+	for name, c := range cfg.Containers {
+		counts[name] = len(c.Links)
+	}
+	for _, net := range cfg.Networks {
+		for cname := range net.Attach {
+			counts[cname]++
+		}
+	}
+	return counts
+}
+
+func defaultMark(d bool) string {
+	if d {
+		return " (default)"
+	}
+	return ""
 }
 
 // wireContainers brings up loopback in each container netns and writes its generated
