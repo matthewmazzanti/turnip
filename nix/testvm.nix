@@ -21,9 +21,16 @@
 #
 # `turnip` / `python3` / `pytest` come from that editable env -- they run the LIVE
 # /mnt/turnip/src with uv.lock-pinned deps (no wrapper, no nixpkgs/lock skew).
-{ ... }:
+{ pkgs, ... }:
 {
   networking.hostName = "turnip";
+
+  # Go toolchain for building/running the rootful rewrite spike inside the VM
+  # (spike/go-netns-bootstrap, live-mounted at /mnt/turnip/spike). VM-only: the
+  # spike needs real root + podman, which is what this sandbox is for. Sources are
+  # read-only (9p), so build out-of-tree, e.g. `go build -o /tmp/spike .` with
+  # GOCACHE/GOPATH under $HOME (their defaults are already writable).
+  environment.systemPackages = [ pkgs.go ];
 
   # Admin user for console/ssh debugging.
   users.users.dev = {
