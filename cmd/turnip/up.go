@@ -98,8 +98,9 @@ func netnsSpecs(cfg *config.Turnip, stateDir string) []netns.Spec {
 // --- up / down -------------------------------------------------------------
 
 // up loads the config, resolves the owner, bootstraps the netns the config implies, then
-// configures the dataplane over them. up = down + build (clean slate). The routed fabric
-// (configureNetworks) is wired; container-local setup and the host edge are still stubs.
+// configures the dataplane over them (inline, until the phases reveal real boundaries to
+// extract). up = down + build (clean slate). The routed fabric is wired; container-local
+// setup and the host edge are still TODO sections.
 func up(configPath string) error {
 	cfg, err := loadConfig(configPath)
 	if err != nil {
@@ -124,57 +125,10 @@ func up(configPath string) error {
 	defer set.Close() // the netns persist by bind-mount; this drops only our fd handles
 	fmt.Printf("  bootstrapped %d netns (pinned under %s)\n", len(specs), stateDir)
 
-	// The dataplane: each step drives the live Set the rootful parent holds (set.Enter for
-	// sysctls, netlink/nft over the fd). configureNetworks is wired; the rest are stubs.
-	if err := configureNetworks(cfg, set); err != nil {
-		return err
-	}
-	if err := configureContainers(cfg, set); err != nil {
-		return err
-	}
-	if err := configureHostEdge(cfg, set); err != nil {
-		return err
-	}
-
-	fmt.Println("  (skeleton: container-local setup + host edge not yet implemented)")
-	return nil
-}
-
-// down scrubs the netns: removing each pinned netns destroys everything inside it (links,
-// routes, sysctls, the future nft table), so this is the whole teardown for the routed
-// fabric. The host-edge state (in the init netns) is a separate, later concern.
-func down(configPath string) error {
-	cfg, err := loadConfig(configPath)
-	if err != nil {
-		return err
-	}
-	owner, stateDir, err := resolveRuntime(cfg.Runtime)
-	if err != nil {
-		return err
-	}
-	specs := netnsSpecs(cfg, stateDir)
-	paths := make([]string, len(specs))
-	for i, s := range specs {
-		paths[i] = s.Path
-	}
-	// TODO(host-edge): teardownHostEdge (init-netns parent) once uplinks/links are wired.
-	// TODO: refuse when a live podman container still holds a target netns (would orphan it).
-	if err := netns.Teardown(owner, paths); err != nil {
-		return err
-	}
-	fmt.Printf("down: scrubbed %d netns under %s\n", len(paths), stateDir)
-	return nil
-}
-
-// --- dataplane skeleton (not implemented) ----------------------------------
-
-// configureNetworks wires each network's L3 fabric in its router netns: the dummy gateway
-// holding <gateway>/32, a /32 routed veth per attached container (the router end here, the
-// container end born directly in the container netns -- a network attachment), the router
-// sysctls (ip_forward, per-veth proxy_arp + strict rp_filter, ipv6 off), and the nft forward
-// flow matrix + input lockdown. This owns the container-side veth because the veth IS the
-// attachment; container-LOCAL setup (lo/links/hosts) is configureContainers.
-func configureNetworks(cfg *config.Turnip, set *netns.Set) error {
+	// --- the routed fabric: per network, the L3 wiring in its router netns ---------------
+	// gateway + a /32 routed veth per attached container (the container end is born in the
+	// container netns -- the attachment), router sysctls, and the nft flow matrix. Drives the
+	// live Set the rootful parent holds (netlink/nft over the fd, set.Enter for sysctls).
 	counts := interfaceCounts(cfg)
 	for _, netName := range sortedKeys(cfg.Networks) {
 		net := cfg.Networks[netName]
@@ -238,17 +192,54 @@ func configureNetworks(cfg *config.Turnip, set *netns.Set) error {
 				Proto: string(fl.Proto), Port: uint16(fl.Port.Port),
 			})
 		}
-		// nft applies inside the router netns: nft acts on the process's netns, so we run
-		// it in a set.Enter episode (the same setns the sysctls used) where the forked nft
-		// child inherits the router netns.
+		// nft acts on the process netns, so apply it inside a set.Enter episode: the forked
+		// nft child inherits the router netns.
 		rs := dataplane.BuildNFT(flows)
 		if err := set.Enter("router:"+netName, func() error { return nftlib.Load(rs) }); err != nil {
 			return fmt.Errorf("network %q nft: %w", netName, err)
 		}
 		fmt.Printf("    nft: forward flow matrix (%d flow(s)) + input lockdown\n", len(flows))
 	}
+
+	// --- container-local setup (lo + /etc/hosts + links) -- TODO ------------------------
+	// per container: bring up lo; move host-netdev links into the netns (the L2 escape --
+	// veth/macvlan/ipvlan owned, phys borrowed); write the generated /etc/hosts.
+
+	// --- the host edge (uplink veth + masquerade/DNAT) -- TODO --------------------------
+	// per network with an uplink: the /31 veth across init<->router, host masquerade/DNAT,
+	// the router default route, the uplink rp_filter sysctl + nft egress/ingress edge rules.
+
+	fmt.Println("  (container-local setup + host edge not yet implemented)")
 	return nil
 }
+
+// down scrubs the netns: removing each pinned netns destroys everything inside it (links,
+// routes, sysctls, the future nft table), so this is the whole teardown for the routed
+// fabric. The host-edge state (in the init netns) is a separate, later concern.
+func down(configPath string) error {
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	owner, stateDir, err := resolveRuntime(cfg.Runtime)
+	if err != nil {
+		return err
+	}
+	specs := netnsSpecs(cfg, stateDir)
+	paths := make([]string, len(specs))
+	for i, s := range specs {
+		paths[i] = s.Path
+	}
+	// TODO(host-edge): teardownHostEdge (init-netns parent) once uplinks/links are wired.
+	// TODO: refuse when a live podman container still holds a target netns (would orphan it).
+	if err := netns.Teardown(owner, paths); err != nil {
+		return err
+	}
+	fmt.Printf("down: scrubbed %d netns under %s\n", len(paths), stateDir)
+	return nil
+}
+
+// --- helpers (model derivation -- the seed of build_model) ------------------
 
 // routerIf is the router-side veth name for a container's attachment. It must fit IFNAMSIZ
 // (15); reject an over-long name rather than letting the kernel truncate it into a silent
@@ -281,25 +272,6 @@ func defaultMark(d bool) string {
 		return " (default)"
 	}
 	return ""
-}
-
-// configureContainers does the per-container, network-INDEPENDENT setup -- distinct from
-// configureNetworks, which owns the attachment veths. Per container: bring up loopback;
-// move any host-netdev links into the container netns (the deliberate L2 trust escape,
-// outside every router and its nft policy -- veth/macvlan/ipvlan owned, phys borrowed); and
-// write the generated /etc/hosts (its own names + the peers its flows may reach). NOT
-// IMPLEMENTED.
-func configureContainers(cfg *config.Turnip, set *netns.Set) error {
-	// TODO: ports main.py set_lo_up / validate_link_anchors / link_connect / hosts_file.
-	return nil
-}
-
-// configureHostEdge wires each network's uplink: the point-to-point /31 veth across the
-// init<->router boundary, the host-side masquerade/DNAT, the router's default route, and
-// the uplinked router's dataplane. The rootful, init-netns half.
-func configureHostEdge(cfg *config.Turnip, set *netns.Set) error {
-	// TODO: ports main.py teardown_host_edge / host_edge_connect / configure_host_nat / build_host_nft.
-	return nil
 }
 
 // sortedKeys returns m's keys sorted -- deterministic ordering for the specs + logs.
