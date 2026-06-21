@@ -33,10 +33,25 @@
               ./nix/testvm.nix # dev VM: 9p mount, ssh/console, login users, Go
             ];
           };
+
+          # The turnip binary itself: `nix build .#turnip` -> result/bin/turnip.
+          # vendorHash = null while the port is stdlib-only; set it once the netlink/nft
+          # deps land (nix prints the expected hash on the first mismatch).
+          turnip = pkgs.buildGoModule {
+            pname = "turnip";
+            version = "0.1.0-dev";
+            src = ./.;
+            vendorHash = null;
+            subPackages = [ "cmd/turnip" ];
+            meta.mainProgram = "turnip";
+          };
         in
         {
-          # `nix build .#vm` -> result/bin/run-turnip-vm
-          packages.vm = testVM.config.system.build.vm;
+          packages = {
+            inherit turnip;
+            default = turnip; # `nix build` -> the turnip binary
+            vm = testVM.config.system.build.vm; # `nix build .#vm` -> result/bin/run-turnip-vm
+          };
 
           devShells.default = pkgs.mkShell {
             packages = [

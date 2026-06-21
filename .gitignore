@@ -1,5 +1,10 @@
 netns/
 .direnv/
+
+# Go build output (cmd/turnip -> ./turnip at the repo root)
+/turnip
+
+# Python (old/ implementation)
 __pycache__/
 .venv/
 .pytest_cache/
