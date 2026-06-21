@@ -23,6 +23,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+
+	"git.lan/mmazzanti/turnip/internal/config"
 )
 
 func main() {
@@ -73,13 +75,39 @@ flags:
 `)
 }
 
-// up and down are stubs for now -- the port fills them in over internal/config,
-// internal/netns, and internal/dataplane.
+// loadConfig discovers, reads, and validates the config: an explicit --config, else
+// $TURNIP_CONFIG, else ./turnip.json. The file read is the imperative shell's job; the
+// model + validation live in internal/config (mirrors the Python main.load_config).
+func loadConfig(path string) (*config.Turnip, error) {
+	if path == "" {
+		path = os.Getenv("TURNIP_CONFIG")
+	}
+	if path == "" {
+		path = "turnip.json"
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config %s: %w", path, err)
+	}
+	return config.Parse(data)
+}
+
+// up and down load + validate the config, then dispatch. The dataplane (over the planned
+// internal/netns + internal/dataplane) is still a stub.
 
 func up(configPath string) error {
-	return fmt.Errorf("up: not implemented yet (Go port in progress)")
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("config ok: %d network(s), %d container(s), requires_root=%v\n",
+		len(cfg.Networks), len(cfg.Containers), cfg.RequiresRoot())
+	return fmt.Errorf("up: dataplane not implemented yet (Go port in progress)")
 }
 
 func down(configPath string) error {
-	return fmt.Errorf("down: not implemented yet (Go port in progress)")
+	if _, err := loadConfig(configPath); err != nil {
+		return err
+	}
+	return fmt.Errorf("down: dataplane not implemented yet (Go port in progress)")
 }
