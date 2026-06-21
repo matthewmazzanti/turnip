@@ -59,7 +59,8 @@ in `turnip.json` to change it (example: `old/tests/turnip.example.json`).
 | `nix/` | the flake helpers (`nix/lib`) + the rootless-podman dev VM (`testvm.nix`, `turnip-host.nix`) |
 | `spike/go-netns-bootstrap/` | the validated kernel-interface primitives the port builds on |
 | `old/` | the reference Python implementation (`src/turnip/`, tests, the privilege probe) |
-| `docs/` | design docs — `CONFIG-SKETCH.md` (config model), `IMPLEMENTATION-PLAN.md`, `todo.md` |
+| `docs/` | design docs — `CONFIG-SKETCH.md` (config model), `IMPLEMENTATION-PLAN.md` |
+| `todo.md` | the open-work checklist |
 
 ## Usage
 
