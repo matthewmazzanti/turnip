@@ -1,87 +1,32 @@
 # Shared substrate: "a host that can run turnip" -- rootless podman owned by the run
-# user, plus the nft / ip tooling turnip drives. Imported by BOTH the interactive dev
-# VM (nix/testvm.nix) and the hermetic NixOS integration tests (tests/nixos/*).
+# user (homelab), plus the nft / ip tooling turnip drives. Imported by the dev VM
+# (nix/testvm.nix).
 #
-# Two REQUIRED options let each consumer supply what differs, while the base does the
-# common wiring. Both consumers of this base are test hosts that always set them:
-#   turnip.env       -- the turnip venv to put on PATH. The base stays agnostic about WHICH:
-#                       the dev VM gives an editable env (live 9p source), the check the
-#                       uv2nix-built package.
-#   turnip.testImage -- the test OCI image; a boot-time oneshot loads it into homelab's
-#                       rootless podman (the dev VM for `just itest`, the check before pytest).
-{ config, lib, pkgs, ... }:
+# (This used to carry two required options -- turnip.env / turnip.testImage -- so the
+# hermetic pytest integration check and the dev VM could share it. That check is parked
+# under ./old during the Go rewrite, so the base is now just the rootless-podman host.)
+{ pkgs, ... }:
 {
-  options.turnip = {
-    env = lib.mkOption {
-      type = lib.types.package;
-      description = "The turnip venv to put on PATH (editable for the dev VM, packaged for the check).";
-    };
-    testImage = lib.mkOption {
-      type = lib.types.package;
-      description = "Integration test OCI image (a dockerTools image), loaded into rootless podman at boot.";
-    };
+  system.stateVersion = "25.05";
+
+  # Don't let the host firewall interfere with turnip's netns/nft work.
+  networking.firewall.enable = false;
+
+  # Rootless podman, owned by `homelab` (the runtime.user in the configs). linger =>
+  # /run/user/<uid> + the pause process exist with no active login; autoSubUidGidRange
+  # => the subuid/subgid range podman maps. uid is pinned so state paths
+  # (/run/user/1001/turnip/...) are deterministic.
+  virtualisation.podman.enable = true;
+  users.users.homelab = {
+    isNormalUser = true;
+    uid = 1001;
+    linger = true;
+    autoSubUidGidRange = true;
   };
 
-  config = {
-    system.stateVersion = "25.05";
-
-    # Don't let the host firewall interfere with turnip's netns/nft experiments.
-    networking.firewall.enable = false;
-
-    # Rootless podman, owned by `homelab` (the runtime.user in the configs). linger =>
-    # /run/user/<uid> + the pause process exist with no active login; autoSubUidGidRange
-    # => the subuid/subgid range podman maps. uid is pinned so state paths
-    # (/run/user/1001/turnip/...) are deterministic for the probes.
-    virtualisation.podman.enable = true;
-    users.users.homelab = {
-      isNormalUser = true;
-      uid = 1001;
-      linger = true;
-      autoSubUidGidRange = true;
-    };
-
-    environment.systemPackages = [
-      config.turnip.env # `turnip` + python3 + pytest (editable or packaged, per consumer)
-      pkgs.nftables # `nft` -- turnip shells out to it (nftlib.load)
-      pkgs.iproute2 # ip/ss -- probes read `ip -j`
-      pkgs.jq # inspect `nft -j`
-    ];
-
-    # Test config shared by both consumers (the dev VM + the check): un-skip the live
-    # scenarios, redirect the bytecode cache off the read-only sources, and name the OCI
-    # image this host loads at boot, derived from the image itself so it can't drift.
-    #
-    # sessionVariables (NOT environment.variables) so these land in BOTH /etc/set-environment
-    # (the check's machine.succeed backdoor sources /etc/profile) AND /etc/pam/environment --
-    # the latter is pam_env's file, so `just itest`'s `sudo pytest` inherits them with no
-    # env_keep. pam_env expands @{HOME} to the sudo TARGET, so root's cache lands in /root.
-    environment.sessionVariables = {
-      TURNIP_INTEGRATION = "1";
-      # The sources are read-only (store path / ro 9p), so Python can't cache .pyc beside
-      # them -- WITHOUT this every `turnip` invocation recompiles the heavy import graph
-      # (pydantic + pyroute2 + turnip), ~1s of every up/down. Redirect the cache to a
-      # writable, $HOME-relative dir so it compiles ONCE per boot and is reused -- and so
-      # root and homelab keep SEPARATE, self-writable caches (no cross-user .pyc clobber).
-      PYTHONPYCACHEPREFIX = "$HOME/.cache/turnip/pycache";
-      TURNIP_TEST_IMAGE = "${config.turnip.testImage.imageName}:${config.turnip.testImage.imageTag}";
-    };
-
-    # Load the test OCI image into homelab's rootless store at boot, so both consumers get
-    # the identical image with no per-host loader.
-    systemd.services.turnip-test-image = {
-      description = "load the integration test OCI image into homelab's rootless podman";
-      wantedBy = [ "multi-user.target" ];
-      after = [ "user@1001.service" ];
-      wants = [ "user@1001.service" ];
-      serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
-      # rootless podman needs the setuid newuidmap/newgidmap (/run/wrappers/bin) + podman
-      # itself (/run/current-system/sw/bin) -- the system PATH, which a unit otherwise lacks.
-      script = ''
-        until test -d /run/user/1001; do sleep 0.2; done
-        export PATH=/run/wrappers/bin:/run/current-system/sw/bin
-        runuser -u homelab -- env XDG_RUNTIME_DIR=/run/user/1001 HOME=/home/homelab PATH="$PATH" \
-          podman load -i ${config.turnip.testImage}
-      '';
-    };
-  };
+  environment.systemPackages = [
+    pkgs.nftables # `nft` -- turnip drives nftables
+    pkgs.iproute2 # ip/ss -- inspect links/routes
+    pkgs.jq # inspect `nft -j`
+  ];
 }

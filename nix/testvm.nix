@@ -1,10 +1,9 @@
-# NixOS dev VM for turnip -- the interactive rootful sandbox.
+# NixOS dev VM for turnip -- the interactive rootful sandbox for the Go rewrite.
 #
-# A persistent qemu VM (boots under KVM) with the turnip repo LIVE-MOUNTED (9p) at
-# /mnt/turnip, so host edits run inside with no rebuild -- the fast manual-debug loop.
-# The flake's testVM stacks the layers explicitly (turnip-host -> this -> customizations),
-# so this module is ONLY the VM-specific bits: the 9p mount, ssh/console access, login
-# users. The HERMETIC packaged turnip + assertions live in the integration check, not here.
+# A persistent qemu VM (boots under KVM) with the turnip repo mounted (9p, READ-ONLY) at
+# /mnt/turnip. The flake's testVM stacks the layers (turnip-host -> this), so this module
+# is ONLY the VM-specific bits: the 9p mount, ssh/console access, login users, and the Go
+# toolchain (below). Rootless podman + nft/ip come from the turnip-host base.
 #
 # Build + run:
 #   nix build .#vm
@@ -13,14 +12,9 @@
 # Drive it:
 #   ssh -i nix/testvm_key -p 2222 dev@localhost        # admin (sudo)
 #   ssh -i nix/testvm_key -p 2222 homelab@localhost    # the rootless run user
-#   homelab@turnip$ TURNIP_CONFIG=... turnip up        # `turnip` is the live /mnt/turnip/src
 #
-# This module is just the dev-VM-specific config (ssh, users, 9p mount, console). The
-# editable turnip env and the test OCI image are supplied by the flake via the shared
-# turnip.{env,testImage} options (see flake.nix's testVM), not through this module's args.
-#
-# `turnip` / `python3` / `pytest` come from that editable env -- they run the LIVE
-# /mnt/turnip/src with uv.lock-pinned deps (no wrapper, no nixpkgs/lock skew).
+# The 9p mount is READ-ONLY, so build out-of-tree, e.g.:
+#   cp -r /mnt/turnip/<pkg> /tmp/b && cd /tmp/b && CGO_ENABLED=0 go build -o /tmp/turnip .
 { pkgs, ... }:
 {
   networking.hostName = "turnip";

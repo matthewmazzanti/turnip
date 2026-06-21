@@ -6,16 +6,6 @@
 default:
     @just --list
 
-# Run the pure unit/golden suite (host; integration tests skip without TURNIP_INTEGRATION).
-test:
-    uv run pytest
-
-# Run the integration scenarios in the running dev VM -- the fast loop. Pass pytest args,
-# e.g. `just itest -k links`. needs_world / needs_image scenarios self-skip here.
-# (Boot the VM first: `just vm`.)
-itest *args:
-    nix/ssh-vm.sh dev "sudo pytest -p no:cacheprovider -v /mnt/turnip/tests/integration {{args}}"
-
 # Boot the dev VM: build `.#vm` and exec its run-turnip-vm. Mounts THIS repo
 # (read-only, 9p tag `turnip`) by injecting its absolute path -- captured here
 # from the repo root, before the run script cd's to its temp dir, which is why a
