@@ -1,4 +1,3 @@
-netns/
 .direnv/
 
 # Go build output (cmd/turnip -> ./turnip at the repo root)

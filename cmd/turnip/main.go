@@ -25,6 +25,7 @@ import (
 	"os"
 
 	"git.lan/mmazzanti/turnip/internal/config"
+	"git.lan/mmazzanti/turnip/internal/netns"
 )
 
 func main() {
@@ -57,6 +58,10 @@ func run(args []string) error {
 		return up(*configPath)
 	case "down":
 		return down(*configPath)
+	case netns.ProvisionArg:
+		// the re-exec'd provisioner child (inside podman's userns) -- not a user command;
+		// the name/path specs are the positional args after the sentinel.
+		return netns.RunProvisioner(fs.Args()[1:])
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)
