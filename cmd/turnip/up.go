@@ -176,6 +176,7 @@ func configureRouters(cfg *config.Turnip, set *netns.Set) error {
 		}
 		fmt.Printf("  router %s: gateway %s/%d on %s\n", netName, net.Gateway, config.HOSTPrefix, net.GatewayIf)
 
+		var routerIfs []string
 		for _, cname := range sortedKeys(net.Attach) {
 			att := net.Attach[cname]
 			contFd, ok := set.FD("container:" + cname)
@@ -197,9 +198,18 @@ func configureRouters(cfg *config.Turnip, set *netns.Set) error {
 			if err := dataplane.Connect(routerFd, contFd, net.Gateway, ep); err != nil {
 				return fmt.Errorf("network %q connect %q: %w", netName, cname, err)
 			}
+			routerIfs = append(routerIfs, rif)
 			fmt.Printf("    %s: %s %s/%d -> gw %s%s <-> %s\n",
 				cname, att.Interface, att.IP, config.HOSTPrefix, net.Gateway, defaultMark(ep.Default), rif)
 		}
+
+		// sysctls: applied AFTER the veths exist (the per-veth conf.<if> dirs). /proc/sys is
+		// per-process-netns with no netlink verb, so it needs a setns episode (set.Enter).
+		sysctls := dataplane.RouterSysctls(routerIfs)
+		if err := set.Enter("router:"+netName, func() error { return dataplane.WriteSysctls(sysctls) }); err != nil {
+			return fmt.Errorf("network %q sysctls: %w", netName, err)
+		}
+		fmt.Printf("    sysctls: ip_forward + per-veth proxy_arp/rp_filter (strict) + ipv6 off\n")
 	}
 	return nil
 }
