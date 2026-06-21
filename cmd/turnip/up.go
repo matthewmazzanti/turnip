@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 
 	"git.lan/mmazzanti/turnip/internal/config"
 	"git.lan/mmazzanti/turnip/internal/dataplane"
@@ -125,6 +126,14 @@ func up(configPath string) error {
 	defer set.Close() // the netns persist by bind-mount; this drops only our fd handles
 	fmt.Printf("  bootstrapped %d netns (pinned under %s)\n", len(specs), stateDir)
 
+	// loopback up in every netns (routers + containers); all fds are present post-Bootstrap.
+	for _, sp := range specs {
+		fd, _ := set.FD(sp.Name)
+		if err := dataplane.SetLoUp(fd); err != nil {
+			return fmt.Errorf("%s lo: %w", sp.Name, err)
+		}
+	}
+
 	// --- the routed fabric: per network, the L3 wiring in its router netns ---------------
 	// gateway + a /32 routed veth per attached container (the container end is born in the
 	// container netns -- the attachment), router sysctls, and the nft flow matrix. Drives the
@@ -201,15 +210,27 @@ func up(configPath string) error {
 		fmt.Printf("    nft: forward flow matrix (%d flow(s)) + input lockdown\n", len(flows))
 	}
 
-	// --- container-local setup (lo + /etc/hosts + links) -- TODO ------------------------
-	// per container: bring up lo; move host-netdev links into the netns (the L2 escape --
-	// veth/macvlan/ipvlan owned, phys borrowed); write the generated /etc/hosts.
+	// --- container-local: the generated /etc/hosts (lo is up above; links are TODO) ------
+	// each container resolves itself (its own ip/name on each network) and the peers its
+	// outbound flows may reach. Written to <state>/containers/<name>/hosts (the provisioner
+	// made the dir, on the shared user-runtime tmpfs); chowned to the owner so podman
+	// bind-mounts it to /etc/hosts cleanly. Container links (the L2 escape) are still TODO.
+	for _, cname := range sortedKeys(cfg.Containers) {
+		hostsPath := filepath.Join(stateDir, "containers", cname, "hosts")
+		if err := os.WriteFile(hostsPath, []byte(hostsFile(cfg, cname)), 0o644); err != nil {
+			return fmt.Errorf("container %q hosts: %w", cname, err)
+		}
+		if err := os.Chown(hostsPath, owner.UID, owner.GID); err != nil {
+			return fmt.Errorf("container %q hosts chown: %w", cname, err)
+		}
+		fmt.Printf("  container %s: hosts written\n", cname)
+	}
 
 	// --- the host edge (uplink veth + masquerade/DNAT) -- TODO --------------------------
 	// per network with an uplink: the /31 veth across init<->router, host masquerade/DNAT,
 	// the router default route, the uplink rp_filter sysctl + nft egress/ingress edge rules.
 
-	fmt.Println("  (container-local setup + host edge not yet implemented)")
+	fmt.Println("  (container links + host edge not yet implemented)")
 	return nil
 }
 
@@ -272,6 +293,36 @@ func defaultMark(d bool) string {
 		return " (default)"
 	}
 	return ""
+}
+
+// hostsFile is the /etc/hosts body for a container: localhost, the container's own name on
+// each network it's attached to (so it resolves itself -- the bind-mount replaces podman's
+// generated file), then the peers it may reach by name (the targets of its outbound flows;
+// flows are directional, so from == container). Ports main.py hosts_file / container_peers.
+func hostsFile(cfg *config.Turnip, container string) string {
+	var b strings.Builder
+	b.WriteString("127.0.0.1 localhost\n")
+	for _, netName := range sortedKeys(cfg.Networks) {
+		if att, ok := cfg.Networks[netName].Attach[container]; ok {
+			fmt.Fprintf(&b, "%s %s\n", att.IP, container)
+		}
+	}
+	peers := map[string]netip.Addr{}
+	for _, netName := range sortedKeys(cfg.Networks) {
+		net := cfg.Networks[netName]
+		if _, ok := net.Attach[container]; !ok {
+			continue
+		}
+		for _, fl := range net.Flows {
+			if fl.From == container {
+				peers[fl.To] = net.Attach[fl.To].IP
+			}
+		}
+	}
+	for _, name := range sortedKeys(peers) {
+		fmt.Fprintf(&b, "%s %s\n", peers[name], name)
+	}
+	return b.String()
 }
 
 // sortedKeys returns m's keys sorted -- deterministic ordering for the specs + logs.

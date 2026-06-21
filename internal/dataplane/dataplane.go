@@ -18,6 +18,24 @@ import (
 
 const hostPrefix = 32 // the routed /32 model -- a real local address per node
 
+// SetLoUp brings up loopback in the netns the fd refers to. Every netns wants lo up
+// (containers expect it; the router for anything bound to lo).
+func SetLoUp(fd int) error {
+	h, err := netlink.NewHandleAt(netns.NsHandle(fd))
+	if err != nil {
+		return fmt.Errorf("netlink handle: %w", err)
+	}
+	defer h.Close()
+	lo, err := h.LinkByName("lo")
+	if err != nil {
+		return fmt.Errorf("find lo: %w", err)
+	}
+	if err := h.LinkSetUp(lo); err != nil {
+		return fmt.Errorf("set lo up: %w", err)
+	}
+	return nil
+}
+
 // Gateway is a router netns's virtual gateway: a dummy device holding <Addr>/32, answered
 // by the normal ARP responder (no uplink needed to make it "real").
 type Gateway struct {
