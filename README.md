@@ -1,17 +1,21 @@
 # turnip
 
-A persistent, rootless container network for podman: a **routed, Cilium-style L3
-network** built out of network namespaces, veths, and nftables — no shared L2
-bridge. Each container hangs off a central `router` netns by its own `/32` veth;
-the router forwards between them by destination IP, and an nftables flow matrix
-decides who may talk to whom.
+A persistent network for **rootless podman** containers: a **routed, Cilium-style L3
+network** built out of network namespaces, veths, and nftables — no shared L2 bridge.
+Each container hangs off a central `router` netns by its own `/32` veth; the router
+forwards between them by destination IP, and an nftables flow matrix decides who may
+talk to whom. The network's *model* (who exists, who may talk, what crosses the edge)
+is a declarative `turnip.json`; the mechanism builds the dataplane from it.
 
-The network's *model* (who exists, who may talk, what crosses the edge) is a
-declarative `turnip.json`, loaded + validated by `config.py`; the mechanism
-(`main.py` over `netns.py`/`nftlib.py`) builds the dataplane from it. The rootless
-baseline (milestones 1–3) is done; the rootful host edge (uplinks, links) is next.
-See `docs/CONFIG-SKETCH.md` for the config model and `docs/IMPLEMENTATION-PLAN.md`
-for the milestone status and architecture.
+> **Status: Go rewrite in progress (rootful).** The active implementation is
+> [`cmd/turnip`](cmd/turnip) (Go). It runs **rootful** — the host edge (uplinks,
+> container links) needs the init netns, so turnip runs as root and drops to the
+> rootless-podman owner to enter podman's namespaces. The reference Python
+> implementation it's based on is parked under [`old/`](old); the kernel-interface
+> primitives (podman-userns bootstrap, netns fd collection + bind-mount persistence,
+> sysctl/nft/netlink over an fd) are validated in
+> [`spike/go-netns-bootstrap`](spike/go-netns-bootstrap). Design docs live in
+> [`docs/`](docs).
 
 ## Why routed instead of a bridge
 
@@ -35,7 +39,7 @@ router netns:  fabric0  10.0.0.1/32     (dummy; the virtual gateway)
                |- vethR-hass   route 10.0.0.12/32 dev vethR-hass
                |- vethR-proxy  route 10.0.0.13/32 dev vethR-proxy
                ip_forward=1 ; per-veth proxy_arp=1, rp_filter=1 (strict)
-               ipv6 disabled ; nft table inet fabric (forward flow matrix)
+               ipv6 disabled ; nft table inet turnip (forward flow matrix)
 zwave  netns:  eth0 10.0.0.11/32  default via 10.0.0.1
 hass   netns:  eth0 10.0.0.12/32  default via 10.0.0.1
 proxy  netns:  eth0 10.0.0.13/32  default via 10.0.0.1
@@ -44,76 +48,61 @@ proxy  netns:  eth0 10.0.0.13/32  default via 10.0.0.1
 The example flow matrix is hub-and-spoke with `hass` as the hub: `zwave`→`hass`
 and `hass`→`proxy` on tcp/443 (flows are **directional** — `from` initiates to
 `to`). Every container may reach the gateway. Edit `containers`/`networks`/`flows`
-in `turnip.json` to change it (see `tests/turnip.example.json`). The `inet fabric` table
-in the diagram is now `inet turnip`, one per router netns.
+in `turnip.json` to change it (example: `old/tests/turnip.example.json`).
+
+## Layout
+
+| Path | Role |
+|------|------|
+| `cmd/turnip/` | the CLI + orchestration (the imperative shell): config/env IO, the runtime model, the `up`/`down` dispatch |
+| `internal/` *(planned)* | `config` (the declarative model + validation), `netns` (podman bootstrap, netns lifecycle, the SCM_RIGHTS fd bridge), `dataplane` (gateway/veth/route wiring + the nft flow matrix) |
+| `nix/` | the flake helpers (`nix/lib`) + the rootless-podman dev VM (`testvm.nix`, `turnip-host.nix`) |
+| `spike/go-netns-bootstrap/` | the validated kernel-interface primitives the port builds on |
+| `old/` | the reference Python implementation (`src/turnip/`, tests, the privilege probe) |
+| `docs/` | design docs — `CONFIG-SKETCH.md` (config model), `IMPLEMENTATION-PLAN.md`, `todo.md` |
 
 ## Usage
 
-Run as your **normal login user** — no `podman unshare` wrapper. `main.py` enters
-podman's rootless user+mount namespaces in-process (see `in_podman_context`); you
-just have to use the venv interpreter that has pyroute2. Config is discovered via
-`$TURNIP_CONFIG`, else `./turnip.json`.
+> The port is in progress: `up`/`down` are stubs (they print a not-implemented
+> message). Build it now; run it once the dataplane lands.
 
 ```sh
-uv run turnip up        # create + wire everything, write hosts files
-uv run turnip down      # tear it all down
+nix build .#turnip      # -> result/bin/turnip   (or: go build ./cmd/turnip)
+sudo turnip up          # create + wire the namespaces the config implies
+sudo turnip down        # tear them down
 ```
 
-A container attaches to a router netns by joining it (`podman run --network
+turnip runs rootful and resolves the rootless-podman owner from `$SUDO_USER`. A
+container attaches to a router netns by joining it (`podman run --network
 ns:<state_dir>/containers/<name>/netns`) with its generated hosts file bind-mounted
-to `/etc/hosts`; the integration suite drives this directly (`Probe.run_container`).
+to `/etc/hosts`. Each router netns owns its gateway, veths, routes, sysctls, and nft
+table, so removing it is a complete teardown — no per-element deletes; `up` is
+`down` + build (clean slate every time).
 
-`down` removes every netns the config implies. Since each router netns owns its
-gateway, veths, routes, sysctls, and nft table, removing it is a complete teardown
-— no per-element deletes. (`up` is `down()` + build: clean-slate every time.)
+## Mechanism
 
-## Files
+turnip reaches podman's user+mount namespaces through `podman unshare` as an **exec
+boundary** — Go's multithreaded runtime can't `setns(CLONE_NEWUSER)` in-process the way
+the Python tool did, so a fresh process is dropped inside podman's userns instead. A
+phase-1 child creates each netns there, **pins it with a bind-mount** (so `podman run
+--network ns:<path>` can attach later), and ships its fd back to the root parent over
+SCM_RIGHTS. The parent then drives the whole dataplane against those fds: sysctls via a
+`setns` episode, nft via the netns-bound netlink socket (`google/nftables` `WithNetNSFd`,
+no `nft` subprocess), and links/addrs/routes via `vishvananda/netlink`. See
+[`spike/go-netns-bootstrap`](spike/go-netns-bootstrap) for the validated walk-through and
+the capability reasoning (init-root holds `CAP_NET_ADMIN` over the podman-userns-owned
+netns).
 
-All package modules live under `src/turnip/`.
+- **The "virtual" gateway is made real.** A pure Cilium-style virtual gateway relies on
+  a default route (via an uplink) for proxy_arp to answer. A network with no uplink is
+  self-contained, so `10.0.0.1` is assigned to a `dummy` (`fabric0`) and answered by the
+  normal ARP responder. `proxy_arp` is kept on each veth — harmless without an uplink,
+  correct once one is added.
 
-| File            | Role |
-|-----------------|------|
-| `main.py`       | The imperative shell + CLI: config/env IO, `resolve_runtime`, `build_model` (config → the `Container`/`Network`/`Endpoint` runtime graph), the wiring (`create_gateway`/`connect`/`configure_dataplane`), the app policy (`build_nft`/`router_sysctls`), hosts-file generation (`container_peers`/`hosts_file`), and the `up`/`down` dispatch. |
-| `config.py`     | The declarative model: pure pydantic `Turnip` (types + validation, no IO) for `turnip.json` — containers, networks, attachments, runtime. This *is* the model the mechanism consumes. |
-| `netns.py`      | The namespace layer (pure mechanism, explicit args): enter podman's namespaces (`in_podman_context`), netns lifecycle (`create_netns`/`remove_netns`), ifindex lookups, run-code/write-sysctls inside a netns (`run_in_netns`/`write_sysctls`). Plus the rootless / pyroute2 rationale. |
-| `nftlib.py`     | A use-case-agnostic, data-oriented DSL for libnftables JSON (`render` over frozen-dataclass sums) and the `nft` executor (`load`/`find_nft`). The app policy that uses it (`build_nft`) lives in `main.py`. |
-| `*.py.bak`      | The old literal-driven `main.py`/`verify.py`, parked as reference for the remaining milestones (M4/M5); to be removed when those land. |
-| `typings/`      | Local partial pyroute2 stubs (it ships none); scoped to the API surface we use. |
+## Design decisions
 
-## Design notes
-
-The two genuinely subtle pieces (both documented at length in the source):
-
-- **Entering podman's namespaces in-process.** Everything must run inside
-  podman's user+mount namespaces (the mount ns so the persistent `~/netns/*`
-  bind-mounts are visible; the user ns so we hold `CAP_NET_ADMIN` over the
-  namespaces podman owns). Instead of wrapping the script in `podman unshare`,
-  `in_podman_context` reads the rootless pause pid, forks, and `setns`es into the
-  pause process's user ns then mount ns — the login user is the *owner* of
-  podman's userns, so it gains full caps on the join. Env stays intact, so PATH /
-  `nft` / the venv resolve normally.
-- **Why a forked `setns` child for sysctls + nftables.** pyroute2 drives
-  links/addrs/routes over a netlink socket bound *into* a netns, but `/proc/sys`
-  (sysctls) and the nft ruleset reflect the calling *process's* netns — they
-  aren't reachable through that socket. So `run_in_netns` (in `netns.py`) forks a
-  child (from within the podman context), `setns`es into the `router` netns,
-  writes `/proc/sys` directly, and applies the ruleset as libnftables JSON via
-  `nft -j -f -` (built programmatically by `build_nft` in `main.py` on the
-  `nftlib.py` DSL, no hand-formatted text). See `netns.run_in_netns` /
-  `main.configure_dataplane`.
-- **The "virtual" gateway is made real.** A pure Cilium-style virtual gateway
-  relies on a default route (via an uplink) for proxy_arp to answer. This fabric
-  is self-contained (no host uplink — that needs root in the host netns), so
-  `10.0.0.1` is assigned to a `dummy` (`fabric0`) and answered by the normal ARP
-  responder. `proxy_arp` is kept on each veth — harmless now, correct once an
-  uplink is added.
-
-## Known gaps / next steps
-
-- **No external egress.** The network is self-contained; nothing routes to the
-  host LAN or the internet. The intended path is a rootful host `uplink` (NAT +
-  DNAT) per network, plus per-container `links` for direct LAN membership — both
-  specified in `docs/CONFIG-SKETCH.md` (the "uplink" and "links" sections).
-- **IPv4 only, by design.** IPv6 is disabled router-wide (no service needs it
-  here, and it's one less thing to lock down). Adding it would mean a parallel v6
-  dataplane.
+- **Rootful.** The host edge (uplink NAT/DNAT, container `links` into the host LAN) needs
+  the init netns, so turnip runs as root. The capability-based path (an unprivileged user
+  with ambient `CAP_NET_ADMIN`) is out of scope for the rewrite.
+- **IPv4 only.** IPv6 is disabled router-wide (no service needs it here, and it's one
+  less thing to lock down). Adding it would mean a parallel v6 dataplane.
