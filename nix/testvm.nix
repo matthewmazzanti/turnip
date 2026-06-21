@@ -15,7 +15,35 @@
 #
 # The 9p mount is READ-ONLY, so build out-of-tree, e.g.:
 #   cp -r /mnt/turnip/<pkg> /tmp/b && cd /tmp/b && CGO_ENABLED=0 go build -o /tmp/turnip .
+#
+# A minimal OCI image (turnip-test:latest, name in $TURNIP_TEST_IMAGE) is loaded into
+# homelab's rootless podman at boot, for the real container-attach test:
+#   podman run --rm --network ns:/run/user/1001/turnip/containers/<c>/netns \
+#     "$TURNIP_TEST_IMAGE" ip -br addr
+# It's registry-free + root-owned (no large subuid range needed -- a pulled busybox fails
+# the unpack on homelab's small autoSubUidGidRange; this image loads clean).
 { pkgs, ... }:
+let
+  # The container-attach test toolbox: python3 (scripted connect over a link), plus the
+  # netns inspection/diagnostic CLIs (ip/ss, ping, nft). buildEnv symlinks every bin into
+  # one /bin so a single PATH entry resolves them all.
+  testTools = pkgs.buildEnv {
+    name = "turnip-test-tools";
+    paths = [
+      pkgs.python3Minimal
+      pkgs.iproute2 # ip, ss
+      pkgs.iputils # ping
+      pkgs.nftables # nft
+    ];
+  };
+  # A registry-free OCI image for the container-attach test.
+  testImage = pkgs.dockerTools.buildLayeredImage {
+    name = "turnip-test";
+    tag = "latest";
+    contents = [ testTools ];
+    config.Env = [ "PATH=${testTools}/bin" ];
+  };
+in
 {
   networking.hostName = "turnip";
 
@@ -25,6 +53,30 @@
   # read-only (9p), so build out-of-tree, e.g. `go build -o /tmp/spike .` with
   # GOCACHE/GOPATH under $HOME (their defaults are already writable).
   environment.systemPackages = [ pkgs.go ];
+
+  # Load the python test image into homelab's rootless store at boot, and name it in the
+  # environment (derived from the image so it can't drift). A oneshot rather than a baked
+  # layer because rootless podman's store lives under the user's $XDG_RUNTIME_DIR/$HOME,
+  # which only exists once `homelab`'s user instance (linger) is up.
+  environment.sessionVariables.TURNIP_TEST_IMAGE = "${testImage.imageName}:${testImage.imageTag}";
+  systemd.services.turnip-test-image = {
+    description = "load the python test OCI image into homelab's rootless podman";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "user@1001.service" ];
+    wants = [ "user@1001.service" ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+    # rootless podman needs the setuid newuidmap/newgidmap (/run/wrappers/bin) + podman
+    # itself (/run/current-system/sw/bin) -- the system PATH a unit otherwise lacks.
+    script = ''
+      until test -d /run/user/1001; do sleep 0.2; done
+      export PATH=/run/wrappers/bin:/run/current-system/sw/bin
+      runuser -u homelab -- env XDG_RUNTIME_DIR=/run/user/1001 HOME=/home/homelab PATH="$PATH" \
+        podman load -i ${testImage}
+    '';
+  };
 
   # Admin user for console/ssh debugging.
   users.users.dev = {
