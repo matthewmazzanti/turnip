@@ -1,8 +1,9 @@
 # go-netns-bootstrap spike
 
-De-risks the **bootstrap + fd-collection** step of turnip's Go rewrite (rootful
-only): get every netns fd into one place in the root host process, so the host
-program can then drive sysctls / nft / netlink against them.
+De-risks the **bootstrap + fd-collection + netns-persistence** steps of turnip's Go
+rewrite (rootful only): get every netns fd into one place in the root host process
+(so it can drive sysctls / nft / netlink against them), AND prove a netns bind-mounted
+at an arbitrary path survives so `podman run --network ns:<path>` can attach later.
 
 ## What it proves
 
@@ -18,8 +19,10 @@ Chain:
    `podman unshare <self> --phase1 <names...>`, passing one end of a SEQPACKET
    socketpair as fd 3. In-process drop via `SysProcAttr.Credential` — `sudo -u`
    would close the inherited fd.
-2. **phase1 child** (inside podman's userns, mapped to uid 0) `unshare`s a fresh
-   netns per name and ships each fd back over SCM_RIGHTS (name + fd in one message).
+2. **phase1 child** (inside podman's userns, mapped to uid 0) per name: creates a netns
+   **pinned at a bind-mount path** under the user runtime dir (`unshare(CLONE_NEWNET)` +
+   `mount(/proc/.../ns/net, path, MS_BIND)` — the `ip netns add` idiom at an arbitrary
+   path), drops a persistent `marker0` iface, and ships the fd back over SCM_RIGHTS.
 3. **parent** collects every `(name, fd)` into one registry and checks each fd is:
    - **present** — all requested names came back;
    - **distinct** — distinct nsfs inode (not one ns aliased N times);
@@ -27,10 +30,14 @@ Chain:
      link. Green here is the rootful thesis: **init-root holds CAP_NET_ADMIN over
      the podman-userns-owned netns** (it can `setns` in because it has CAP_SYS_ADMIN
      in both its own userns and the target's).
+4. **parent** then CLOSES all fds (so only the bind-mount keeps each netns alive) and
+   launches a SEPARATE `podman unshare <self> --verify <paths...>` that must still find
+   each netns live at its path (NSFS magic + `marker0` present) — the persistence proof.
 
-The two unknowns it actually answers: **(a)** does init-root operating on a
-child-userns-owned netns by fd work, and **(b)** does fd 3 survive `podman
-unshare`'s re-exec.
+Unknowns it answers: **(a)** init-root operating on a child-userns-owned netns by fd;
+**(b)** fd 3 surviving `podman unshare`'s re-exec; **(c)** whether a bind-mount made in
+one `podman unshare` survives into a separate one (i.e. `podman unshare` joins the
+persistent pause-process mount ns) — the prerequisite for container attach.
 
 ## Run
 
@@ -69,6 +76,9 @@ Expected tail (validated in the dev VM, 2026-06-21 — **PASS**):
   [ok] 4 distinct netns inode(s)
   [ok] "router:fabric": entered as root + created link (CAP_NET_ADMIN over podman netns)
   ...
+[parent] fds closed; re-entering a FRESH `podman unshare` to check persistence
+  [ok] /run/user/1001/turnip-spike/router_fabric persisted (live netns mount, marker "marker0" present)
+  ...
 PASS
 ```
 
@@ -81,10 +91,18 @@ PASS
   mapped-root holds no caps, so `setns` back into it is EPERM. `unshare(CLONE_NEWNET)`
   always mints a fresh netns regardless of the current one, so phase 1 chains forward
   (each new netns owned by podman's userns, which the root parent has caps over) and
-  exits in the last one — it never returns to the host netns. The real port's phase 1
-  must respect this when it adds bind-mounts.
+  bind-mounts each WHILE IN IT before moving on — it never returns to the host netns.
 - **Rootful thesis holds.** The root parent enters every podman-userns-owned netns by
   fd (`NewHandleAt`) and does CAP_NET_ADMIN ops — no in-process userns entry needed.
+- **Bind-mounts persist across `podman unshare` invocations.** A netns pinned at an
+  arbitrary path in one `podman unshare` is still live in a *separate* one (after phase 1
+  exits and all fds are closed) — so `podman unshare` joins podman's PERSISTENT
+  pause-process mount ns, not a transient one. This is the prerequisite for
+  `podman run --network ns:<path>` attach, and it means the exec-boundary bootstrap is a
+  viable foundation (no cgo `nsenter` shim into the pause process needed). The pin is
+  built from scratch (`unshare` + `mount` MS_BIND at a `$XDG_RUNTIME_DIR`-relative path),
+  since `vishvananda/netns.NewNamed` only targets `/run/netns`, which mapped-root can't
+  write.
 
 ## Known risks / fallbacks
 
@@ -92,16 +110,20 @@ PASS
   podman drops inherited fds, phase1 fails fast with `fd 3 is not a socket` — the fix
   is an **abstract-namespace unix socket** whose name is passed via an env var (env
   survives the re-exec) and dialed by the child; the SCM_RIGHTS transfer is identical.
-- **No persistence.** These netns are anonymous, alive only while the parent holds
-  the fds — fine for proving the bridge. The real tool must also **bind-mount** each
-  netns under a user-writable state dir (`/run/user/<uid>/turnip/...`, NOT
-  `/run/netns`, which the mapped-root user can't write) so `podman run --network
-  ns:<path>` can attach later. `vishvananda/netns.NewNamed` targets `/run/netns`, so
-  the port will replicate pyroute2's explicit bind-mount instead.
+- **`podman run --network ns:<path>` attach is proven by proxy, not directly.** The
+  two-`podman-unshare` test confirms the mount ns is shared, and turnip's Python tool
+  already attaches containers this way — but this spike does not itself launch a
+  container (keeps it image-free). That end-to-end check is the obvious next confirmation.
+- **Re-run hygiene.** Pins persist by design, so `--phase1` lazily unmounts + removes a
+  stale pin before recreating; leftover `/run/user/<uid>/turnip-spike/*` mounts clear on
+  reboot (tmpfs) or via `umount`.
 
 ## Not covered here (next spikes)
 
-- Applying the **dataplane** over a collected fd: sysctls (manual `LockOSThread` +
-  setns episode), nft via `google/nftables` `WithNetNSFd(fd)`, addrs/routes.
+- Applying the **dataplane** over a collected fd (the next pass): sysctls (`LockOSThread`
+  + setns episode, in the ROOT parent — which *can* round-trip setns, unlike phase 1),
+  nft via `google/nftables` `WithNetNSFd(fd)`, addrs/routes.
 - The **host-edge** setns-free ops from init: veth peer born in a target netns via
   `netlink.NsFd`, and `LinkSetNsFd` device moves.
+- An end-to-end `podman run --network ns:<path>` attach to a pinned netns (the direct
+  form of the persistence proof above).
