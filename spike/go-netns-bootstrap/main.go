@@ -479,27 +479,42 @@ func nftDataplane(fd int) error {
 }
 
 // inNetns runs fn while the calling goroutine is setns'd into the netns `fd` refers to,
-// restoring the host netns afterwards. LockOSThread pins the goroutine; on a failed
-// restore the thread is poisoned, so we deliberately do NOT unlock it (Go retires it).
+// restoring the host netns afterwards. LockOSThread pins the goroutine; a single deferred
+// lambda owns cleanup -- it always closes the saved handle, but unlocks ONLY when we're
+// back on the host netns. A failed restore leaves the thread poisoned (still in the target
+// netns), so we leave it LOCKED and let Go retire it rather than reuse it in the wrong ns.
+//
+// TODO: refine before porting -- the runtime mechanics here aren't fully nailed down.
+// "leave it locked so Go retires the thread" only fires when the GOROUTINE EXITS; inNetns
+// returns to a still-live caller, so on poison the thread stays pinned to that goroutine
+// and its later work would run in the wrong netns. The port probably wants each setns
+// episode on a dedicated short-lived goroutine (poison -> it exits -> thread retired),
+// and/or to treat a failed restore as fatal. Also revisit: per-netns long-lived bound
+// sockets vs a setns episode per op; whether nft/netlink's internal locking composes with
+// ours. Understand the LockOSThread refcount + thread-retirement guarantees first.
 func inNetns(fd int, fn func() error) error {
 	runtime.LockOSThread()
 	orig, err := netns.Get()
 	if err != nil {
-		runtime.UnlockOSThread()
+		runtime.UnlockOSThread() // nothing saved yet; the cleanup defer isn't registered
 		return fmt.Errorf("get host netns: %w", err)
 	}
-	if err := netns.Set(netns.NsHandle(fd)); err != nil {
+	backOnHost := false
+	defer func() {
 		orig.Close()
-		runtime.UnlockOSThread()
+		if backOnHost {
+			runtime.UnlockOSThread()
+		}
+	}()
+	if err := netns.Set(netns.NsHandle(fd)); err != nil {
+		backOnHost = true // never left the host netns -> safe to unlock
 		return fmt.Errorf("setns target: %w", err)
 	}
 	fnErr := fn()
 	if err := netns.Set(orig); err != nil {
-		orig.Close() // poisoned thread: no UnlockOSThread
 		return fmt.Errorf("restore host netns (fn err=%v): %w", fnErr, err)
 	}
-	orig.Close()
-	runtime.UnlockOSThread()
+	backOnHost = true
 	return fnErr
 }
 
