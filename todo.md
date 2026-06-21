@@ -2,8 +2,7 @@
 
 Open work for the Go rewrite (rootful only; the capability / no-root path is out of scope).
 
-- [ ] uplink **ingress / DNAT** — published-port forwarding: the host prerouting DNAT rules + the forward-chain ingress allows (egress path + teardown are done)
-- [ ] container **links** — `validate_link_anchors` + `link_connect` (veth→bridge / veth→host / macvlan / ipvlan / phys), the L2 trust escape
+- [ ] container **links** — `validate_link_anchors` + `link_connect` (veth→bridge / veth→host / macvlan / ipvlan / phys), the L2 trust escape — the LAST parity feature
 - [ ] running-container teardown guard — refuse when a live container holds a target netns (would orphan it)
 - [ ] `build_model` — the real config→Container/Network/Endpoint graph (`netnsSpecs` is just a seed)
 - [ ] `port="any"` / icmp in `flows` — needs a second nft map shape
