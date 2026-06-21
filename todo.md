@@ -44,7 +44,7 @@ the read-back assertion baked in, gated by `requires_root`. The last validated p
 version (in-process drop, both sources green) is in git history around commit
 `f6e787e`.
 
-## Other known deferrals (cross-ref IMPLEMENTATION-PLAN.md)
+## Other known deferrals (cross-ref docs/IMPLEMENTATION-PLAN.md)
 
 - Running-container teardown guard: `up` must refuse when a live container holds a
   target netns (teardown would orphan it).

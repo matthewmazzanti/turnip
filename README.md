@@ -10,8 +10,8 @@ The network's *model* (who exists, who may talk, what crosses the edge) is a
 declarative `turnip.json`, loaded + validated by `config.py`; the mechanism
 (`main.py` over `netns.py`/`nftlib.py`) builds the dataplane from it. The rootless
 baseline (milestones 1–3) is done; the rootful host edge (uplinks, links) is next.
-See `CONFIG-SKETCH.md` for the config model and `IMPLEMENTATION-PLAN.md` for the
-milestone status and architecture.
+See `docs/CONFIG-SKETCH.md` for the config model and `docs/IMPLEMENTATION-PLAN.md`
+for the milestone status and architecture.
 
 ## Why routed instead of a bridge
 
@@ -113,7 +113,7 @@ The two genuinely subtle pieces (both documented at length in the source):
 - **No external egress.** The network is self-contained; nothing routes to the
   host LAN or the internet. The intended path is a rootful host `uplink` (NAT +
   DNAT) per network, plus per-container `links` for direct LAN membership — both
-  specified in `CONFIG-SKETCH.md` (the "uplink" and "links" sections).
+  specified in `docs/CONFIG-SKETCH.md` (the "uplink" and "links" sections).
 - **IPv4 only, by design.** IPv6 is disabled router-wide (no service needs it
   here, and it's one less thing to lock down). Adding it would mean a parallel v6
   dataplane.

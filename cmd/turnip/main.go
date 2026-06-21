@@ -2,8 +2,8 @@
 // podman from a declarative turnip.json -- the Go rewrite.
 //
 // The reference Python implementation lives under ./old (its modules map onto the
-// planned package layout below); the design docs at the repo root (README.md,
-// CONFIG-SKETCH.md) describe the model this port targets. The kernel-interface
+// planned package layout below); README.md at the repo root and ./docs (CONFIG-SKETCH.md,
+// IMPLEMENTATION-PLAN.md) describe the model this port targets. The kernel-interface
 // primitives are proven in ./spike/go-netns-bootstrap.
 //
 // Planned layout as the port grows (cmd is the imperative shell; internal/* are the
