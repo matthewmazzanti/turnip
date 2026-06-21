@@ -41,7 +41,7 @@
             pname = "turnip";
             version = "0.1.0-dev";
             src = ./.;
-            vendorHash = "sha256-pGZ0ilQ4TC0aUP6mbWeby6Dj2yqngJeOwOQAmV1c9cg=";
+            vendorHash = "sha256-8PyDTxkco+b7r1/+JY8gC+gdfc/VzQwi49jqqcM67Q4=";
             subPackages = [ "cmd/turnip" ];
             meta.mainProgram = "turnip";
           };

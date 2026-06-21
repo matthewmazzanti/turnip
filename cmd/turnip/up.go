@@ -7,6 +7,7 @@ package main
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	osuser "os/user"
 	"path/filepath"
@@ -96,8 +97,8 @@ func netnsSpecs(cfg *config.Turnip, stateDir string) []netns.Spec {
 // --- up / down -------------------------------------------------------------
 
 // up loads the config, resolves the owner, bootstraps the netns the config implies, then
-// configures the dataplane over them. up = down + build (clean slate); the dataplane steps
-// are skeletons for now -- the netns are really created, nothing inside them yet.
+// configures the dataplane over them. up = down + build (clean slate). The routed fabric
+// (configureNetworks) is wired; container-local setup and the host edge are still stubs.
 func up(configPath string) error {
 	cfg, err := loadConfig(configPath)
 	if err != nil {
@@ -122,8 +123,8 @@ func up(configPath string) error {
 	defer set.Close() // the netns persist by bind-mount; this drops only our fd handles
 	fmt.Printf("  bootstrapped %d netns (pinned under %s)\n", len(specs), stateDir)
 
-	// The dataplane -- skeletoned, NOT implemented. Each step drives the live Set the
-	// rootful parent holds (set.Enter for sysctls, netlink/nft over the fd).
+	// The dataplane: each step drives the live Set the rootful parent holds (set.Enter for
+	// sysctls, netlink/nft over the fd). configureNetworks is wired; the rest are stubs.
 	if err := configureNetworks(cfg, set); err != nil {
 		return err
 	}
@@ -134,7 +135,7 @@ func up(configPath string) error {
 		return err
 	}
 
-	fmt.Println("  (skeleton: nft + container-local setup + host edge not yet implemented)")
+	fmt.Println("  (skeleton: container-local setup + host edge not yet implemented)")
 	return nil
 }
 
@@ -168,10 +169,10 @@ func down(configPath string) error {
 
 // configureNetworks wires each network's L3 fabric in its router netns: the dummy gateway
 // holding <gateway>/32, a /32 routed veth per attached container (the router end here, the
-// container end born directly in the container netns -- a network attachment), and the
-// router sysctls (ip_forward, per-veth proxy_arp + strict rp_filter, ipv6 off). The nft
-// forward flow matrix is still TODO. This owns the container-side veth because the veth IS
-// the attachment; container-LOCAL setup (lo/links/hosts) is configureContainers.
+// container end born directly in the container netns -- a network attachment), the router
+// sysctls (ip_forward, per-veth proxy_arp + strict rp_filter, ipv6 off), and the nft forward
+// flow matrix + input lockdown. This owns the container-side veth because the veth IS the
+// attachment; container-LOCAL setup (lo/links/hosts) is configureContainers.
 func configureNetworks(cfg *config.Turnip, set *netns.Set) error {
 	counts := interfaceCounts(cfg)
 	for _, netName := range sortedKeys(cfg.Networks) {
@@ -219,6 +220,27 @@ func configureNetworks(cfg *config.Turnip, set *netns.Set) error {
 			return fmt.Errorf("network %q sysctls: %w", netName, err)
 		}
 		fmt.Printf("    sysctls: ip_forward + per-veth proxy_arp/rp_filter (strict) + ipv6 off\n")
+
+		// nft: the forward flow matrix + the router's own-address lockdown. Resolve flow
+		// endpoints (container names) to IPs; icmp / port="any" in flows isn't wired yet.
+		ip := map[string]netip.Addr{}
+		for cname, att := range net.Attach {
+			ip[cname] = att.IP
+		}
+		var flows []dataplane.Flow
+		for _, fl := range net.Flows {
+			if fl.Proto == config.ProtoICMP || fl.Port.Any {
+				return fmt.Errorf("network %q: icmp / port=\"any\" in flows not wired yet", netName)
+			}
+			flows = append(flows, dataplane.Flow{
+				FromIP: ip[fl.From], ToIP: ip[fl.To],
+				Proto: string(fl.Proto), Port: uint16(fl.Port.Port),
+			})
+		}
+		if err := dataplane.ConfigureNFT(routerFd, flows); err != nil {
+			return fmt.Errorf("network %q nft: %w", netName, err)
+		}
+		fmt.Printf("    nft: forward flow matrix (%d flow(s)) + input lockdown\n", len(flows))
 	}
 	return nil
 }
