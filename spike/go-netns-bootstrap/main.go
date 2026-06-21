@@ -26,6 +26,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	osuser "os/user"
@@ -35,6 +36,8 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/google/nftables"
+	"github.com/google/nftables/expr"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
@@ -350,43 +353,154 @@ func checkFds(fds map[string]int) bool {
 	}
 
 	for name, fd := range fds {
-		if !probeCaps(name, fd) {
+		if !applyDataplane(name, fd) {
 			ok = false
 		}
 	}
 	return ok
 }
 
-func probeCaps(name string, fd int) bool {
+// applyDataplane proves the THREE kernel-config interfaces over a collected fd, all
+// from the ROOT parent (which can round-trip setns -- unlike phase 1): netlink
+// (link+addr+route), sysctls (a setns episode), and nft (the netns-bound nf_tables
+// socket). Together they're everything the real dataplane needs.
+func applyDataplane(name string, fd int) bool {
+	if err := netlinkDataplane(fd); err != nil {
+		fmt.Printf("  [FAIL] %q: netlink: %v\n", name, err)
+		return false
+	}
+	if err := sysctlDataplane(fd); err != nil {
+		fmt.Printf("  [FAIL] %q: sysctl: %v\n", name, err)
+		return false
+	}
+	if err := nftDataplane(fd); err != nil {
+		fmt.Printf("  [FAIL] %q: nft: %v\n", name, err)
+		return false
+	}
+	fmt.Printf("  [ok] %q: netlink (gw0 +addr +route) + sysctl (ip_forward) + nft (inet table) by fd\n", name)
+	return true
+}
+
+// netlinkDataplane: a gateway-style dummy with a /32 address and a /32 link route --
+// the create_gateway/connect ops, via a netns-bound vishvananda handle (NewHandleAt
+// does the setns at socket-dial under the hood; CAP_NET_ADMIN is the root parent's).
+func netlinkDataplane(fd int) error {
 	h, err := netlink.NewHandleAt(netns.NsHandle(fd))
 	if err != nil {
-		fmt.Printf("  [FAIL] %q: NewHandleAt: %v\n", name, err)
-		return false
+		return err
 	}
 	defer h.Close()
-	dummy := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "probe0"}}
-	if err := h.LinkAdd(dummy); err != nil {
-		fmt.Printf("  [FAIL] %q: LinkAdd (caps?): %v\n", name, err)
-		return false
+	if err := h.LinkAdd(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "gw0"}}); err != nil {
+		return fmt.Errorf("LinkAdd: %w", err)
 	}
-	links, err := h.LinkList()
+	link, err := h.LinkByName("gw0") // re-fetch for the kernel-assigned index
 	if err != nil {
-		fmt.Printf("  [FAIL] %q: LinkList: %v\n", name, err)
-		return false
+		return fmt.Errorf("LinkByName: %w", err)
 	}
-	found := false
-	for _, l := range links {
-		if l.Attrs().Name == "probe0" {
-			found = true
+	addr, err := netlink.ParseAddr("10.0.0.1/32")
+	if err != nil {
+		return err
+	}
+	if err := h.AddrAdd(link, addr); err != nil {
+		return fmt.Errorf("AddrAdd: %w", err)
+	}
+	if err := h.LinkSetUp(link); err != nil {
+		return fmt.Errorf("LinkSetUp: %w", err)
+	}
+	_, dst, err := net.ParseCIDR("10.0.0.2/32")
+	if err != nil {
+		return err
+	}
+	if err := h.RouteAdd(&netlink.Route{
+		LinkIndex: link.Attrs().Index, Dst: dst, Scope: unix.RT_SCOPE_LINK,
+	}); err != nil {
+		return fmt.Errorf("RouteAdd: %w", err)
+	}
+	addrs, err := h.AddrList(link, netlink.FAMILY_V4)
+	if err != nil || len(addrs) == 0 {
+		return fmt.Errorf("addr readback empty (err=%v)", err)
+	}
+	return nil
+}
+
+// sysctlDataplane: set + read back net.ipv4.ip_forward inside the netns. There's no
+// netlink verb for this -- /proc/sys/net is keyed to the process's netns -- so it needs
+// a real setns episode. The root parent CAN return to the host netns afterwards (it has
+// CAP_SYS_ADMIN in its own init userns); phase 1 could not.
+func sysctlDataplane(fd int) error {
+	return inNetns(fd, func() error {
+		path := "/proc/sys/net/ipv4/ip_forward"
+		if err := os.WriteFile(path, []byte("1"), 0); err != nil {
+			return fmt.Errorf("write: %w", err)
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read: %w", err)
+		}
+		if got := strings.TrimSpace(string(b)); got != "1" {
+			return fmt.Errorf("readback=%q want 1", got)
+		}
+		return nil
+	})
+}
+
+// nftDataplane: load an inet table+chain+rule via google/nftables bound to the netns by
+// fd (WithNetNSFd) -- the nf_tables netlink socket, NO `nft` subprocess. Confirm by
+// listing the netns's tables.
+func nftDataplane(fd int) error {
+	c, err := nftables.New(nftables.WithNetNSFd(fd))
+	if err != nil {
+		return fmt.Errorf("new conn: %w", err)
+	}
+	t := c.AddTable(&nftables.Table{Family: nftables.TableFamilyINet, Name: "turnipspike"})
+	pol := nftables.ChainPolicyAccept
+	ch := c.AddChain(&nftables.Chain{
+		Name: "forward", Table: t,
+		Type: nftables.ChainTypeFilter, Hooknum: nftables.ChainHookForward,
+		Priority: nftables.ChainPriorityFilter, Policy: &pol,
+	})
+	c.AddRule(&nftables.Rule{
+		Table: t, Chain: ch,
+		Exprs: []expr.Any{&expr.Verdict{Kind: expr.VerdictAccept}},
+	})
+	if err := c.Flush(); err != nil {
+		return fmt.Errorf("flush: %w", err)
+	}
+	tables, err := c.ListTables()
+	if err != nil {
+		return fmt.Errorf("list tables: %w", err)
+	}
+	for _, tb := range tables {
+		if tb.Name == "turnipspike" {
+			return nil
 		}
 	}
-	_ = h.LinkDel(dummy)
-	if !found {
-		fmt.Printf("  [FAIL] %q: probe0 missing after add\n", name)
-		return false
+	return fmt.Errorf("table turnipspike absent after flush")
+}
+
+// inNetns runs fn while the calling goroutine is setns'd into the netns `fd` refers to,
+// restoring the host netns afterwards. LockOSThread pins the goroutine; on a failed
+// restore the thread is poisoned, so we deliberately do NOT unlock it (Go retires it).
+func inNetns(fd int, fn func() error) error {
+	runtime.LockOSThread()
+	orig, err := netns.Get()
+	if err != nil {
+		runtime.UnlockOSThread()
+		return fmt.Errorf("get host netns: %w", err)
 	}
-	fmt.Printf("  [ok] %q: entered as root + created link (CAP_NET_ADMIN over podman netns)\n", name)
-	return true
+	if err := netns.Set(netns.NsHandle(fd)); err != nil {
+		orig.Close()
+		runtime.UnlockOSThread()
+		return fmt.Errorf("setns target: %w", err)
+	}
+	fnErr := fn()
+	if err := netns.Set(orig); err != nil {
+		orig.Close() // poisoned thread: no UnlockOSThread
+		return fmt.Errorf("restore host netns (fn err=%v): %w", fnErr, err)
+	}
+	orig.Close()
+	runtime.UnlockOSThread()
+	return fnErr
 }
 
 // --- helpers ---------------------------------------------------------------

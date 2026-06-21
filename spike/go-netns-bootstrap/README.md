@@ -1,8 +1,8 @@
 # go-netns-bootstrap spike
 
-De-risks the **bootstrap + fd-collection + netns-persistence** steps of turnip's Go
-rewrite (rootful only): get every netns fd into one place in the root host process
-(so it can drive sysctls / nft / netlink against them), AND prove a netns bind-mounted
+De-risks the **bootstrap + fd-collection + dataplane-over-fd + netns-persistence** steps
+of turnip's Go rewrite (rootful only): get every netns fd into one place in the root host
+process, drive sysctls / nft / netlink against each by fd, AND prove a netns bind-mounted
 at an arbitrary path survives so `podman run --network ns:<path>` can attach later.
 
 ## What it proves
@@ -26,10 +26,12 @@ Chain:
 3. **parent** collects every `(name, fd)` into one registry and checks each fd is:
    - **present** — all requested names came back;
    - **distinct** — distinct nsfs inode (not one ns aliased N times);
-   - **operable as root** — enter via `netlink.NewHandleAt(fd)` and create a dummy
-     link. Green here is the rootful thesis: **init-root holds CAP_NET_ADMIN over
-     the podman-userns-owned netns** (it can `setns` in because it has CAP_SYS_ADMIN
-     in both its own userns and the target's).
+   - **operable as root** — apply the full dataplane over the fd: **netlink** (`gw0`
+     dummy + `/32` addr + link route via `NewHandleAt`), **sysctl** (`ip_forward` set +
+     read back via a `setns` episode), **nft** (an `inet` table via `google/nftables`
+     `WithNetNSFd` — no `nft` subprocess). Green is the rootful thesis: **init-root holds
+     CAP_NET_ADMIN over the podman-userns-owned netns** (it has CAP_SYS_ADMIN in both its
+     own userns and the target's, so it can `setns` in *and back out*).
 4. **parent** then CLOSES all fds (so only the bind-mount keeps each netns alive) and
    launches a SEPARATE `podman unshare <self> --verify <paths...>` that must still find
    each netns live at its path (NSFS magic + `marker0` present) — the persistence proof.
@@ -94,6 +96,13 @@ PASS
   bind-mounts each WHILE IN IT before moving on — it never returns to the host netns.
 - **Rootful thesis holds.** The root parent enters every podman-userns-owned netns by
   fd (`NewHandleAt`) and does CAP_NET_ADMIN ops — no in-process userns entry needed.
+- **All three kernel-config interfaces work over an fd from the root parent.** netlink
+  (vishvananda `NewHandleAt`) and nft (`google/nftables` `WithNetNSFd`) both accept a
+  netns fd and `setns` at socket-dial under the hood — so nft needs no `nft` subprocess.
+  sysctls have no netlink verb, so they need an explicit `setns` episode; the root parent
+  can do it because it returns to the host netns afterwards (CAP_SYS_ADMIN in its own init
+  userns) — the dual of the phase-1 constraint. This pins WHERE each lives in the port:
+  the root parent owns sysctls/nft/netns-bound netlink; phase 1 only mints + pins netns.
 - **Bind-mounts persist across `podman unshare` invocations.** A netns pinned at an
   arbitrary path in one `podman unshare` is still live in a *separate* one (after phase 1
   exits and all fds are closed) — so `podman unshare` joins podman's PERSISTENT
@@ -120,10 +129,7 @@ PASS
 
 ## Not covered here (next spikes)
 
-- Applying the **dataplane** over a collected fd (the next pass): sysctls (`LockOSThread`
-  + setns episode, in the ROOT parent — which *can* round-trip setns, unlike phase 1),
-  nft via `google/nftables` `WithNetNSFd(fd)`, addrs/routes.
 - The **host-edge** setns-free ops from init: veth peer born in a target netns via
-  `netlink.NsFd`, and `LinkSetNsFd` device moves.
+  `netlink.NsFd`, and `LinkSetNsFd` device moves (the uplink/links primitives).
 - An end-to-end `podman run --network ns:<path>` attach to a pinned netns (the direct
   form of the persistence proof above).
