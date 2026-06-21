@@ -2,7 +2,7 @@
 #
 # Wire it up once with the flake inputs, then `inherit` the pieces you need:
 #
-#   turnipLib = import ./lib { inherit inputs; };
+#   turnipLib = import ./nix/lib { inherit inputs; };
 #   inherit (turnipLib) mkOutputs;
 #
 # Components:

@@ -5,7 +5,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   };
 
-  # Outputs rebuilt on ./lib (mkOutputs): the dev VM + the Go devShell. The Python
+  # Outputs rebuilt on ./nix/lib (mkOutputs): the dev VM + the Go devShell. The Python
   # implementation -- and its uv2nix packaging + hermetic pytest integration check -- is
   # parked under ./old during the Go rewrite; re-add a Go package + integration check here
   # once the port has them.
@@ -13,9 +13,9 @@
     let
       lib = nixpkgs.lib;
 
-      # turnip's in-repo lib (./lib): mkOutputs -- one system's outputs, transposed into
-      # the flake schema.
-      turnipLib = import ./lib { inherit inputs; };
+      # turnip's in-repo lib (./nix/lib): mkOutputs -- one system's outputs, transposed
+      # into the flake schema.
+      turnipLib = import ./nix/lib { inherit inputs; };
       inherit (turnipLib) mkOutputs;
     in
     mkOutputs {
