@@ -197,13 +197,18 @@ func up(configPath string) error {
 			for _, cname := range sortedKeys(net.Attach) {
 				containerIPs = append(containerIPs, net.Attach[cname].IP)
 			}
-			if err := dataplane.ConfigureHostNAT(netName, uplink, containerIPs); err != nil {
+			dnats, ingressAllows := buildIngress(net)
+			if err := dataplane.ConfigureHostNAT(netName, uplink, containerIPs, dnats); err != nil {
 				return fmt.Errorf("network %q host nat: %w", netName, err)
 			}
 			uplinkRouterIf = uplink.RouterIf
-			edge = &dataplane.Edge{UplinkIf: uplink.RouterIf, Egress: buildEgressAllows(net)}
-			fmt.Printf("    uplink: %s <-> %s (%s/%d), host masquerade + %d route(s)\n",
-				uplink.HostIf, uplink.RouterIf, uplink.HostIP, config.LINKPrefix, len(containerIPs))
+			edge = &dataplane.Edge{
+				UplinkIf: uplink.RouterIf,
+				Egress:   buildEgressAllows(net),
+				Ingress:  ingressAllows,
+			}
+			fmt.Printf("    uplink: %s <-> %s (%s/%d), host masquerade + %d route(s) + %d dnat\n",
+				uplink.HostIf, uplink.RouterIf, uplink.HostIP, config.LINKPrefix, len(containerIPs), len(dnats))
 		}
 
 		// sysctls: applied AFTER the veths exist (the per-veth conf.<if> dirs). /proc/sys is
@@ -256,7 +261,7 @@ func up(configPath string) error {
 		fmt.Printf("  container %s: hosts written\n", cname)
 	}
 
-	fmt.Println("  (container links + uplink ingress/DNAT not yet implemented)")
+	fmt.Println("  (container links not yet implemented)")
 	return nil
 }
 
@@ -363,6 +368,26 @@ func buildEgressAllows(net config.Network) []dataplane.EgressAllow {
 		allows = append(allows, a)
 	}
 	return allows
+}
+
+// buildIngress translates each attachment's ingress config into the host DNAT rules
+// (Listen:host_port -> container:port) and the matching router forward-chain allows.
+func buildIngress(net config.Network) ([]dataplane.DNAT, []dataplane.IngressAllow) {
+	var dnats []dataplane.DNAT
+	var allows []dataplane.IngressAllow
+	for _, cname := range sortedKeys(net.Attach) {
+		att := net.Attach[cname]
+		for _, ing := range att.Ingress {
+			dnats = append(dnats, dataplane.DNAT{
+				Listen: ing.Listen, Proto: string(ing.Proto),
+				HostPort: ing.HostPort, ContIP: att.IP, ContPort: ing.Port,
+			})
+			allows = append(allows, dataplane.IngressAllow{
+				IP: att.IP, Proto: string(ing.Proto), Port: ing.Port,
+			})
+		}
+	}
+	return dnats, allows
 }
 
 // hostsFile is the /etc/hosts body for a container: localhost, the container's own name on

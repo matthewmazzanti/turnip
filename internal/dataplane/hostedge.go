@@ -67,14 +67,25 @@ func HostEdgeConnect(routerFd int, up Uplink) error {
 	return nil
 }
 
+// DNAT is one published-port forward: traffic to Listen:HostPort (proto) is rewritten to
+// ContIP:ContPort. An unspecified Listen (0.0.0.0) matches any host address.
+type DNAT struct {
+	Listen   netip.Addr
+	Proto    string
+	HostPort int
+	ContIP   netip.Addr
+	ContPort int
+}
+
 // ConfigureHostNAT sets up the init-netns side of the uplink: ip_forward, the host nat zone
-// (masquerade egress), and a /32 route to each container via the router end. Runs directly
-// in the init netns (the root parent is there -- no setns). Ports configure_host_nat.
-func ConfigureHostNAT(netName string, up Uplink, containerIPs []netip.Addr) error {
+// (masquerade egress + DNAT for published ports), and a /32 route to each container via the
+// router end. Runs directly in the init netns (the root parent is there -- no setns). Ports
+// configure_host_nat.
+func ConfigureHostNAT(netName string, up Uplink, containerIPs []netip.Addr, dnats []DNAT) error {
 	if err := WriteSysctls(map[string]string{"net.ipv4.ip_forward": "1"}); err != nil {
 		return err
 	}
-	if err := nftlib.Load(BuildHostNFT(netName, up)); err != nil {
+	if err := nftlib.Load(BuildHostNFT(netName, up, dnats)); err != nil {
 		return fmt.Errorf("host nat %s: %w", netName, err)
 	}
 	host, err := netlink.LinkByName(up.HostIf)
@@ -93,14 +104,31 @@ func ConfigureHostNAT(netName string, up Uplink, containerIPs []netip.Addr) erro
 }
 
 // BuildHostNFT renders the `ip turnip_host_<net>` zone in the init netns: postrouting
-// masquerade for traffic forwarded IN from the uplink (egress SNAT, iif-matched -- the
-// routed /32 model declares no subnet). DNAT (published ports) is a later slice.
-func BuildHostNFT(netName string, up Uplink) nftlib.Ruleset {
+// masquerade for traffic forwarded IN from the uplink (egress SNAT, iif-matched -- the routed
+// /32 model declares no subnet), and prerouting DNAT of each published host port to its
+// container (ingress). The iif (egress) vs the DNAT's prerouting hook keep the two from
+// colliding; each connection's NAT is decided on its first packet.
+func BuildHostNFT(netName string, up Uplink, dnats []DNAT) nftlib.Ruleset {
 	t := nftlib.Table{Family: "ip", Name: "turnip_host_" + netName}
 	cmds := append(t.Reload(),
 		t.Chain("postrouting", "nat", "postrouting", 100, "accept"),
 		t.Rule("postrouting", nftlib.Match(nftlib.Meta("iifname"), up.HostIf), nftlib.Masquerade()),
 	)
+	if len(dnats) > 0 {
+		cmds = append(cmds, t.Chain("prerouting", "nat", "prerouting", -100, "accept"))
+		for _, d := range dnats {
+			var exprs []nftlib.Node
+			if d.Listen.IsValid() && !d.Listen.IsUnspecified() { // default 0.0.0.0 = any host address
+				exprs = append(exprs, nftlib.Match(nftlib.Payload("ip", "daddr"), d.Listen.String()))
+			}
+			exprs = append(exprs,
+				nftlib.Match(nftlib.Meta("l4proto"), d.Proto),
+				nftlib.Match(nftlib.Payload("th", "dport"), d.HostPort),
+				nftlib.Dnat(d.ContIP.String(), d.ContPort),
+			)
+			cmds = append(cmds, t.Rule("prerouting", exprs...))
+		}
+	}
 	return nftlib.Rules(cmds...)
 }
 

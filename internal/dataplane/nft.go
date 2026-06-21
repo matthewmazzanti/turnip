@@ -24,14 +24,16 @@ type Flow struct {
 }
 
 // Edge is the uplink policy in a router's forward chain (only with an uplink): which
-// containers may INITIATE out the uplink (egress). UplinkIf is the router-side uplink veth.
+// containers may INITIATE out the uplink (egress) and which published ports may be reached
+// IN through it (ingress, post-DNAT). UplinkIf is the router-side uplink veth.
 type Edge struct {
 	UplinkIf string
 	Egress   []EgressAllow
+	Ingress  []IngressAllow
 }
 
 // EgressAllow lets a container (by IP) initiate out the uplink. All = any proto/port; else
-// the scoped rules. (Ingress / DNAT is a later slice.)
+// the scoped rules.
 type EgressAllow struct {
 	IP    netip.Addr
 	All   bool
@@ -43,6 +45,15 @@ type EgressAllow struct {
 type EgressScope struct {
 	Protos []string
 	Port   int
+}
+
+// IngressAllow lets traffic in the uplink reach a published container port. Port is the
+// CONTAINER port (the host's DNAT has already rewritten the dport by the time the packet
+// reaches the router's forward chain).
+type IngressAllow struct {
+	IP    netip.Addr
+	Proto string
+	Port  int
 }
 
 // BuildNFT renders the `inet turnip` ruleset for one router netns: the forward flow matrix,
@@ -82,6 +93,7 @@ func BuildNFT(flows []Flow, edge *Edge) nftlib.Ruleset {
 	)
 	if edge != nil {
 		cmds = append(cmds, egressRules(t, edge)...)
+		cmds = append(cmds, ingressRules(t, edge)...)
 	}
 	cmds = append(cmds,
 		t.Rule("input", nftlib.Match(nftlib.Meta("iifname"), "lo"), nftlib.Accept()),
@@ -115,6 +127,24 @@ func egressRules(t nftlib.Table, edge *Edge) []nftlib.Node {
 				rules = append(rules, t.Rule("forward", append(exprs, nftlib.Accept())...))
 			}
 		}
+	}
+	return rules
+}
+
+// ingressRules are the forward-chain uplink ingress allows: post-DNAT traffic IN the uplink
+// to a published container port (iifname = uplink, daddr = container, dport = the CONTAINER
+// port). Keyed on dest, since the client source is a wildcard after the host's DNAT.
+func ingressRules(t nftlib.Table, edge *Edge) []nftlib.Node {
+	var rules []nftlib.Node
+	for _, in := range edge.Ingress {
+		rules = append(rules, t.Rule("forward",
+			nftlib.CtState("new"),
+			nftlib.Match(nftlib.Meta("iifname"), edge.UplinkIf),
+			nftlib.Match(nftlib.Payload("ip", "daddr"), in.IP.String()),
+			nftlib.Match(nftlib.Meta("l4proto"), in.Proto),
+			nftlib.Match(nftlib.Payload("th", "dport"), in.Port),
+			nftlib.Accept(),
+		))
 	}
 	return rules
 }
