@@ -328,7 +328,7 @@ func (t *Turnip) crossCutting() error {
 	}
 	for cname, c := range t.Containers {
 		for _, l := range c.Links {
-			b := l.base()
+			b := l.Base()
 			ifaces[cname] = append(ifaces[cname], iface{b.Name, b.Default})
 		}
 	}

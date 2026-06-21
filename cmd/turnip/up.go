@@ -116,6 +116,20 @@ func up(configPath string) error {
 	fmt.Printf("up: %d network(s), %d container(s); owner=%s, state=%s\n",
 		len(cfg.Networks), len(cfg.Containers), owner.User, stateDir)
 
+	// build + validate the container link specs up front -- fail fast on a bad anchor before
+	// any netns or host-edge mutation.
+	linkSpecs, err := buildLinkSpecs(cfg)
+	if err != nil {
+		return err
+	}
+	var allLinks []dataplane.LinkSpec
+	for _, cname := range sortedKeys(linkSpecs) {
+		allLinks = append(allLinks, linkSpecs[cname]...)
+	}
+	if err := dataplane.ValidateLinkAnchors(allLinks); err != nil {
+		return err
+	}
+
 	// up = down + build: clear prior host-edge state (init-netns veths + nat zones) before
 	// rebuilding. The netns themselves are recreated clean by Bootstrap (pinNetns is idempotent).
 	if err := clearHostEdge(cfg); err != nil {
@@ -245,11 +259,12 @@ func up(configPath string) error {
 		fmt.Printf("    nft: forward flow matrix (%d flow(s)) + input lockdown\n", len(flows))
 	}
 
-	// --- container-local: the generated /etc/hosts (lo is up above; links are TODO) ------
+	// --- container-local: the generated /etc/hosts + links (lo is up above) ---------------
 	// each container resolves itself (its own ip/name on each network) and the peers its
 	// outbound flows may reach. Written to <state>/containers/<name>/hosts (the provisioner
 	// made the dir, on the shared user-runtime tmpfs); chowned to the owner so podman
-	// bind-mounts it to /etc/hosts cleanly. Container links (the L2 escape) are still TODO.
+	// bind-mounts it to /etc/hosts cleanly. Then any links -- host netdev holes into the
+	// netns, the deliberate L2 escape outside every router and its nft policy.
 	for _, cname := range sortedKeys(cfg.Containers) {
 		hostsPath := filepath.Join(stateDir, "containers", cname, "hosts")
 		if err := os.WriteFile(hostsPath, []byte(hostsFile(cfg, cname)), 0o644); err != nil {
@@ -258,10 +273,23 @@ func up(configPath string) error {
 		if err := os.Chown(hostsPath, owner.UID, owner.GID); err != nil {
 			return fmt.Errorf("container %q hosts chown: %w", cname, err)
 		}
+
+		if links := linkSpecs[cname]; len(links) > 0 {
+			contFd, ok := set.FD("container:" + cname)
+			if !ok {
+				return fmt.Errorf("container netns %q missing from the bootstrap set", cname)
+			}
+			for _, spec := range links {
+				if err := dataplane.LinkConnect(contFd, spec); err != nil {
+					return err
+				}
+			}
+			fmt.Printf("  container %s: hosts written + %d link(s)\n", cname, len(links))
+			continue
+		}
 		fmt.Printf("  container %s: hosts written\n", cname)
 	}
 
-	fmt.Println("  (container links not yet implemented)")
 	return nil
 }
 
@@ -306,6 +334,72 @@ func routerIf(container string) (string, error) {
 		return "", fmt.Errorf("router veth name %q exceeds IFNAMSIZ (15); shorten %q", name, container)
 	}
 	return name, nil
+}
+
+// linkHostIf is the init-side veth end name for a veth link. Like routerIf it must fit
+// IFNAMSIZ (15) -- reject rather than let the kernel truncate into a silent collision.
+func linkHostIf(container, linkName string) (string, error) {
+	name := "vethL-" + container + "-" + linkName
+	if len(name) > 15 {
+		return "", fmt.Errorf("link host veth name %q exceeds IFNAMSIZ (15); shorten container %q / link %q",
+			name, container, linkName)
+	}
+	return name, nil
+}
+
+// buildLinkSpecs derives every container's link specs from the config -- the model
+// derivation for the L2 escape, grouped by container for the per-netns connect loop.
+func buildLinkSpecs(cfg *config.Turnip) (map[string][]dataplane.LinkSpec, error) {
+	out := map[string][]dataplane.LinkSpec{}
+	for _, cname := range sortedKeys(cfg.Containers) {
+		for _, link := range cfg.Containers[cname].Links {
+			spec, err := buildLinkSpec(cname, link)
+			if err != nil {
+				return nil, err
+			}
+			out[cname] = append(out[cname], spec)
+		}
+	}
+	return out, nil
+}
+
+// buildLinkSpec translates one config.Link union member into the flat dataplane.LinkSpec.
+func buildLinkSpec(cname string, link config.Link) (dataplane.LinkSpec, error) {
+	b := link.Base()
+	spec := dataplane.LinkSpec{
+		Container: cname,
+		Name:      b.Name,
+		Address:   b.Address,
+		Gateway:   b.Gateway,
+		Routes:    b.Routes,
+		Mac:       b.Mac,
+		Default:   b.Default,
+	}
+	if b.Mtu != nil {
+		spec.MTU = *b.Mtu
+	}
+	switch l := link.(type) {
+	case *config.VethLink:
+		hostIf, err := linkHostIf(cname, b.Name)
+		if err != nil {
+			return spec, err
+		}
+		spec.HostIf = hostIf
+		if l.Bridge != "" {
+			spec.Kind, spec.Bridge = "veth-bridge", l.Bridge
+		} else {
+			spec.Kind = "veth-host"
+		}
+	case *config.MacvlanLink:
+		spec.Kind, spec.Parent, spec.Mode = "macvlan", l.Parent, string(l.Mode)
+	case *config.IpvlanLink:
+		spec.Kind, spec.Parent, spec.Mode = "ipvlan", l.Parent, string(l.Mode)
+	case *config.PhysLink:
+		spec.Kind, spec.Dev = "phys", l.Dev
+	default:
+		return spec, fmt.Errorf("container %q: unknown link type %T", cname, link)
+	}
+	return spec, nil
 }
 
 // interfaceCounts is the total interface count per container (links + attachments across

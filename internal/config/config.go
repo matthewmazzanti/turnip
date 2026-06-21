@@ -270,7 +270,7 @@ type LinkBase struct {
 // Link is the discriminated union (on "type"). Ownership is implied by type, never a flag:
 // veth/macvlan/ipvlan are virtual => owned; phys is physical => borrowed.
 type Link interface {
-	base() *LinkBase
+	Base() *LinkBase
 	Kind() LinkType
 	validate(cname string) error
 }
@@ -306,10 +306,10 @@ type PhysLink struct {
 	Dev  string   `json:"dev"`
 }
 
-func (l *VethLink) base() *LinkBase    { return &l.LinkBase }
-func (l *MacvlanLink) base() *LinkBase { return &l.LinkBase }
-func (l *IpvlanLink) base() *LinkBase  { return &l.LinkBase }
-func (l *PhysLink) base() *LinkBase    { return &l.LinkBase }
+func (l *VethLink) Base() *LinkBase    { return &l.LinkBase }
+func (l *MacvlanLink) Base() *LinkBase { return &l.LinkBase }
+func (l *IpvlanLink) Base() *LinkBase  { return &l.LinkBase }
+func (l *PhysLink) Base() *LinkBase    { return &l.LinkBase }
 
 func (l *VethLink) Kind() LinkType    { return LinkVeth }
 func (l *MacvlanLink) Kind() LinkType { return LinkMacvlan }
