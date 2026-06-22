@@ -54,8 +54,8 @@ in `turnip.json` to change it (example: `old/tests/turnip.example.json`).
 
 | Path | Role |
 |------|------|
-| `cmd/turnip/` | the CLI + orchestration (the imperative shell): config/env IO, the runtime model, the `up`/`down` dispatch |
-| `internal/` *(planned)* | `config` (the declarative model + validation), `netns` (podman bootstrap, netns lifecycle, the SCM_RIGHTS fd bridge), `dataplane` (gateway/veth/route wiring + the nft flow matrix) |
+| `cmd/turnip/` | the CLI + orchestration (the imperative shell): config/env IO, the `buildModel` lowering (config → `Plan`, `model.go`), the `applyPlan` driver (`apply.go`), and `up`/`down` dispatch |
+| `internal/` | `config` (the declarative model + validation), `netns` (podman bootstrap, netns lifecycle, the SCM_RIGHTS fd bridge), `dataplane` (gateway/veth/route wiring + the nft flow matrix) |
 | `nix/` | the flake helpers (`nix/lib`) + the rootless-podman dev VM (`testvm.nix`, `turnip-host.nix`) |
 | `spike/go-netns-bootstrap/` | the validated kernel-interface primitives the port builds on |
 | `old/` | the reference Python implementation (`src/turnip/`, tests, the privilege probe) |
@@ -64,8 +64,9 @@ in `turnip.json` to change it (example: `old/tests/turnip.example.json`).
 
 ## Usage
 
-> The port is in progress: `up`/`down` are stubs (they print a not-implemented
-> message). Build it now; run it once the dataplane lands.
+> The port is functional and VM-validated: `up`/`down` build and tear down the
+> full routed fabric (gateway, /32 veths, sysctls, nft matrix, uplinks, links).
+> The rootless-podman attach end-to-end is the remaining gate (see `todo.md`).
 
 ```sh
 nix build .#turnip      # -> result/bin/turnip   (or: go build ./cmd/turnip)
