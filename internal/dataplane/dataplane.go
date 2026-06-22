@@ -1,8 +1,9 @@
 // Package dataplane builds the routed L3 fabric inside the netns the bootstrap created --
 // the gateway, the /32 routed veths, the routes (and, later, sysctls + the nft flow
 // matrix). It operates on netns by FD: the rootful parent holds the fds (internal/netns'
-// Set) and drives netlink against each via a netns-bound handle. Decoupled from config --
-// the caller walks the model and passes concrete fds + names + addresses.
+// Set) and drives netlink against each via a netns-bound handle. Takes no config *types* --
+// the caller walks the model and passes concrete fds + names + addresses; the only shared
+// vocabulary is the topology prefix constants (HostPrefix/LinkPrefix), which this package owns.
 //
 // Ports old/src/turnip/main.py: CreateGateway = create_gateway, Connect = connect.
 package dataplane
@@ -16,7 +17,9 @@ import (
 	"github.com/vishvananda/netns"
 )
 
-const hostPrefix = 32 // the routed /32 model -- a real local address per node
+// HostPrefix is the routed /32 model -- a real local address per node. Exported as the
+// canonical topology constant (the display layer reads it here rather than re-declaring it).
+const HostPrefix = 32
 
 // SetLoUp brings up loopback in the netns the fd refers to. Every netns wants lo up
 // (containers expect it; the router for anything bound to lo).
@@ -152,5 +155,5 @@ func Connect(routerFd, contFd int, gateway netip.Addr, ep Endpoint) error {
 
 // host32 turns a netip.Addr into the <addr>/32 *net.IPNet vishvananda/netlink wants.
 func host32(a netip.Addr) *net.IPNet {
-	return &net.IPNet{IP: a.AsSlice(), Mask: net.CIDRMask(hostPrefix, 32)}
+	return &net.IPNet{IP: a.AsSlice(), Mask: net.CIDRMask(HostPrefix, 32)}
 }

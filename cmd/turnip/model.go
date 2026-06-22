@@ -49,13 +49,16 @@ type EndpointPlan struct {
 	Endpoint  dp.Endpoint
 }
 
-// UplinkPlan is the host edge: the /31 veth across init<->router and the init-netns NAT inputs
-// (container /32 routes + ingress DNAT). Present iff the network has an uplink. (The nft edge
-// allows it implies are folded into NetworkPlan.NFT during lowering.)
+// UplinkPlan is the host edge: the /31 veth across init<->router, the init-netns container
+// routes, and the fully-built host policy artifacts (the init-netns sysctls + nat zone ruleset).
+// Present iff the network has an uplink. apply only pushes these; the builders ran in lowering.
+// (The router-side nft edge allows the uplink implies are folded into NetworkPlan.NFT.)
 type UplinkPlan struct {
 	Uplink       dp.Uplink
-	ContainerIPs []netip.Addr // container /32s to route via the uplink
-	DNATs        []dp.DNAT    // ingress host_port -> container:port
+	ContainerIPs []netip.Addr      // container /32s to route via the uplink (init netns)
+	DNATs        []dp.DNAT         // ingress host_port -> container:port (kept for reference/logs)
+	HostSysctls  map[string]string // init-netns sysctls (ip_forward)
+	HostNFT      nftlib.Ruleset    // the `ip turnip_host_<net>` nat zone (masquerade + DNAT)
 }
 
 // ContainerPlan is one container's local setup: the generated /etc/hosts (path + body) and its
@@ -163,6 +166,8 @@ func lowerNetwork(name string, net config.Network, counts map[string]int) (Netwo
 			Uplink:       uplink,
 			ContainerIPs: ips,
 			DNATs:        dnats,
+			HostSysctls:  map[string]string{"net.ipv4.ip_forward": "1"}, // the host routes/forwards this net
+			HostNFT:      dp.BuildHostNFT(name, uplink, dnats),
 		}
 		edge = &dp.Edge{
 			UplinkIf: uplink.RouterIf,

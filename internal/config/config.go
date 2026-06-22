@@ -29,12 +29,6 @@ import (
 // them into a silent collision.
 const ifnameMax = 15
 
-// HOSTPrefix / LINKPrefix are locked by topology, not configurable (mirrors config.py).
-const (
-	HOSTPrefix = 32 // the routed /32 model
-	LINKPrefix = 31 // uplink veth is a point-to-point /31 (RFC 3021)
-)
-
 // --- enums (string-typed; members ARE their wire string, like the Python StrEnums) ---
 
 // Proto is a layer-4 protocol expressible as an nft element. ICMP is portless.

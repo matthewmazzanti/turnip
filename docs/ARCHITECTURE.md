@@ -104,6 +104,28 @@ netlink failure), never config problems. Ordering *is* the policy apply owns, an
 load-bearing: the uplink veth is wired before the router sysctls/nft so its `rp_filter`
 dir and egress allows exist when they're referenced; sysctls and nft come last.
 
+### Where the plan/dataplane line actually falls
+
+What goes in the `Plan` vs what a dataplane primitive derives at apply-time isn't a
+style choice — there's a hard rule:
+
+> **A thing is plan-able iff it's computable without touching the kernel.** Names,
+> addresses, policy bits, nft rulesets, sysctl maps — all pure functions of the
+> config, so they're lowered into the `Plan` as built artifacts. Anything keyed by a
+> **kernel-assigned identifier** — chiefly a `LinkIndex`, which doesn't exist until
+> `LinkAdd` runs in the live netns — is irreducibly apply-time and lives inside the
+> dataplane primitive.
+
+This is why the sysctl set (keyed by interface *name*, `net.ipv4.conf.vethR-a.rp_filter`)
+moved into lowering, but the routes in `Connect`/`HostEdgeConnect` (keyed by the
+just-created link's *index*) cannot — they're built against `link.Attrs().Index` right
+after the `LinkAdd` that mints it. So `CreateGateway`/`Connect`/`HostEdgeConnect` aren't
+"leaving thinking in the doer": their structs (`Gateway`/`Endpoint`/`Uplink`) carry the
+plan-level facts, and the only thing they derive internally is the index-dependent route
+wiring — the one part that *can't* be precomputed. The rule keeps the seam honest:
+everything name/address/policy-shaped is a `Plan` artifact; the index last-mile is the
+dataplane's.
+
 ## The shell — up / down
 
 **Where:** `cmd/turnip/up.go`, `cmd/turnip/down.go`. Dispatched from `main.go`.

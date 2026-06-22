@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"os"
 
-	"git.lan/mmazzanti/turnip/internal/config"
 	dp "git.lan/mmazzanti/turnip/internal/dataplane"
 	"git.lan/mmazzanti/turnip/internal/netns"
 	"git.lan/mmazzanti/turnip/internal/nftlib"
@@ -52,7 +51,7 @@ func applyNetwork(set *netns.Set, np NetworkPlan) error {
 	if err := dp.CreateGateway(routerFd, np.Gateway); err != nil {
 		return fmt.Errorf("network %q: %w", np.Name, err)
 	}
-	fmt.Printf("  router %s: gateway %s/%d on %s\n", np.Name, np.Gateway.Addr, config.HOSTPrefix, np.Gateway.IfName)
+	fmt.Printf("  router %s: gateway %s/%d on %s\n", np.Name, np.Gateway.Addr, dp.HostPrefix, np.Gateway.IfName)
 
 	for _, ep := range np.Endpoints {
 		contFd, ok := set.FD(ep.Netns)
@@ -63,22 +62,27 @@ func applyNetwork(set *netns.Set, np NetworkPlan) error {
 			return fmt.Errorf("network %q connect %q: %w", np.Name, ep.Container, err)
 		}
 		fmt.Printf("    %s: %s %s/%d -> gw %s%s <-> %s\n",
-			ep.Container, ep.Endpoint.ContIf, ep.Endpoint.IP, config.HOSTPrefix,
+			ep.Container, ep.Endpoint.ContIf, ep.Endpoint.IP, dp.HostPrefix,
 			np.Gateway.Addr, defaultMark(ep.Endpoint.Default), ep.Endpoint.RouterIf)
 	}
 
-	// uplink (the host edge): the /31 veth across init<->router + host NAT. Wired before the
-	// sysctls/nft push so the uplink veth exists when they reference it (rp_filter + egress allows).
+	// uplink (the host edge): the /31 veth + container routes (HostEdgeConnect), then the
+	// pre-built host sysctls + nat zone pushed in. All run in the init netns (the root parent
+	// is here) -- no set.Enter. Done before the router sysctls/nft so the uplink veth exists
+	// when they reference it (rp_filter + egress allows).
 	if np.Uplink != nil {
 		u := np.Uplink
-		if err := dp.HostEdgeConnect(routerFd, u.Uplink); err != nil {
+		if err := dp.HostEdgeConnect(routerFd, u.Uplink, u.ContainerIPs); err != nil {
 			return fmt.Errorf("network %q uplink: %w", np.Name, err)
 		}
-		if err := dp.ConfigureHostNAT(np.Name, u.Uplink, u.ContainerIPs, u.DNATs); err != nil {
+		if err := dp.WriteSysctls(u.HostSysctls); err != nil {
+			return fmt.Errorf("network %q host sysctls: %w", np.Name, err)
+		}
+		if err := nftlib.Load(u.HostNFT); err != nil {
 			return fmt.Errorf("network %q host nat: %w", np.Name, err)
 		}
 		fmt.Printf("    uplink: %s <-> %s (%s/%d), host masquerade + %d route(s) + %d dnat\n",
-			u.Uplink.HostIf, u.Uplink.RouterIf, u.Uplink.HostIP, config.LINKPrefix, len(u.ContainerIPs), len(u.DNATs))
+			u.Uplink.HostIf, u.Uplink.RouterIf, u.Uplink.HostIP, dp.LinkPrefix, len(u.ContainerIPs), len(u.DNATs))
 	}
 
 	// sysctls + nft: the pre-built artifacts, pushed last. Both act on the process netns

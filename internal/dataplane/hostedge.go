@@ -10,7 +10,9 @@ import (
 	"github.com/vishvananda/netns"
 )
 
-const linkPrefix = 31 // the uplink veth is a point-to-point /31 (RFC 3021)
+// LinkPrefix is the uplink veth's point-to-point /31 (RFC 3021). Exported as the canonical
+// topology constant (dataplane owns the wire prefixes; the display layer reads them here).
+const LinkPrefix = 31
 
 // Uplink is a network's host edge: a /31 veth between its router netns and the init (host)
 // netns. HostIP is the init end (the router's gateway out), RouterIP the router end.
@@ -21,12 +23,16 @@ type Uplink struct {
 	RouterIP netip.Addr // /31 base+1 -- router end
 }
 
-// HostEdgeConnect wires the uplink veth across the init<->router boundary. The host end is
-// born in the init netns and the router end DIRECTLY in the router netns (PeerNamespace =
-// the fd). The host end is addressed on the /31; the router end is addressed + brought up +
-// default-routed via the host end, inside the router netns. Run from the init parent (root
-// holds CAP_NET_ADMIN there, which the IFLA_NET_NS_FD move needs). Ports host_edge_connect.
-func HostEdgeConnect(routerFd int, up Uplink) error {
+// HostEdgeConnect wires the full init<->router edge -- every index-dependent netlink op the
+// host edge needs. The uplink veth: host end born in the init netns, router end DIRECTLY in the
+// router netns (PeerNamespace = the fd); host end addressed on the /31; router end addressed +
+// up + default-routed via the host end, inside the router netns. Then, in the init netns, a /32
+// route to each container via the router end (reach the container for ingress, and satisfy
+// rp_filter for egress -- the reverse path to a container source is the uplink). Run from the
+// init parent (root holds CAP_NET_ADMIN there, which the IFLA_NET_NS_FD move needs). The host
+// sysctls + nat zone are pre-built artifacts pushed separately (WriteSysctls / nftlib.Load).
+// Ports host_edge_connect + the route half of configure_host_nat.
+func HostEdgeConnect(routerFd int, up Uplink, containerIPs []netip.Addr) error {
 	veth := &netlink.Veth{
 		LinkAttrs:     netlink.LinkAttrs{Name: up.HostIf},
 		PeerName:      up.RouterIf,
@@ -64,6 +70,15 @@ func HostEdgeConnect(routerFd int, up Uplink) error {
 	if err := rh.RouteAdd(&netlink.Route{LinkIndex: r.Attrs().Index, Gw: up.HostIP.AsSlice()}); err != nil {
 		return fmt.Errorf("router default route via %s: %w", up.HostIP, err)
 	}
+
+	// init-netns: a /32 route to each container via the router end. `host` is the init-side
+	// veth end fetched above. (Reach the container for ingress; satisfy rp_filter for egress.)
+	for _, ip := range containerIPs {
+		route := &netlink.Route{LinkIndex: host.Attrs().Index, Dst: host32(ip), Gw: up.RouterIP.AsSlice()}
+		if err := netlink.RouteAdd(route); err != nil {
+			return fmt.Errorf("host route to %s: %w", ip, err)
+		}
+	}
 	return nil
 }
 
@@ -75,32 +90,6 @@ type DNAT struct {
 	HostPort int
 	ContIP   netip.Addr
 	ContPort int
-}
-
-// ConfigureHostNAT sets up the init-netns side of the uplink: ip_forward, the host nat zone
-// (masquerade egress + DNAT for published ports), and a /32 route to each container via the
-// router end. Runs directly in the init netns (the root parent is there -- no setns). Ports
-// configure_host_nat.
-func ConfigureHostNAT(netName string, up Uplink, containerIPs []netip.Addr, dnats []DNAT) error {
-	if err := WriteSysctls(map[string]string{"net.ipv4.ip_forward": "1"}); err != nil {
-		return err
-	}
-	if err := nftlib.Load(BuildHostNFT(netName, up, dnats)); err != nil {
-		return fmt.Errorf("host nat %s: %w", netName, err)
-	}
-	host, err := netlink.LinkByName(up.HostIf)
-	if err != nil {
-		return fmt.Errorf("find %s: %w", up.HostIf, err)
-	}
-	for _, ip := range containerIPs {
-		// reach the container (ingress/DNAT) and satisfy rp_filter for egress: the reverse
-		// path to a container source resolves back out the uplink.
-		route := &netlink.Route{LinkIndex: host.Attrs().Index, Dst: host32(ip), Gw: up.RouterIP.AsSlice()}
-		if err := netlink.RouteAdd(route); err != nil {
-			return fmt.Errorf("host route to %s: %w", ip, err)
-		}
-	}
-	return nil
 }
 
 // BuildHostNFT renders the `ip turnip_host_<net>` zone in the init netns: postrouting
@@ -150,5 +139,5 @@ func TeardownHostEdge(netName, hostIf string) error {
 }
 
 func host31(a netip.Addr) *net.IPNet {
-	return &net.IPNet{IP: a.AsSlice(), Mask: net.CIDRMask(linkPrefix, 32)}
+	return &net.IPNet{IP: a.AsSlice(), Mask: net.CIDRMask(LinkPrefix, 32)}
 }
