@@ -40,10 +40,10 @@ func applyPlan(set *netns.Set, plan *Plan) error {
 }
 
 // applyNetwork wires one network's routed fabric in its router netns: the gateway, the routed
-// veths into attached containers, the optional host edge, then the sysctls and nft policy
-// (built from the plan's resolved inputs and applied last, after the veths they reference
-// exist). Drives the live Set the rootful parent holds (netlink/nft over the fd, set.Enter for
-// the per-process-netns bits).
+// veths into attached containers, the optional host edge, then the pre-built sysctls + nft
+// artifacts (pushed last, after the veths they reference exist). It only looks up resolved fds
+// and calls effectful dataplane primitives -- no derivation, no netns-key construction, no
+// pure builders; those all happened in lowering.
 func applyNetwork(set *netns.Set, np NetworkPlan) error {
 	routerFd, ok := set.FD(np.Router)
 	if !ok {
@@ -54,25 +54,21 @@ func applyNetwork(set *netns.Set, np NetworkPlan) error {
 	}
 	fmt.Printf("  router %s: gateway %s/%d on %s\n", np.Name, np.Gateway.Addr, config.HOSTPrefix, np.Gateway.IfName)
 
-	var routerIfs []string
 	for _, ep := range np.Endpoints {
-		contFd, ok := set.FD("container:" + ep.Container)
+		contFd, ok := set.FD(ep.Netns)
 		if !ok {
 			return fmt.Errorf("container netns %q missing from the bootstrap set", ep.Container)
 		}
 		if err := dp.Connect(routerFd, contFd, np.Gateway.Addr, ep.Endpoint); err != nil {
 			return fmt.Errorf("network %q connect %q: %w", np.Name, ep.Container, err)
 		}
-		routerIfs = append(routerIfs, ep.Endpoint.RouterIf)
 		fmt.Printf("    %s: %s %s/%d -> gw %s%s <-> %s\n",
 			ep.Container, ep.Endpoint.ContIf, ep.Endpoint.IP, config.HOSTPrefix,
 			np.Gateway.Addr, defaultMark(ep.Endpoint.Default), ep.Endpoint.RouterIf)
 	}
 
 	// uplink (the host edge): the /31 veth across init<->router + host NAT. Wired before the
-	// sysctls/nft so the uplink veth exists when they reference it (its rp_filter + egress allows).
-	uplinkRouterIf := ""
-	var edge *dp.Edge
+	// sysctls/nft push so the uplink veth exists when they reference it (rp_filter + egress allows).
 	if np.Uplink != nil {
 		u := np.Uplink
 		if err := dp.HostEdgeConnect(routerFd, u.Uplink); err != nil {
@@ -81,27 +77,22 @@ func applyNetwork(set *netns.Set, np NetworkPlan) error {
 		if err := dp.ConfigureHostNAT(np.Name, u.Uplink, u.ContainerIPs, u.DNATs); err != nil {
 			return fmt.Errorf("network %q host nat: %w", np.Name, err)
 		}
-		uplinkRouterIf = u.Uplink.RouterIf
-		edge = &u.Edge
 		fmt.Printf("    uplink: %s <-> %s (%s/%d), host masquerade + %d route(s) + %d dnat\n",
 			u.Uplink.HostIf, u.Uplink.RouterIf, u.Uplink.HostIP, config.LINKPrefix, len(u.ContainerIPs), len(u.DNATs))
 	}
 
-	// sysctls: applied AFTER the veths exist (the per-veth conf.<if> dirs). /proc/sys is
-	// per-process-netns with no netlink verb, so it needs a setns episode (set.Enter).
-	sysctls := dp.RouterSysctls(routerIfs, uplinkRouterIf)
-	if err := set.Enter(np.Router, func() error { return dp.WriteSysctls(sysctls) }); err != nil {
+	// sysctls + nft: the pre-built artifacts, pushed last. Both act on the process netns
+	// (/proc/sys has no netlink verb; the forked nft child inherits the netns), so each runs
+	// inside a setns episode (set.Enter).
+	if err := set.Enter(np.Router, func() error { return dp.WriteSysctls(np.Sysctls) }); err != nil {
 		return fmt.Errorf("network %q sysctls: %w", np.Name, err)
 	}
 	fmt.Printf("    sysctls: ip_forward + per-veth proxy_arp/rp_filter (strict) + ipv6 off\n")
 
-	// nft acts on the process netns, so apply it inside a set.Enter episode: the forked nft
-	// child inherits the router netns.
-	rs := dp.BuildNFT(np.Flows, edge)
-	if err := set.Enter(np.Router, func() error { return nftlib.Load(rs) }); err != nil {
+	if err := set.Enter(np.Router, func() error { return nftlib.Load(np.NFT) }); err != nil {
 		return fmt.Errorf("network %q nft: %w", np.Name, err)
 	}
-	fmt.Printf("    nft: forward flow matrix (%d flow(s)) + input lockdown\n", len(np.Flows))
+	fmt.Printf("    nft: forward flow matrix + input lockdown\n")
 	return nil
 }
 

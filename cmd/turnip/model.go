@@ -14,6 +14,7 @@ import (
 	"git.lan/mmazzanti/turnip/internal/config"
 	dp "git.lan/mmazzanti/turnip/internal/dataplane"
 	"git.lan/mmazzanti/turnip/internal/netns"
+	"git.lan/mmazzanti/turnip/internal/nftlib"
 )
 
 // Plan is the fully-resolved dataplane description lowered from the config: every netns to pin
@@ -27,31 +28,34 @@ type Plan struct {
 }
 
 // NetworkPlan is one network's resolved L3 wiring in its router netns: the gateway, the routed
-// veths into attached containers, the optional host edge, and the resolved nft inputs (flows
-// name->IP, edge allows). The final nft/sysctl artifacts are built in apply from these inputs.
+// veths into attached containers, the optional host edge, and the fully-built router policy
+// artifacts (the sysctl set + the nft ruleset). apply only pushes these -- the pure builders
+// (RouterSysctls/BuildNFT) ran here, in lowering.
 type NetworkPlan struct {
 	Name      string
 	Router    string // the router netns key, "router:<name>"
 	Gateway   dp.Gateway
-	Endpoints []EndpointPlan // routed veths, sorted by container
-	Uplink    *UplinkPlan    // nil = no host edge
-	Flows     []dp.Flow      // forward flow matrix, container names resolved to /32s
+	Endpoints []EndpointPlan    // routed veths, sorted by container
+	Uplink    *UplinkPlan       // nil = no host edge
+	Sysctls   map[string]string // the router netns sysctls (built from the veth/uplink ifnames)
+	NFT       nftlib.Ruleset    // the forward flow matrix + edge allows + input lockdown
 }
 
 // EndpointPlan pairs a routed veth's dataplane Endpoint with the container netns it connects.
+// Netns is the resolved FD-lookup key; Container is the bare name for logs/errors.
 type EndpointPlan struct {
-	Container string // the attached container (netns key "container:<name>" + log label)
+	Container string // the attached container -- log label + error text
+	Netns     string // the container netns key, "container:<name>" -- the FD lookup
 	Endpoint  dp.Endpoint
 }
 
-// UplinkPlan is the host edge: the /31 veth across init<->router, the init-netns NAT inputs
-// (container /32 routes + ingress DNAT), and the nft edge allows (egress/ingress) the router's
-// forward chain needs. Present iff the network has an uplink.
+// UplinkPlan is the host edge: the /31 veth across init<->router and the init-netns NAT inputs
+// (container /32 routes + ingress DNAT). Present iff the network has an uplink. (The nft edge
+// allows it implies are folded into NetworkPlan.NFT during lowering.)
 type UplinkPlan struct {
 	Uplink       dp.Uplink
 	ContainerIPs []netip.Addr // container /32s to route via the uplink
 	DNATs        []dp.DNAT    // ingress host_port -> container:port
-	Edge         dp.Edge      // egress + ingress allows for the router forward chain
 }
 
 // ContainerPlan is one container's local setup: the generated /etc/hosts (path + body) and its
@@ -117,6 +121,7 @@ func lowerNetwork(name string, net config.Network, counts map[string]int) (Netwo
 		Gateway: dp.Gateway{IfName: net.GatewayIf, Addr: net.Gateway},
 	}
 
+	var routerIfs []string
 	for _, cname := range sortedKeys(net.Attach) {
 		att := net.Attach[cname]
 		rif, err := routerIf(cname)
@@ -127,6 +132,7 @@ func lowerNetwork(name string, net config.Network, counts map[string]int) (Netwo
 		// interface (config guarantees at most one configured default).
 		np.Endpoints = append(np.Endpoints, EndpointPlan{
 			Container: cname,
+			Netns:     "container:" + cname,
 			Endpoint: dp.Endpoint{
 				RouterIf: rif,
 				ContIf:   att.Interface,
@@ -134,8 +140,13 @@ func lowerNetwork(name string, net config.Network, counts map[string]int) (Netwo
 				Default:  ownsDefault(att.Default, counts[cname]),
 			},
 		})
+		routerIfs = append(routerIfs, rif)
 	}
 
+	// the nft edge (egress/ingress allows) and the uplink's router-side ifname exist only with a
+	// host edge; both feed the policy builders below.
+	var edge *dp.Edge
+	uplinkRouterIf := ""
 	if net.Uplink != nil {
 		uplink := dp.Uplink{
 			HostIf:   net.Uplink.HostIf,
@@ -152,19 +163,23 @@ func lowerNetwork(name string, net config.Network, counts map[string]int) (Netwo
 			Uplink:       uplink,
 			ContainerIPs: ips,
 			DNATs:        dnats,
-			Edge: dp.Edge{
-				UplinkIf: uplink.RouterIf,
-				Egress:   buildEgressAllows(net),
-				Ingress:  ingressAllows,
-			},
 		}
+		edge = &dp.Edge{
+			UplinkIf: uplink.RouterIf,
+			Egress:   buildEgressAllows(net),
+			Ingress:  ingressAllows,
+		}
+		uplinkRouterIf = uplink.RouterIf
 	}
 
+	// the router policy artifacts -- built here (pure) so apply only pushes them. sysctls key
+	// off the per-veth conf.<if> dirs; nft is the forward flow matrix + edge allows + lockdown.
 	flows, err := buildFlows(net)
 	if err != nil {
 		return np, err
 	}
-	np.Flows = flows
+	np.Sysctls = dp.RouterSysctls(routerIfs, uplinkRouterIf)
+	np.NFT = dp.BuildNFT(flows, edge)
 	return np, nil
 }
 
