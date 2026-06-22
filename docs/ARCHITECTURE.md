@@ -78,11 +78,16 @@ literal with no VM and no root (Layer-1 unit tests). The `Plan` is also the shar
 fixture type — apply consumes exactly what the lowering tests construct, and you can
 feed apply a hand-authored `Plan` that no config could express.
 
-> The `Plan` carries resolved *inputs* (`Flows`, the `Edge`), not the final nft/sysctl
-> artifacts; the pure builders (`dp.BuildNFT`, `dp.RouterSysctls`) run in apply, right
-> before the kernel push. They're infallible, so this doesn't weaken apply's totality —
-> it keeps the `Plan` at the semantic altitude and the nft/sysctl *generation* tests in
-> `dataplane`, separate from the cmd lowering tests.
+> The `Plan` carries the **resolved argument list for the effectful dataplane calls** —
+> uniformly. For sysctls/nft that means the *built artifacts* (the sysctl map, the
+> `nftlib.Ruleset`), because the effectful primitives apply calls (`WriteSysctls`,
+> `nftlib.Load`) take artifacts; the pure builders (`dp.RouterSysctls`, `dp.BuildNFT`)
+> therefore run in lowering. This is the invariant that keeps apply a pure walk —
+> **apply calls only effectful primitives; the pure builders and the `router:`/
+> `container:` key scheme belong to lowering.** The flow-resolution *reasoning* stays
+> visible and tested in the lowering helpers (`buildFlows`, `buildEgressAllows`,
+> `buildIngress`), so an artifact-shaped `Plan` doesn't hide it — it relocates the
+> render step to where the rest of the resolution lives.
 
 ## Layer 3 — Apply (the imperative driver)
 
