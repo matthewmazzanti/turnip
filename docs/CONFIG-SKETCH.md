@@ -1,14 +1,16 @@
-# Declarative config — sketch
+# Declarative config — design & deferred-features spec
 
-Today the fabric's *model* (already cleanly separated into `fabric.py`) is Python
-source: `HOSTS`, `FABRIC_FLOWS`, `GW_IP`, `ROUTER`, etc. Everything else —
-`main.py`, `nftlib.py`, `verify.py` — is pure mechanism that consumes that model.
-So "make it declarative" means lifting that model out into a config file (JSON,
-generated from a Nix module — see "Why JSON") and turning `fabric.py` into a
-loader + validator. With multiple networks the model
-grows from one fabric to three entities — **containers**, **networks**, and the
-**attachments** that join them — but `main.py`/`nftlib.py`/`verify.py` still just
-consume the parsed result.
+turnip's *model* is a declarative `turnip.json` — `runtime` + `containers` +
+`networks` (with their `attach` rosters and `flows`) — parsed and validated by
+`internal/config`. Everything else (`internal/dataplane`, `internal/netns`, the
+`cmd/turnip` shell) is mechanism that consumes the parsed model; see
+[ARCHITECTURE](ARCHITECTURE.md) for the layering. With multiple networks the model
+is three entities — **containers**, **networks**, and the **attachments** that join
+them.
+
+This doc is the schema's design rationale and the spec for the **deferred** features
+not yet built — the `bridge` network type, multi-homing, inter-network routing —
+each tagged **DEFERRED** where it appears.
 
 The security invariants stay as **code, not config**: rp_filter-strict,
 ipv6-disabled, the implicit gateway + icmp allows. They *are* the routed model's
@@ -18,7 +20,7 @@ crosses the edge), never the mechanism that secures it.
 
 ## Scope — baseline vs deferred
 
-The design here is the full target. The **baseline** (build first) is a deliberate
+The design here is the full target. The **baseline** (built first) is a deliberate
 subset; the rest is sound but each piece drags in a whole subsystem, so it's
 deferred — the design notes stay (their sections tagged **DEFERRED**) as the spec
 for when each lands.
@@ -27,8 +29,8 @@ for when each lands.
 - The routed model lifted to config: `runtime` + `containers` + a **single**
   routed `networks.<n>` with its `attach` roster and `flows`.
 - The host edge: one `uplink` with **egress + ingress** (NAT/masquerade + host
-  DNAT), built on the rootful sudo/fork-drop/`SCM_RIGHTS` primitive as the
-  reusable core (`wire_into(netns)` + keyed host zones).
+  DNAT), built on the rootful fork-drop/`SCM_RIGHTS` primitive as the reusable core
+  (`wire_into(netns)` + keyed host zones).
 
 **Deferred** (useful, but each adds disproportionate surface)
 - **Multiple networks / multi-homing** — the per-network loop, the `default`-route
@@ -40,17 +42,13 @@ for when each lands.
 - **Network→network** (transit / `egress_via` / `net:container` flows) — keep the
   "phases stay global, validate acyclicity" invariant in mind so it stays additive.
 
-Build order: (1) loader/validator for the single-network routed model, rootless,
-= today's behaviour declaratively; (2) the minimal uplink (egress + ingress) on
-the rootful primitive; then the deferred set as needed.
-
-## The model in one file — `fabric.json` (baseline)
+## The model in one file — `turnip.json` (baseline)
 
 Baseline: a single routed network with a host uplink (egress + ingress). Deferred
 features — multiple networks, container `links`, `bridge` type — appear in their
 (DEFERRED) sections below, not here. JSON has no comments; with Nix as the
 authoring layer, annotations live in the Nix module (see "Why JSON"). This is the
-on-disk artifact `fabric.example.json`.
+on-disk artifact `turnip.example.json`.
 
 ```json
 {
@@ -97,7 +95,8 @@ gives the best *security-audit* view: open `networks.dmz` and see its whole
 population, internal policy, and egress path in one block. The trade is that a few
 **container-global** concerns get written network-side and must be validated
 non-locally (see below) — and "what does container X touch?" is spread across
-networks, which `verify` reconstructs as a per-container view.
+networks, recoverable by a reverse traversal (the generated `/etc/hosts` already
+does this: container → endpoints → flows → peer).
 
 **Naming split.** Two different "attach" ideas collide, so they get distinct
 names: **`links`** = an L2 hole into host networking (on the container);
@@ -168,14 +167,14 @@ privilege model, `links`, multi-homing — is unchanged):
 ## Why JSON (Nix-driven)
 
 The config is authored as a **Nix** attrset and emitted with `builtins.toJSON`, so
-JSON is the natural on-disk format and `json` (stdlib) loads it. JSON's usual
+JSON is the natural on-disk format and Go's `encoding/json` loads it. JSON's usual
 downside — no comments — is moot here: the authoring + documentation layer is Nix
 (its `mkOption`s carry the docs, the module source carries the comments); the JSON
 is a generated artifact, not hand-edited. Bonus: the polymorphic spots express
 cleanly (`egress`: bool|list, `proto`: string|list, `port`: int|"any"), and a JSON
-Schema can validate the emitted file independently of the Nix types. TOML/`tomllib`
-would also work for hand-authoring but loses the Nix-generation path; YAML adds a
-dependency for nothing.
+Schema can validate the emitted file independently of the Nix types. TOML would
+also work for hand-authoring but loses the Nix-generation path; YAML buys nothing
+here.
 
 ## Global / runtime options — `runtime`
 
@@ -183,9 +182,9 @@ The *model* is separate from the *execution environment* (which user, dirs,
 binaries), which goes in `runtime`:
 
 - **`user`** — the unprivileged account that owns rootless podman and is the
-  fork-drop target (`/run/user/<uid>` for the pause pid, `sudo -u <user> podman
-  …`). Default: `$SUDO_USER`. Explicit value decouples ownership from the invoker
-  (admin runs `sudo fabric up`; it drops to `homelab`). Validated via `getpwnam`.
+  fork-drop target (`/run/user/<uid>` for the pause pid, `podman` run as the user).
+  Default: `$SUDO_USER`. Explicit value decouples ownership from the invoker
+  (admin runs `sudo turnip up`; it drops to `homelab`). Validated via `getpwnam`.
 - **`state_dir`** — where turnip's runtime state lives: the netns mounts and the
   generated per-container hosts files, under `routers/<network>` +
   `containers/<container>/{netns,hosts}`. Default `$XDG_RUNTIME_DIR/turnip`
@@ -195,13 +194,12 @@ binaries), which goes in `runtime`:
 - **`nft` / `podman`** (optional) — binary-path overrides; default to the PATH +
   common-location search.
 
-**Privilege is conditional on the model:** sudo is required *only when some
-network has an `uplink` or some container has `links`* (the host edge needs
-root). A pure routed fabric with neither is the self-contained rootless tool of
-today — run it directly as `user`, no drop, no sudo.
+**Privilege is conditional on the model:** root is required *only when some
+network has an `uplink` or some container has `links`* (the host edge needs the
+init netns). A pure routed fabric with neither is self-contained.
 
 Config discovery — *where the file is* — is the one global that can't live in the
-file: `$FABRIC_CONFIG` / `--config` (see open questions).
+file: `--config` → `$TURNIP_CONFIG` → `./turnip.json`.
 
 ## The two edges — `egress` / `ingress` (on the attachment)
 
@@ -281,7 +279,7 @@ these gather across scattered locations):
   container)`, but `IFNAMSIZ` is **15 chars** — `vethR-…` is already long, so
   `veth-<net>-<container>` overflows for longer names. The mechanism needs a
   stable truncation/hash scheme; the loader should reject names that can't be
-  encoded uniquely.
+  encoded uniquely. (`routerIf` currently only rejects over-long — see `todo.md`.)
 - **rp_filter stays valid multi-homed** — each network's `/32` + per-gateway
   routing keeps every interface's traffic symmetric, so strict rp_filter per
   router holds. (Watch the *container* netns's own rp_filter only if you later add
@@ -304,14 +302,10 @@ between that network's router netns and the **host** netns, which is what makes
    **rootful**. (With multiple uplinks, the host holds one such zone per network.)
 
 So the tool grows a component that needs `CAP_NET_ADMIN` in the **init** userns
-(to touch the host netns). Two ways to hold it, both supported:
-
-- **`sudo turnip up`** — real root. The convenient interactive path.
-- **Run as the user with `CAP_NET_ADMIN`** (ambient cap) — no root at all. The
-  clean *service* path: a systemd unit with `User=<user>` +
-  `AmbientCapabilities=CAP_NET_ADMIN`. (Get the cap from the *launcher* — systemd
-  ambient, or `setpriv --ambient-caps=+net_admin`. Do **not** `setcap` the Python
-  interpreter — that grants the cap to every Python invocation system-wide.)
+(to touch the host netns). turnip runs **rootful** for this: `sudo turnip up`
+(real root), dropping to the rootless-podman owner to enter podman's namespaces.
+(A no-root path — running as the user with an ambient `CAP_NET_ADMIN` — is sound
+but **out of scope** for the current rewrite; see `todo.md`.)
 
 ### The fork is forced by the userns split, not by privilege
 
@@ -346,34 +340,6 @@ via the uid_map, and the `setns(CLONE_NEWUSER)` join is permitted by owner-match
 `euid == owner`.) **Root does NOT change netns ownership** — even under sudo the
 persistent netns are created inside podman's rootless user+mount ns.
 
-### Gate + detection (driven by `requires_root`)
-
-`requires_root` (any `uplink` or any `links`) is the switch; a pure routed config
-stays rootless (unchanged):
-
-- **Have host-edge privilege?** = `euid == 0` **or** `CAP_NET_ADMIN ∈ CapEff`
-  (read `/proc/self/status`). If `requires_root` and neither → error: *needs root
-  (sudo) or CAP_NET_ADMIN (e.g. systemd AmbientCapabilities)*.
-- **If root:** require a resolvable `runtime.user`/`$SUDO_USER` (do **not** fall
-  back to the current user — that's `root`); resolve `state_dir` + the pause-pid
-  path by the **target uid** (`/run/user/<uid>/...`), ignoring the invoker's env
-  (under sudo `$XDG_RUNTIME_DIR` is root's). Bootstrap the pause process *as the
-  user* (`sudo -u <user> podman unshare true`).
-- **If user + cap:** the user *is* the current user, env is correct, dirs resolve
-  as today — simpler.
-
-Non-interactive cases (systemd) also need `loginctl enable-linger <user>` so
-`/run/user/<uid>` + the podman pause process exist with no active login.
-
-### First implementation step (prove the primitive in isolation)
-
-Before any uplink/nft logic: harden `resolve_runtime` (the detection + gate +
-uid-based dir resolution above), then build the **privileged-exec primitive**
-(generalizing today's `in_podman_context`, which is just the netns branch with no
-host-edge sibling) and test it standalone — fork, do a trivial host-netns op in
-the parent and a netns op in the dropped/same-user child, pass an fd between them
-— so the privilege plumbing is proven before any real work rides on it.
-
 What the edges expand to:
 - **egress** — *rootless (router):* allow `ct new` out the uplink for permitted
   dests/ports; default route via the uplink. *rootful (host):* `ip_forward`, route
@@ -385,14 +351,16 @@ What the edges expand to:
 
 ## Container links — "holes" into host networking
 
-> **DEFERRED (post-baseline).** Not in the first cut. When it lands it folds into
-> the unified default-deny `links` concept (uplink + links, `allow = "open" |
-> [rules]`, soft/`strict` enforcement). Spec and ownership doctrine preserved below.
+> **DEFERRED — superseded by the implementation.** This is the original design
+> doctrine; container links are **built** (`internal/dataplane/links.go`,
+> VM-validated). The ownership/own-vs-borrow reasoning below is still the rationale;
+> the unified default-deny `links` concept (folding uplink + links, `allow = "open"
+> | [rules]`, soft/`strict` enforcement) remains the deferred next step.
 
 A network is controlled L3. A `link` is the opposite: it moves a host netdev into
 a container so the container gets direct membership in some host-level domain (the
 LAN, a host bridge, a VLAN) — bypassing every router and its nft policy. This is
-the whole reason for the rootful/sudo model. Links are **container-scoped** (they
+the whole reason for the rootful model. Links are **container-scoped** (they
 don't belong to any network) and live in a `links` list. Any `link` makes the run
 rootful, like an `uplink`.
 
@@ -465,13 +433,14 @@ Fields:
   same one-per-container flag that appears on attachments).
 
 ### Validation & considerations
-- **Rootful:** any `link` ⇒ sudo + fork-drop.
+- **Rootful:** any `link` ⇒ root + fork-drop.
 - **Anchor validated, never created:** fail clearly if absent; don't create host
   infra.
 - **Hard rejects:** `macvlan` over a wireless `parent` (won't work — use
   `ipvlan`); `phys` on a netns-local/wireless device (`NETIF_F_NETNS_LOCAL` can't
   be moved — wifi needs the unbuilt `iw phy` path); `phys` on the host's primary/
-  default-route NIC.
+  default-route NIC; `macvlan` and `ipvlan` sharing one `parent` (kernel EBUSY — a
+  device is a macvlan master XOR ipvlan master).
 - **Soft warning:** `ipvlan mode = "l3"` kills broadcast/multicast → mDNS/discovery
   silently break; warn since the move "works" but the use case doesn't.
 - **macvlan host isolation:** the host can't reach its own macvlan children on that
@@ -493,110 +462,17 @@ the items below are exactly what a bridge trades away.
 - **Links are the deliberate exception.** A `link` iface is outside every router
   and its nft policy by design — an explicit trust grant, not a gap.
 
-## How the model loads — IMPLEMENTED as `config.py`
+## How the model loads — implemented in `internal/config`
 
-> **DONE.** This section's plan is realized in `src/turnip/config.py` — but as a
-> **pydantic** model (`Turnip`/`Network`/`Attachment`/…) rather than the stdlib
-> `json` + hand-rolled `_require` sketch below. Differences from the sketch:
-> discovery is `$TURNIP_CONFIG` → `./turnip.json`; `extra="forbid"` turns typos
-> into load errors; the polymorphic spots (`egress` bool|list, `proto`
-> scalar|list, `port` int|"any", the `links` discriminated union) are real types;
-> validation is split across `@model_validator`s (per-network rules on `Network`,
-> the container-global cross-cutting checks on `Turnip`). The mechanism
-> (`main.py`/`nftlib.py`/`verify.py`) does **not** yet consume it — that rewire is
-> the next step, and retires `fabric.py`. The stdlib sketch is kept below as the
-> original design rationale.
-
-From "module of literals" to "loader + validator." Downstream now iterates
-networks (one router netns, nft table, and uplink each) rather than the single
-`router`; the loader returns the parsed containers/networks/attachments.
-
-```python
-import os, json, pwd
-
-HOST_PREFIX = 32   # locked by topology; not configurable
-
-def _require(d, *keys):                       # fail closed: omission never widens
-    for k in keys:
-        if k not in d:
-            raise ValueError(f"{d!r} missing required {k!r}")
-
-def _runtime(cfg):
-    rt = cfg.get("runtime", {})
-    user = rt.get("user") or os.environ.get("SUDO_USER")
-    if not user:
-        raise ValueError("set runtime.user or run via sudo ($SUDO_USER)")
-    pw = pwd.getpwnam(user)
-    return {"user": user, "uid": pw.pw_uid, "gid": pw.pw_gid,
-            "netns_dir": rt.get("netns_dir") or os.path.join(pw.pw_dir, "netns"),
-            "nft": rt.get("nft"), "podman": rt.get("podman")}
-
-def _load(path):
-    with open(path) as f:
-        cfg = json.load(f)
-    runtime = _runtime(cfg)
-    containers = {name: {"links": c.get("links", [])}
-                  for name, c in cfg.get("containers", {}).items()}
-
-    networks, ports, defaults, ifaces = {}, {}, {}, {}   # last three: cross-cutting
-    for cname, c in containers.items():                  # seed iface/default from links
-        for ln in c["links"]:
-            ifaces.setdefault(cname, set())
-            if ln["name"] in ifaces[cname]:
-                raise ValueError(f"{cname}: duplicate iface {ln['name']!r}")
-            ifaces[cname].add(ln["name"])
-            if ln.get("default"):
-                defaults[cname] = defaults.get(cname, 0) + 1
-
-    for net, n in cfg["networks"].items():
-        uplink = n.get("uplink")
-        members, attach = set(), {}
-        for cname, a in n.get("attach", {}).items():     # keyed by container = unique per net
-            _require(a, "ip", "interface")
-            if cname not in containers:
-                raise ValueError(f"network {net}: unknown container {cname!r}")
-            members.add(cname)
-            ifaces.setdefault(cname, set())
-            if a["interface"] in ifaces[cname]:
-                raise ValueError(f"{cname}: duplicate iface {a['interface']!r}")
-            ifaces[cname].add(a["interface"])
-            if a.get("default"):
-                defaults[cname] = defaults.get(cname, 0) + 1
-            eg, ing = a.get("egress"), a.get("ingress", [])
-            if (eg or ing) and uplink is None:
-                raise ValueError(f"{net}/{cname}: egress/ingress needs this network's uplink")
-            if isinstance(eg, list):
-                for r in eg: _require(r, "proto", "port")
-            for fwd in ing:                              # host_port unique across ALL networks
-                _require(fwd, "proto", "host_port")
-                p = fwd["proto"]; protos = p if isinstance(p, list) else [p]
-                for proto in protos:
-                    key = (fwd.get("listen", "0.0.0.0"), proto, fwd["host_port"])
-                    if key in ports:
-                        raise ValueError(f"host_port collision {key}: {cname} vs {ports[key]}")
-                    ports[key] = cname
-            attach[cname] = a
-        flows = []
-        for fl in n.get("flows", []):
-            _require(fl, "from", "to", "proto", "port")
-            for end in (fl["from"], fl["to"]):
-                if end not in members:                   # endpoints attached to THIS network
-                    raise ValueError(f"network {net}: flow endpoint {end!r} not attached here")
-            flows.append((fl["from"], fl["to"], fl["proto"], fl["port"]))
-        networks[net] = {"gateway": n["gateway"], "fabric_if": n["fabric_if"],
-                         "uplink": uplink, "flows": flows, "attach": attach}
-
-    for cname, n in defaults.items():                    # exactly one default per container
-        if n > 1:
-            raise ValueError(f"{cname}: {n} interfaces marked default; pick one")
-
-    return {"runtime": runtime, "containers": containers, "networks": networks}
-
-CONFIG = _load(os.environ.get("FABRIC_CONFIG", "fabric.json"))
-```
+The schema above is parsed and validated in `internal/config` (`config.go` /
+`validate.go`): the `Turnip` graph, the polymorphic spots as real types (`egress`
+bool|list, `proto` scalar|list, `port` int|"any", the `links` discriminated union),
+unknown keys rejected so typos become load errors, and the validation split into
+per-network rules + the container-global cross-cutting checks above. Discovery is
+`--config` → `$TURNIP_CONFIG` → `./turnip.json`. `HOST_PREFIX = 32` is locked by
+topology, not configurable.
 
 ## Open questions
-- **Config discovery.** `$FABRIC_CONFIG` (sketched) vs a `--config` flag.
 - **Single-network sugar.** Offer a flat top-level shorthand that desugars to one
   implicit network, or require the explicit `networks.<name>` form always?
 - **Inter-network routing.** Deferred; when added, an explicit default-deny transit
@@ -607,6 +483,5 @@ CONFIG = _load(os.environ.get("FABRIC_CONFIG", "fabric.json"))
   (`nat = false`) needs a static route for the subnet on your LAN router.
 - **Per-flow direction.** *Decided:* `flows` are **directional** (`from` → `to`
   initiation only; conntrack carries the return path). The other direction is a
-  second explicit flow. (Was bidirectional in the retired `fabric.py`; changed so
-  the directional `from`/`to` keys mean what they say, and to stay least-privilege.)
-```
+  second explicit flow. (Least-privilege: the directional `from`/`to` keys mean
+  what they say.)
