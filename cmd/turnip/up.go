@@ -105,14 +105,20 @@ func up(configPath string) error {
 		return err
 	}
 
-	// define: lower the config to a fully-resolved Plan. Fails fast on bad anchors / oversized
-	// ifnames / unwired flows -- before any netns or host-edge mutation.
+	// define: lower the config to a fully-resolved Plan (pure -- no kernel). Fails fast on
+	// oversized ifnames / unwired flows / link conflicts before any host read or mutation.
 	plan, err := buildModel(cfg, owner, stateDir)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("up: %d network(s), %d container(s); owner=%s, state=%s\n",
 		len(cfg.Networks), len(cfg.Containers), owner.User, stateDir)
+
+	// preflight: validate the plan's link anchors against the LIVE init netns (read-only) --
+	// still fail-fast, but this is the first thing that reads the kernel, kept out of buildModel.
+	if err := preflightAnchors(plan); err != nil {
+		return err
+	}
 
 	// up = down + build: clear prior host-edge state (init-netns veths + nat zones) before
 	// rebuilding. The netns themselves are recreated clean by Bootstrap (pinNetns is idempotent).
@@ -129,6 +135,18 @@ func up(configPath string) error {
 	fmt.Printf("  bootstrapped %d netns (pinned under %s)\n", len(plan.Specs), stateDir)
 
 	return applyPlan(set, plan)
+}
+
+// preflightAnchors validates every link's host-side anchor against the live init netns
+// (exists, right kind, not wireless/primary) -- read-only kernel IO, run as root in the init
+// netns before any mutation. The pure cross-spec conflicts were caught in buildModel; this is
+// the host-dependent half, kept out of the pure lowering and pushed to its own phase.
+func preflightAnchors(plan *Plan) error {
+	var links []dp.LinkSpec
+	for _, cp := range plan.Containers {
+		links = append(links, cp.Links...)
+	}
+	return dp.ValidateLinkAnchors(links)
 }
 
 // clearHostEdge removes the init-netns host-edge state (uplink veths + nat zones) for every

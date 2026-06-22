@@ -7,9 +7,9 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-// TestCheckParentFlavors: a parent device is a macvlan master XOR an ipvlan master. Same
+// TestValidateLinkConflicts: a parent device is a macvlan master XOR an ipvlan master. Same
 // flavor on a shared parent is fine; mixing flavors on one parent is the conflict.
-func TestCheckParentFlavors(t *testing.T) {
+func TestValidateLinkConflicts(t *testing.T) {
 	cases := []struct {
 		name    string
 		specs   []LinkSpec
@@ -48,7 +48,7 @@ func TestCheckParentFlavors(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err := checkParentFlavors(c.specs)
+			err := ValidateLinkConflicts(c.specs)
 			if c.wantErr == "" {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)

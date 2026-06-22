@@ -130,12 +130,21 @@ dataplane's.
 
 **Where:** `cmd/turnip/up.go`, `cmd/turnip/down.go`. Dispatched from `main.go`.
 
-`up` is two passes over the seam:
+`up` runs on a **pure → read → write** axis:
 
 ```
-up = loadConfig → resolveRuntime → buildModel → clearHostEdge → Bootstrap → applyPlan
-       (Layer 1)    (env/IO)        (Layer 2)    (clean slate)   (netns)    (Layer 3)
+up = loadConfig → resolveRuntime → buildModel → preflightAnchors → clearHostEdge → Bootstrap → applyPlan
+       (env/IO)      (env/IO)        (pure)        (read host)       └──────────── write ──────────────┘
 ```
+
+`buildModel` is pure (no kernel). `preflightAnchors` is the *first* kernel touch but
+**read-only** — it validates the plan's link anchors against the live init netns, still
+fail-fast, before anything is mutated. Then the write phase (`clearHostEdge` → `Bootstrap` →
+`applyPlan`) changes the world. The kernel-touch rule from "Where the plan/dataplane line
+falls" is what splits link validation across these phases: the pure cross-spec conflicts
+(`ValidateLinkConflicts`, macvlan⊕ipvlan can't share a parent) run in `buildModel`; the
+host-anchor probe (`ValidateLinkAnchors` — exists, right kind, not wireless/primary) reads the
+kernel, so it's preflight.
 
 `up = down + build` (clean slate): `clearHostEdge` scrubs prior init-netns host-edge
 state, and `Bootstrap` mints the netns fresh. `down` is the teardown half —

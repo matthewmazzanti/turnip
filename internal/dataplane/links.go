@@ -33,33 +33,11 @@ type LinkSpec struct {
 	Default bool // owns the container's default route
 }
 
-// ValidateLinkAnchors checks each link's host-side anchor in the init netns BEFORE any netns
-// is built, so a bad anchor fails fast. Anchors are BORROWED -- we only check, never create.
-// Ports validate_link_anchors.
-func ValidateLinkAnchors(specs []LinkSpec) error {
-	if len(specs) == 0 {
-		return nil
-	}
-	// macvlan and ipvlan cannot share a parent (a device is a macvlan master XOR ipvlan).
-	if err := checkParentFlavors(specs); err != nil {
-		return err
-	}
-	defOifs, err := defaultRouteOifs()
-	if err != nil {
-		return fmt.Errorf("read default routes: %w", err)
-	}
-	for _, s := range specs {
-		if err := validateAnchor(s, defOifs); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// checkParentFlavors enforces that no host device is asked to be both a macvlan and an
-// ipvlan master -- a parent is one flavor XOR the other. Pure (no netlink), so it units
-// without root; the anchor-existence checks (validateAnchor) need the live host netns.
-func checkParentFlavors(specs []LinkSpec) error {
+// ValidateLinkConflicts is the PURE half of link validation: cross-spec invariants that need
+// no host. Today: no host device may be asked to be both a macvlan and an ipvlan master -- a
+// parent is one flavor XOR the other. Pure (no netlink), so it units without root and belongs
+// in the planning phase (buildModel). The host-side anchor checks are ValidateLinkAnchors.
+func ValidateLinkConflicts(specs []LinkSpec) error {
 	flavor := map[string]string{}
 	for _, s := range specs {
 		if s.Kind != "macvlan" && s.Kind != "ipvlan" {
@@ -70,6 +48,26 @@ func checkParentFlavors(specs []LinkSpec) error {
 				s.Parent, prev, s.Kind)
 		}
 		flavor[s.Parent] = s.Kind
+	}
+	return nil
+}
+
+// ValidateLinkAnchors is the IO half: it checks each link's host-side anchor in the live init
+// netns (exists, right kind, not wireless/primary) BEFORE any netns is built, so a bad anchor
+// fails fast. Anchors are BORROWED -- we only check, never create. Reads the kernel, so it runs
+// in the preflight phase (after the pure buildModel), not in lowering. Ports validate_link_anchors.
+func ValidateLinkAnchors(specs []LinkSpec) error {
+	if len(specs) == 0 {
+		return nil
+	}
+	defOifs, err := defaultRouteOifs()
+	if err != nil {
+		return fmt.Errorf("read default routes: %w", err)
+	}
+	for _, s := range specs {
+		if err := validateAnchor(s, defOifs); err != nil {
+			return err
+		}
 	}
 	return nil
 }

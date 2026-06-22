@@ -71,17 +71,19 @@ type ContainerPlan struct {
 	Links     []dp.LinkSpec
 }
 
-// buildModel lowers the validated config into the dataplane Plan. Pure: no IO, no fds. All
-// fallible resolution (link anchors, ifname lengths, unwired flows) happens here, so the caller
-// can fail before bootstrapping a single netns.
+// buildModel lowers the validated config into the dataplane Plan. Pure: no IO, no fds, no
+// kernel. All resolution that can fail WITHOUT the host (ifname lengths, unwired flows, link
+// conflicts) happens here, so a bad config fails before bootstrapping a single netns. The
+// host-dependent checks (link anchors exist/are valid) are the caller's preflight phase.
 func buildModel(cfg *config.Turnip, owner netns.Owner, stateDir string) (*Plan, error) {
 	plan := &Plan{
 		Specs: netnsSpecs(cfg, stateDir),
 		Owner: owner,
 	}
 
-	// links first: build every container's specs and validate anchors globally (cross-container)
-	// before anything else, then distribute per container below.
+	// links first: build every container's specs and validate the pure cross-container
+	// conflicts (macvlan/ipvlan can't share a parent) before distributing per container below.
+	// The host-anchor checks happen later, in preflightAnchors (they read the live host).
 	linkSpecs, err := buildLinkSpecs(cfg)
 	if err != nil {
 		return nil, err
@@ -90,7 +92,7 @@ func buildModel(cfg *config.Turnip, owner netns.Owner, stateDir string) (*Plan, 
 	for _, cname := range sortedKeys(linkSpecs) {
 		allLinks = append(allLinks, linkSpecs[cname]...)
 	}
-	if err := dp.ValidateLinkAnchors(allLinks); err != nil {
+	if err := dp.ValidateLinkConflicts(allLinks); err != nil {
 		return nil, err
 	}
 
