@@ -41,15 +41,8 @@ func ValidateLinkAnchors(specs []LinkSpec) error {
 		return nil
 	}
 	// macvlan and ipvlan cannot share a parent (a device is a macvlan master XOR ipvlan).
-	flavor := map[string]string{}
-	for _, s := range specs {
-		if s.Kind == "macvlan" || s.Kind == "ipvlan" {
-			if prev, ok := flavor[s.Parent]; ok && prev != s.Kind {
-				return fmt.Errorf("parent %q: macvlan and ipvlan cannot share a parent device (%s vs %s)",
-					s.Parent, prev, s.Kind)
-			}
-			flavor[s.Parent] = s.Kind
-		}
+	if err := checkParentFlavors(specs); err != nil {
+		return err
 	}
 	defOifs, err := defaultRouteOifs()
 	if err != nil {
@@ -59,6 +52,24 @@ func ValidateLinkAnchors(specs []LinkSpec) error {
 		if err := validateAnchor(s, defOifs); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// checkParentFlavors enforces that no host device is asked to be both a macvlan and an
+// ipvlan master -- a parent is one flavor XOR the other. Pure (no netlink), so it units
+// without root; the anchor-existence checks (validateAnchor) need the live host netns.
+func checkParentFlavors(specs []LinkSpec) error {
+	flavor := map[string]string{}
+	for _, s := range specs {
+		if s.Kind != "macvlan" && s.Kind != "ipvlan" {
+			continue
+		}
+		if prev, ok := flavor[s.Parent]; ok && prev != s.Kind {
+			return fmt.Errorf("parent %q: macvlan and ipvlan cannot share a parent device (%s vs %s)",
+				s.Parent, prev, s.Kind)
+		}
+		flavor[s.Parent] = s.Kind
 	}
 	return nil
 }

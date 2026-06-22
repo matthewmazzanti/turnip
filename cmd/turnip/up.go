@@ -184,7 +184,7 @@ func up(configPath string) error {
 				RouterIf: rif,
 				ContIf:   att.Interface,
 				IP:       att.IP,
-				Default:  att.Default || counts[cname] == 1,
+				Default:  ownsDefault(att.Default, counts[cname]),
 			}
 			if err := dataplane.Connect(routerFd, contFd, net.Gateway, ep); err != nil {
 				return fmt.Errorf("network %q connect %q: %w", netName, cname, err)
@@ -236,19 +236,9 @@ func up(configPath string) error {
 		// nft: the forward flow matrix + uplink egress allows + the router's own-address
 		// lockdown. Resolve flow endpoints (container names) to IPs; icmp / port="any" in
 		// flows isn't wired yet.
-		ip := map[string]netip.Addr{}
-		for cname, att := range net.Attach {
-			ip[cname] = att.IP
-		}
-		var flows []dataplane.Flow
-		for _, fl := range net.Flows {
-			if fl.Proto == config.ProtoICMP || fl.Port.Any {
-				return fmt.Errorf("network %q: icmp / port=\"any\" in flows not wired yet", netName)
-			}
-			flows = append(flows, dataplane.Flow{
-				FromIP: ip[fl.From], ToIP: ip[fl.To],
-				Proto: string(fl.Proto), Port: uint16(fl.Port.Port),
-			})
+		flows, err := buildFlows(net)
+		if err != nil {
+			return fmt.Errorf("network %q: %w", netName, err)
 		}
 		// nft acts on the process netns, so apply it inside a set.Enter episode: the forked
 		// nft child inherits the router netns.
@@ -415,6 +405,35 @@ func interfaceCounts(cfg *config.Turnip) map[string]int {
 		}
 	}
 	return counts
+}
+
+// ownsDefault resolves whether an endpoint owns the container's default route: a configured
+// default, OR being the container's sole interface (config guarantees at most one configured
+// default, so the implicit case can't conflict).
+func ownsDefault(configuredDefault bool, ifaceCount int) bool {
+	return configuredDefault || ifaceCount == 1
+}
+
+// buildFlows lowers a network's flows to the dataplane Flow list, resolving each endpoint
+// container name to its /32. icmp / port="any" need a second nft map shape that isn't wired
+// yet, so they're rejected here (the caller wraps with the network name). Ports the flow
+// half of build_nft's caller.
+func buildFlows(net config.Network) ([]dataplane.Flow, error) {
+	ip := map[string]netip.Addr{}
+	for cname, att := range net.Attach {
+		ip[cname] = att.IP
+	}
+	var flows []dataplane.Flow
+	for _, fl := range net.Flows {
+		if fl.Proto == config.ProtoICMP || fl.Port.Any {
+			return nil, fmt.Errorf("icmp / port=\"any\" in flows not wired yet")
+		}
+		flows = append(flows, dataplane.Flow{
+			FromIP: ip[fl.From], ToIP: ip[fl.To],
+			Proto: string(fl.Proto), Port: uint16(fl.Port.Port),
+		})
+	}
+	return flows, nil
 }
 
 func defaultMark(d bool) string {

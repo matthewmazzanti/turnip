@@ -1,0 +1,171 @@
+{
+  "nftables": [
+    {
+      "add": {
+        "table": {
+          "family": "ip",
+          "name": "turnip_host_lan"
+        }
+      }
+    },
+    {
+      "delete": {
+        "table": {
+          "family": "ip",
+          "name": "turnip_host_lan"
+        }
+      }
+    },
+    {
+      "add": {
+        "table": {
+          "family": "ip",
+          "name": "turnip_host_lan"
+        }
+      }
+    },
+    {
+      "add": {
+        "chain": {
+          "family": "ip",
+          "hook": "postrouting",
+          "name": "postrouting",
+          "policy": "accept",
+          "prio": 100,
+          "table": "turnip_host_lan",
+          "type": "nat"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "postrouting",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "==",
+                "right": "veth-lan-host"
+              }
+            },
+            {
+              "masquerade": null
+            }
+          ],
+          "family": "ip",
+          "table": "turnip_host_lan"
+        }
+      }
+    },
+    {
+      "add": {
+        "chain": {
+          "family": "ip",
+          "hook": "prerouting",
+          "name": "prerouting",
+          "policy": "accept",
+          "prio": -100,
+          "table": "turnip_host_lan",
+          "type": "nat"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "prerouting",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "l4proto"
+                  }
+                },
+                "op": "==",
+                "right": "tcp"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "dport",
+                    "protocol": "th"
+                  }
+                },
+                "op": "==",
+                "right": 8080
+              }
+            },
+            {
+              "dnat": {
+                "addr": "10.0.0.13",
+                "port": 80
+              }
+            }
+          ],
+          "family": "ip",
+          "table": "turnip_host_lan"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "prerouting",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "daddr",
+                    "protocol": "ip"
+                  }
+                },
+                "op": "==",
+                "right": "192.0.2.1"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "l4proto"
+                  }
+                },
+                "op": "==",
+                "right": "tcp"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "dport",
+                    "protocol": "th"
+                  }
+                },
+                "op": "==",
+                "right": 8443
+              }
+            },
+            {
+              "dnat": {
+                "addr": "10.0.0.14",
+                "port": 443
+              }
+            }
+          ],
+          "family": "ip",
+          "table": "turnip_host_lan"
+        }
+      }
+    }
+  ]
+}
