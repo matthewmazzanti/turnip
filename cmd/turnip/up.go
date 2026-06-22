@@ -16,7 +16,7 @@ import (
 	"strings"
 
 	"git.lan/mmazzanti/turnip/internal/config"
-	"git.lan/mmazzanti/turnip/internal/dataplane"
+	dp "git.lan/mmazzanti/turnip/internal/dataplane"
 	"git.lan/mmazzanti/turnip/internal/netns"
 	"git.lan/mmazzanti/turnip/internal/nftlib"
 )
@@ -96,12 +96,12 @@ func netnsSpecs(cfg *config.Turnip, stateDir string) []netns.Spec {
 	return specs
 }
 
-// --- up / down -------------------------------------------------------------
+// --- up ---------------------------------------------------------------------
 
 // up loads the config, resolves the owner, bootstraps the netns the config implies, then
-// configures the dataplane over them (inline, until the phases reveal real boundaries to
-// extract). up = down + build (clean slate). The routed fabric is wired; container-local
-// setup and the host edge are still TODO sections.
+// configures the dataplane over them. up = down + build (clean slate): it clears prior
+// host-edge state and rebuilds the routed fabric (per-network L3 wiring) plus the
+// container-local setup (/etc/hosts + links). The per-step work lives in the helpers below.
 func up(configPath string) error {
 	cfg, err := loadConfig(configPath)
 	if err != nil {
@@ -118,15 +118,8 @@ func up(configPath string) error {
 
 	// build + validate the container link specs up front -- fail fast on a bad anchor before
 	// any netns or host-edge mutation.
-	linkSpecs, err := buildLinkSpecs(cfg)
+	linkSpecs, err := validateLinkSpecs(cfg)
 	if err != nil {
-		return err
-	}
-	var allLinks []dataplane.LinkSpec
-	for _, cname := range sortedKeys(linkSpecs) {
-		allLinks = append(allLinks, linkSpecs[cname]...)
-	}
-	if err := dataplane.ValidateLinkAnchors(allLinks); err != nil {
 		return err
 	}
 
@@ -143,118 +136,189 @@ func up(configPath string) error {
 	defer set.Close() // the netns persist by bind-mount; this drops only our fd handles
 	fmt.Printf("  bootstrapped %d netns (pinned under %s)\n", len(specs), stateDir)
 
-	// loopback up in every netns (routers + containers); all fds are present post-Bootstrap.
+	if err := setLoopbackUp(set, specs); err != nil {
+		return err
+	}
+
+	// the routed fabric: per network, the L3 wiring in its router netns.
+	counts := interfaceCounts(cfg)
+	for _, netName := range sortedKeys(cfg.Networks) {
+		if err := configureNetwork(set, netName, cfg.Networks[netName], counts); err != nil {
+			return err
+		}
+	}
+
+	// container-local: the generated /etc/hosts + links (lo is up above).
+	return configureContainers(set, cfg, owner, stateDir, linkSpecs)
+}
+
+// validateLinkSpecs builds every container's link specs and validates their anchors up front,
+// keyed by container for the per-container connect loop -- fail fast on a bad anchor before
+// any netns or host-edge mutation.
+func validateLinkSpecs(cfg *config.Turnip) (map[string][]dp.LinkSpec, error) {
+	linkSpecs, err := buildLinkSpecs(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var allLinks []dp.LinkSpec
+	for _, cname := range sortedKeys(linkSpecs) {
+		allLinks = append(allLinks, linkSpecs[cname]...)
+	}
+	if err := dp.ValidateLinkAnchors(allLinks); err != nil {
+		return nil, err
+	}
+	return linkSpecs, nil
+}
+
+// setLoopbackUp brings lo up in every bootstrapped netns (routers + containers); all fds are
+// present post-Bootstrap.
+func setLoopbackUp(set *netns.Set, specs []netns.Spec) error {
 	for _, sp := range specs {
 		fd, _ := set.FD(sp.Name)
-		if err := dataplane.SetLoUp(fd); err != nil {
+		if err := dp.SetLoUp(fd); err != nil {
 			return fmt.Errorf("%s lo: %w", sp.Name, err)
 		}
 	}
+	return nil
+}
 
-	// --- the routed fabric: per network, the L3 wiring in its router netns ---------------
-	// gateway + a /32 routed veth per attached container (the container end is born in the
-	// container netns -- the attachment), router sysctls, and the nft flow matrix. Drives the
-	// live Set the rootful parent holds (netlink/nft over the fd, set.Enter for sysctls).
-	counts := interfaceCounts(cfg)
-	for _, netName := range sortedKeys(cfg.Networks) {
-		net := cfg.Networks[netName]
-		routerFd, ok := set.FD("router:" + netName)
-		if !ok {
-			return fmt.Errorf("router netns %q missing from the bootstrap set", netName)
-		}
-		if err := dataplane.CreateGateway(routerFd, dataplane.Gateway{IfName: net.GatewayIf, Addr: net.Gateway}); err != nil {
-			return fmt.Errorf("network %q: %w", netName, err)
-		}
-		fmt.Printf("  router %s: gateway %s/%d on %s\n", netName, net.Gateway, config.HOSTPrefix, net.GatewayIf)
+// configureNetwork wires one network's routed fabric in its router netns: the gateway, a
+// routed /32 veth per attached container, the optional host-edge uplink, then the router
+// sysctls and nft policy (applied last, after the veths they reference exist). Drives the
+// live Set the rootful parent holds (netlink/nft over the fd, set.Enter for sysctls).
+func configureNetwork(set *netns.Set, netName string, net config.Network, counts map[string]int) error {
+	routerFd, ok := set.FD("router:" + netName)
+	if !ok {
+		return fmt.Errorf("router netns %q missing from the bootstrap set", netName)
+	}
+	if err := dp.CreateGateway(routerFd, dp.Gateway{IfName: net.GatewayIf, Addr: net.Gateway}); err != nil {
+		return fmt.Errorf("network %q: %w", netName, err)
+	}
+	fmt.Printf("  router %s: gateway %s/%d on %s\n", netName, net.Gateway, config.HOSTPrefix, net.GatewayIf)
 
-		var routerIfs []string
-		for _, cname := range sortedKeys(net.Attach) {
-			att := net.Attach[cname]
-			contFd, ok := set.FD("container:" + cname)
-			if !ok {
-				return fmt.Errorf("container netns %q missing from the bootstrap set", cname)
-			}
-			rif, err := routerIf(cname)
-			if err != nil {
-				return err
-			}
-			// effective default-route ownership: configured default, OR the container's
-			// sole interface (config guarantees at most one configured default).
-			ep := dataplane.Endpoint{
-				RouterIf: rif,
-				ContIf:   att.Interface,
-				IP:       att.IP,
-				Default:  ownsDefault(att.Default, counts[cname]),
-			}
-			if err := dataplane.Connect(routerFd, contFd, net.Gateway, ep); err != nil {
-				return fmt.Errorf("network %q connect %q: %w", netName, cname, err)
-			}
-			routerIfs = append(routerIfs, rif)
-			fmt.Printf("    %s: %s %s/%d -> gw %s%s <-> %s\n",
-				cname, att.Interface, att.IP, config.HOSTPrefix, net.Gateway, defaultMark(ep.Default), rif)
-		}
-
-		// uplink (the host edge): the /31 veth across init<->router, host NAT (masquerade) +
-		// container routes. Wired here, before the router sysctls/nft, so the uplink veth
-		// exists when they reference it (its rp_filter + the egress allows).
-		uplinkRouterIf := ""
-		var edge *dataplane.Edge
-		if net.Uplink != nil {
-			uplink := dataplane.Uplink{
-				HostIf: net.Uplink.HostIf, RouterIf: net.Uplink.RouterIf,
-				HostIP: net.Uplink.Link, RouterIP: net.Uplink.Link.Next(),
-			}
-			if err := dataplane.HostEdgeConnect(routerFd, uplink); err != nil {
-				return fmt.Errorf("network %q uplink: %w", netName, err)
-			}
-			var containerIPs []netip.Addr
-			for _, cname := range sortedKeys(net.Attach) {
-				containerIPs = append(containerIPs, net.Attach[cname].IP)
-			}
-			dnats, ingressAllows := buildIngress(net)
-			if err := dataplane.ConfigureHostNAT(netName, uplink, containerIPs, dnats); err != nil {
-				return fmt.Errorf("network %q host nat: %w", netName, err)
-			}
-			uplinkRouterIf = uplink.RouterIf
-			edge = &dataplane.Edge{
-				UplinkIf: uplink.RouterIf,
-				Egress:   buildEgressAllows(net),
-				Ingress:  ingressAllows,
-			}
-			fmt.Printf("    uplink: %s <-> %s (%s/%d), host masquerade + %d route(s) + %d dnat\n",
-				uplink.HostIf, uplink.RouterIf, uplink.HostIP, config.LINKPrefix, len(containerIPs), len(dnats))
-		}
-
-		// sysctls: applied AFTER the veths exist (the per-veth conf.<if> dirs). /proc/sys is
-		// per-process-netns with no netlink verb, so it needs a setns episode (set.Enter).
-		sysctls := dataplane.RouterSysctls(routerIfs, uplinkRouterIf)
-		if err := set.Enter("router:"+netName, func() error { return dataplane.WriteSysctls(sysctls) }); err != nil {
-			return fmt.Errorf("network %q sysctls: %w", netName, err)
-		}
-		fmt.Printf("    sysctls: ip_forward + per-veth proxy_arp/rp_filter (strict) + ipv6 off\n")
-
-		// nft: the forward flow matrix + uplink egress allows + the router's own-address
-		// lockdown. Resolve flow endpoints (container names) to IPs; icmp / port="any" in
-		// flows isn't wired yet.
-		flows, err := buildFlows(net)
-		if err != nil {
-			return fmt.Errorf("network %q: %w", netName, err)
-		}
-		// nft acts on the process netns, so apply it inside a set.Enter episode: the forked
-		// nft child inherits the router netns.
-		rs := dataplane.BuildNFT(flows, edge)
-		if err := set.Enter("router:"+netName, func() error { return nftlib.Load(rs) }); err != nil {
-			return fmt.Errorf("network %q nft: %w", netName, err)
-		}
-		fmt.Printf("    nft: forward flow matrix (%d flow(s)) + input lockdown\n", len(flows))
+	routerIfs, err := connectContainers(set, routerFd, netName, net, counts)
+	if err != nil {
+		return err
 	}
 
-	// --- container-local: the generated /etc/hosts + links (lo is up above) ---------------
-	// each container resolves itself (its own ip/name on each network) and the peers its
-	// outbound flows may reach. Written to <state>/containers/<name>/hosts (the provisioner
-	// made the dir, on the shared user-runtime tmpfs); chowned to the owner so podman
-	// bind-mounts it to /etc/hosts cleanly. Then any links -- host netdev holes into the
-	// netns, the deliberate L2 escape outside every router and its nft policy.
+	uplinkRouterIf, edge, err := configureUplink(routerFd, netName, net)
+	if err != nil {
+		return err
+	}
+
+	if err := applyRouterSysctls(set, netName, routerIfs, uplinkRouterIf); err != nil {
+		return err
+	}
+	return applyRouterNFT(set, netName, net, edge)
+}
+
+// connectContainers wires a routed /32 veth from the router netns into each attached
+// container's netns (the container end is born there -- the attachment), returning the
+// router-side interface names for the sysctls.
+func connectContainers(set *netns.Set, routerFd int, netName string, net config.Network, counts map[string]int) ([]string, error) {
+	var routerIfs []string
+	for _, cname := range sortedKeys(net.Attach) {
+		att := net.Attach[cname]
+		contFd, ok := set.FD("container:" + cname)
+		if !ok {
+			return nil, fmt.Errorf("container netns %q missing from the bootstrap set", cname)
+		}
+		rif, err := routerIf(cname)
+		if err != nil {
+			return nil, err
+		}
+		// effective default-route ownership: configured default, OR the container's
+		// sole interface (config guarantees at most one configured default).
+		ep := dp.Endpoint{
+			RouterIf: rif,
+			ContIf:   att.Interface,
+			IP:       att.IP,
+			Default:  ownsDefault(att.Default, counts[cname]),
+		}
+		if err := dp.Connect(routerFd, contFd, net.Gateway, ep); err != nil {
+			return nil, fmt.Errorf("network %q connect %q: %w", netName, cname, err)
+		}
+		routerIfs = append(routerIfs, rif)
+		fmt.Printf("    %s: %s %s/%d -> gw %s%s <-> %s\n",
+			cname, att.Interface, att.IP, config.HOSTPrefix, net.Gateway, defaultMark(ep.Default), rif)
+	}
+	return routerIfs, nil
+}
+
+// configureUplink wires the optional host edge: the /31 veth across init<->router, then host
+// NAT (masquerade + container routes + ingress DNAT). It's done before the router sysctls/nft
+// so the uplink veth exists when they reference it (its rp_filter + the egress allows).
+// Returns the uplink's router-side interface (for the sysctls) and the nft edge (egress +
+// ingress allows); both zero when the network has no uplink.
+func configureUplink(routerFd int, netName string, net config.Network) (string, *dp.Edge, error) {
+	if net.Uplink == nil {
+		return "", nil, nil
+	}
+	uplink := dp.Uplink{
+		HostIf:   net.Uplink.HostIf,
+		RouterIf: net.Uplink.RouterIf,
+		HostIP:   net.Uplink.Link,
+		RouterIP: net.Uplink.Link.Next(),
+	}
+	if err := dp.HostEdgeConnect(routerFd, uplink); err != nil {
+		return "", nil, fmt.Errorf("network %q uplink: %w", netName, err)
+	}
+	var containerIPs []netip.Addr
+	for _, cname := range sortedKeys(net.Attach) {
+		containerIPs = append(containerIPs, net.Attach[cname].IP)
+	}
+	dnats, ingressAllows := buildIngress(net)
+	if err := dp.ConfigureHostNAT(netName, uplink, containerIPs, dnats); err != nil {
+		return "", nil, fmt.Errorf("network %q host nat: %w", netName, err)
+	}
+	edge := &dp.Edge{
+		UplinkIf: uplink.RouterIf,
+		Egress:   buildEgressAllows(net),
+		Ingress:  ingressAllows,
+	}
+	fmt.Printf("    uplink: %s <-> %s (%s/%d), host masquerade + %d route(s) + %d dnat\n",
+		uplink.HostIf, uplink.RouterIf, uplink.HostIP, config.LINKPrefix, len(containerIPs), len(dnats))
+	return uplink.RouterIf, edge, nil
+}
+
+// applyRouterSysctls writes the router netns sysctls AFTER its veths exist (they reference the
+// per-veth conf.<if> dirs). /proc/sys is per-process-netns with no netlink verb, so it needs a
+// setns episode (set.Enter).
+func applyRouterSysctls(set *netns.Set, netName string, routerIfs []string, uplinkRouterIf string) error {
+	sysctls := dp.RouterSysctls(routerIfs, uplinkRouterIf)
+	if err := set.Enter("router:"+netName, func() error {
+		return dp.WriteSysctls(sysctls)
+	}); err != nil {
+		return fmt.Errorf("network %q sysctls: %w", netName, err)
+	}
+	fmt.Printf("    sysctls: ip_forward + per-veth proxy_arp/rp_filter (strict) + ipv6 off\n")
+	return nil
+}
+
+// applyRouterNFT loads the router's nft policy: the forward flow matrix + uplink egress allows
+// + the own-address lockdown. Flow endpoints (container names) resolve to IPs; icmp /
+// port="any" in flows isn't wired yet. nft acts on the process netns, so it's applied inside a
+// set.Enter episode (the forked nft child inherits the router netns).
+func applyRouterNFT(set *netns.Set, netName string, net config.Network, edge *dp.Edge) error {
+	flows, err := buildFlows(net)
+	if err != nil {
+		return fmt.Errorf("network %q: %w", netName, err)
+	}
+	rs := dp.BuildNFT(flows, edge)
+	if err := set.Enter("router:"+netName, func() error { return nftlib.Load(rs) }); err != nil {
+		return fmt.Errorf("network %q nft: %w", netName, err)
+	}
+	fmt.Printf("    nft: forward flow matrix (%d flow(s)) + input lockdown\n", len(flows))
+	return nil
+}
+
+// configureContainers writes each container's generated /etc/hosts and connects its links.
+// Each container resolves itself (its own ip/name on each network) and the peers its outbound
+// flows may reach. hosts is written to <state>/containers/<name>/hosts (the provisioner made
+// the dir, on the shared user-runtime tmpfs) and chowned to the owner so podman bind-mounts it
+// to /etc/hosts cleanly. Links are host netdev holes into the netns -- the deliberate L2
+// escape outside every router and its nft policy.
+func configureContainers(set *netns.Set, cfg *config.Turnip, owner netns.Owner, stateDir string, linkSpecs map[string][]dp.LinkSpec) error {
 	for _, cname := range sortedKeys(cfg.Containers) {
 		hostsPath := filepath.Join(stateDir, "containers", cname, "hosts")
 		if err := os.WriteFile(hostsPath, []byte(hostsFile(cfg, cname)), 0o644); err != nil {
@@ -270,7 +334,7 @@ func up(configPath string) error {
 				return fmt.Errorf("container netns %q missing from the bootstrap set", cname)
 			}
 			for _, spec := range links {
-				if err := dataplane.LinkConnect(contFd, spec); err != nil {
+				if err := dp.LinkConnect(contFd, spec); err != nil {
 					return err
 				}
 			}
@@ -279,37 +343,6 @@ func up(configPath string) error {
 		}
 		fmt.Printf("  container %s: hosts written\n", cname)
 	}
-
-	return nil
-}
-
-// down scrubs the netns: removing each pinned netns destroys everything inside it (links,
-// routes, sysctls, the future nft table), so this is the whole teardown for the routed
-// fabric. The host-edge state (in the init netns) is a separate, later concern.
-func down(configPath string) error {
-	cfg, err := loadConfig(configPath)
-	if err != nil {
-		return err
-	}
-	owner, stateDir, err := resolveRuntime(cfg.Runtime)
-	if err != nil {
-		return err
-	}
-	specs := netnsSpecs(cfg, stateDir)
-	paths := make([]string, len(specs))
-	for i, s := range specs {
-		paths[i] = s.Path
-	}
-	// clear the init-netns host edge (uplink veths + nat zones), then scrub the netns (which
-	// reaps everything inside: links, routes, sysctls, the nft table).
-	// TODO: refuse when a live podman container still holds a target netns (would orphan it).
-	if err := clearHostEdge(cfg); err != nil {
-		return err
-	}
-	if err := netns.Teardown(owner, paths); err != nil {
-		return err
-	}
-	fmt.Printf("down: scrubbed %d netns under %s\n", len(paths), stateDir)
 	return nil
 }
 
@@ -339,8 +372,8 @@ func linkHostIf(container, linkName string) (string, error) {
 
 // buildLinkSpecs derives every container's link specs from the config -- the model
 // derivation for the L2 escape, grouped by container for the per-netns connect loop.
-func buildLinkSpecs(cfg *config.Turnip) (map[string][]dataplane.LinkSpec, error) {
-	out := map[string][]dataplane.LinkSpec{}
+func buildLinkSpecs(cfg *config.Turnip) (map[string][]dp.LinkSpec, error) {
+	out := map[string][]dp.LinkSpec{}
 	for _, cname := range sortedKeys(cfg.Containers) {
 		for _, link := range cfg.Containers[cname].Links {
 			spec, err := buildLinkSpec(cname, link)
@@ -354,9 +387,9 @@ func buildLinkSpecs(cfg *config.Turnip) (map[string][]dataplane.LinkSpec, error)
 }
 
 // buildLinkSpec translates one config.Link union member into the flat dataplane.LinkSpec.
-func buildLinkSpec(cname string, link config.Link) (dataplane.LinkSpec, error) {
+func buildLinkSpec(cname string, link config.Link) (dp.LinkSpec, error) {
 	b := link.Base()
-	spec := dataplane.LinkSpec{
+	spec := dp.LinkSpec{
 		Container: cname,
 		Name:      b.Name,
 		Address:   b.Address,
@@ -418,17 +451,17 @@ func ownsDefault(configuredDefault bool, ifaceCount int) bool {
 // container name to its /32. icmp / port="any" need a second nft map shape that isn't wired
 // yet, so they're rejected here (the caller wraps with the network name). Ports the flow
 // half of build_nft's caller.
-func buildFlows(net config.Network) ([]dataplane.Flow, error) {
+func buildFlows(net config.Network) ([]dp.Flow, error) {
 	ip := map[string]netip.Addr{}
 	for cname, att := range net.Attach {
 		ip[cname] = att.IP
 	}
-	var flows []dataplane.Flow
+	var flows []dp.Flow
 	for _, fl := range net.Flows {
 		if fl.Proto == config.ProtoICMP || fl.Port.Any {
 			return nil, fmt.Errorf("icmp / port=\"any\" in flows not wired yet")
 		}
-		flows = append(flows, dataplane.Flow{
+		flows = append(flows, dp.Flow{
 			FromIP: ip[fl.From], ToIP: ip[fl.To],
 			Proto: string(fl.Proto), Port: uint16(fl.Port.Port),
 		})
@@ -451,7 +484,7 @@ func clearHostEdge(cfg *config.Turnip) error {
 		if net.Uplink == nil {
 			continue
 		}
-		if err := dataplane.TeardownHostEdge(netName, net.Uplink.HostIf); err != nil {
+		if err := dp.TeardownHostEdge(netName, net.Uplink.HostIf); err != nil {
 			return fmt.Errorf("network %q host edge teardown: %w", netName, err)
 		}
 	}
@@ -460,16 +493,16 @@ func clearHostEdge(cfg *config.Turnip) error {
 
 // buildEgressAllows translates each attachment's egress config into the dataplane edge
 // allows: a container that may initiate out the uplink, any (All) or scoped (proto, port).
-func buildEgressAllows(net config.Network) []dataplane.EgressAllow {
-	var allows []dataplane.EgressAllow
+func buildEgressAllows(net config.Network) []dp.EgressAllow {
+	var allows []dp.EgressAllow
 	for _, cname := range sortedKeys(net.Attach) {
 		att := net.Attach[cname]
 		if !att.Egress.All && len(att.Egress.Rules) == 0 {
 			continue
 		}
-		a := dataplane.EgressAllow{IP: att.IP, All: att.Egress.All}
+		a := dp.EgressAllow{IP: att.IP, All: att.Egress.All}
 		for _, r := range att.Egress.Rules {
-			sc := dataplane.EgressScope{}
+			sc := dp.EgressScope{}
 			for _, p := range r.Proto {
 				sc.Protos = append(sc.Protos, string(p))
 			}
@@ -485,17 +518,17 @@ func buildEgressAllows(net config.Network) []dataplane.EgressAllow {
 
 // buildIngress translates each attachment's ingress config into the host DNAT rules
 // (Listen:host_port -> container:port) and the matching router forward-chain allows.
-func buildIngress(net config.Network) ([]dataplane.DNAT, []dataplane.IngressAllow) {
-	var dnats []dataplane.DNAT
-	var allows []dataplane.IngressAllow
+func buildIngress(net config.Network) ([]dp.DNAT, []dp.IngressAllow) {
+	var dnats []dp.DNAT
+	var allows []dp.IngressAllow
 	for _, cname := range sortedKeys(net.Attach) {
 		att := net.Attach[cname]
 		for _, ing := range att.Ingress {
-			dnats = append(dnats, dataplane.DNAT{
+			dnats = append(dnats, dp.DNAT{
 				Listen: ing.Listen, Proto: string(ing.Proto),
 				HostPort: ing.HostPort, ContIP: att.IP, ContPort: ing.Port,
 			})
-			allows = append(allows, dataplane.IngressAllow{
+			allows = append(allows, dp.IngressAllow{
 				IP: att.IP, Proto: string(ing.Proto), Port: ing.Port,
 			})
 		}
