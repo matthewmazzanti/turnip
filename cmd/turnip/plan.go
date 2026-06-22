@@ -1,4 +1,4 @@
-// model.go -- build_model: the pure lowering from config to a fully-resolved dataplane Plan.
+// plan.go -- buildPlan: the pure lowering from config to a fully-resolved dataplane Plan.
 // No IO, no fds, no root. Everything that can fail to resolve (oversized ifnames, unsupported
 // flows) is decided here, so applyPlan (apply.go) is total over a valid Plan. This is the seam
 // the imperative shell drives: cfg -> Plan -> effects. Unit-testable without a VM (Layer 1).
@@ -71,11 +71,11 @@ type ContainerPlan struct {
 	Links     []dp.LinkSpec
 }
 
-// buildModel lowers the validated config into the dataplane Plan. Pure: no IO, no fds, no
+// buildPlan lowers the validated config into the dataplane Plan. Pure: no IO, no fds, no
 // kernel. All resolution that can fail WITHOUT the host (ifname lengths, unwired flows, link
 // conflicts) happens here, so a bad config fails before bootstrapping a single netns. The
 // host-dependent checks (link anchors exist/are valid) are the caller's preflight phase.
-func buildModel(cfg *config.Turnip, owner netns.Owner, stateDir string) (*Plan, error) {
+func buildPlan(cfg *config.Turnip, owner netns.Owner, stateDir string) (*Plan, error) {
 	plan := &Plan{
 		Specs: netnsSpecs(cfg, stateDir),
 		Owner: owner,

@@ -54,7 +54,7 @@ in `turnip.json` to change it (example: `old/tests/turnip.example.json`).
 
 | Path | Role |
 |------|------|
-| `cmd/turnip/` | the CLI + orchestration (the imperative shell): config/env IO, the `buildModel` lowering (config → `Plan`, `model.go`), the `applyPlan` driver (`apply.go`), and `up`/`down` dispatch |
+| `cmd/turnip/` | the CLI + orchestration (the imperative shell): config/env IO, the `buildPlan` lowering (config → `Plan`, `plan.go`), the `applyPlan` driver (`apply.go`), and `up`/`down` dispatch |
 | `internal/` | `config` (the declarative model + validation), `netns` (podman bootstrap, netns lifecycle, the SCM_RIGHTS fd bridge), `dataplane` (gateway/veth/route wiring + the nft flow matrix) |
 | `nix/` | the flake helpers (`nix/lib`) + the rootless-podman dev VM (`testvm.nix`, `turnip-host.nix`) |
 | `spike/go-netns-bootstrap/` | the validated kernel-interface primitives the port builds on |

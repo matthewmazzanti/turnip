@@ -36,7 +36,7 @@ type LinkSpec struct {
 // ValidateLinkConflicts is the PURE half of link validation: cross-spec invariants that need
 // no host. Today: no host device may be asked to be both a macvlan and an ipvlan master -- a
 // parent is one flavor XOR the other. Pure (no netlink), so it units without root and belongs
-// in the planning phase (buildModel). The host-side anchor checks are ValidateLinkAnchors.
+// in the planning phase (buildPlan). The host-side anchor checks are ValidateLinkAnchors.
 func ValidateLinkConflicts(specs []LinkSpec) error {
 	flavor := map[string]string{}
 	for _, s := range specs {
@@ -55,7 +55,7 @@ func ValidateLinkConflicts(specs []LinkSpec) error {
 // ValidateLinkAnchors is the IO half: it checks each link's host-side anchor in the live init
 // netns (exists, right kind, not wireless/primary) BEFORE any netns is built, so a bad anchor
 // fails fast. Anchors are BORROWED -- we only check, never create. Reads the kernel, so it runs
-// in the preflight phase (after the pure buildModel), not in lowering. Ports validate_link_anchors.
+// in the preflight phase (after the pure buildPlan), not in lowering. Ports validate_link_anchors.
 func ValidateLinkAnchors(specs []LinkSpec) error {
 	if len(specs) == 0 {
 		return nil

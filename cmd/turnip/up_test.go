@@ -1,4 +1,4 @@
-// Unit tests for the pure config->dataplane lowering in model.go: the model-derivation helpers
+// Unit tests for the pure config->dataplane lowering in plan.go: the buildPlan helpers
 // that turn the parsed config into netns specs, link specs, endpoint defaults, flows, host
 // edge allows, and the generated /etc/hosts. No netns, no netlink, no root -- just the
 // transforms. Inputs are built through config.Parse so the tests exercise real config shapes

@@ -1,7 +1,7 @@
 // apply.go -- the imperative driver: walk a Plan and push it to the live netns Set. The
-// inverse of model.go's pure lowering -- this is where the fds, the set.Enter setns episodes,
+// inverse of plan.go's pure lowering -- this is where the fds, the set.Enter setns episodes,
 // the dataplane effectful primitives, and the progress output live. apply is total over a
-// valid Plan: every fallible resolution already happened in buildModel, so the only errors
+// valid Plan: every fallible resolution already happened in buildPlan, so the only errors
 // here are real runtime/IO faults.
 
 package main

@@ -1,5 +1,5 @@
 // up.go -- the imperative shell: config/runtime IO and the up/down orchestration. up is two
-// passes over a clean seam: buildModel (model.go) lowers the config to a fully-resolved Plan
+// passes over a clean seam: buildPlan (plan.go) lowers the config to a fully-resolved Plan
 // (pure, all fallible resolution up front), then applyPlan (apply.go) pushes that Plan to the
 // live netns Set. The dataplane verbs live in internal/dataplane; this layer only sequences.
 
@@ -91,7 +91,7 @@ func netnsSpecs(cfg *config.Turnip, stateDir string) []netns.Spec {
 
 // --- up ---------------------------------------------------------------------
 
-// up loads the config and resolves the owner, then runs two passes: buildModel lowers the
+// up loads the config and resolves the owner, then runs two passes: buildPlan lowers the
 // config to a fully-resolved Plan (pure -- every fallible resolution happens here, before any
 // mutation), and applyPlan pushes it to the freshly-bootstrapped netns. up = down + build: it
 // clears prior host-edge state before rebuilding (Bootstrap recreates the netns clean).
@@ -107,7 +107,7 @@ func up(configPath string) error {
 
 	// define: lower the config to a fully-resolved Plan (pure -- no kernel). Fails fast on
 	// oversized ifnames / unwired flows / link conflicts before any host read or mutation.
-	plan, err := buildModel(cfg, owner, stateDir)
+	plan, err := buildPlan(cfg, owner, stateDir)
 	if err != nil {
 		return err
 	}
@@ -115,7 +115,7 @@ func up(configPath string) error {
 		len(cfg.Networks), len(cfg.Containers), owner.User, stateDir)
 
 	// preflight: validate the plan's link anchors against the LIVE init netns (read-only) --
-	// still fail-fast, but this is the first thing that reads the kernel, kept out of buildModel.
+	// still fail-fast, but this is the first thing that reads the kernel, kept out of buildPlan.
 	if err := preflightAnchors(plan); err != nil {
 		return err
 	}
@@ -139,7 +139,7 @@ func up(configPath string) error {
 
 // preflightAnchors validates every link's host-side anchor against the live init netns
 // (exists, right kind, not wireless/primary) -- read-only kernel IO, run as root in the init
-// netns before any mutation. The pure cross-spec conflicts were caught in buildModel; this is
+// netns before any mutation. The pure cross-spec conflicts were caught in buildPlan; this is
 // the host-dependent half, kept out of the pure lowering and pushed to its own phase.
 func preflightAnchors(plan *Plan) error {
 	var links []dp.LinkSpec

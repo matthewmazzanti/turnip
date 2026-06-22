@@ -11,7 +11,7 @@ turnip.json ──▶  config  ──▶  Plan  ──▶  apply  ──▶  ker
                 (parse +     (lower,    (drive netns    (netlink / nft /
                  validate)    pure)      Set by fd)      sysctl / mount)
                     │           │           │                 │
-              internal/config  model.go   apply.go      internal/dataplane
+              internal/config  plan.go   apply.go      internal/dataplane
                                           up.go         internal/netns
                                        (the shell)      (the mechanism)
 ```
@@ -45,11 +45,11 @@ Validation here is *structural* (shape, types, referential integrity within the
 schema). Validation that needs the lowered form — ifname lengths, unwired flow
 shapes, link anchors — happens in Layer 2.
 
-## Layer 2 — Plan (build_model, the lowering)
+## Layer 2 — Plan (buildPlan, the lowering)
 
-**Where:** `cmd/turnip/model.go`. **Purity:** pure — no IO, no fds, no root.
+**Where:** `cmd/turnip/plan.go`. **Purity:** pure — no IO, no fds, no root.
 
-`buildModel(cfg, owner, stateDir) → *Plan` resolves the config into the
+`buildPlan(cfg, owner, stateDir) → *Plan` resolves the config into the
 fully-concrete dataplane description. Where the config is symbolic-and-nested, the
 `Plan` is **concrete-and-grouped-by-consumer**:
 
@@ -69,9 +69,11 @@ The `Plan` types (`Plan`, `NetworkPlan`, `EndpointPlan`, `UplinkPlan`,
 and paths the shell needs. They live in `cmd` (not `dataplane`) so the dataplane
 library stays config-agnostic.
 
-**Everything fallible happens here.** `routerIf` rejects an over-IFNAMSIZ name,
-`buildFlows` rejects icmp/`port="any"`, `ValidateLinkAnchors` checks every anchor —
-all *before* `up` bootstraps a single netns. A bad config fails with nothing mutated.
+**Everything fallible *without the kernel* happens here.** `routerIf` rejects an
+over-IFNAMSIZ name, `buildFlows` rejects icmp/`port="any"`, `ValidateLinkConflicts`
+rejects a macvlan/ipvlan parent clash — all *before* `up` reads or mutates anything. (The
+host-dependent link-anchor probe is a separate read-only preflight phase — see "The shell".)
+A bad config fails with nothing touched.
 
 This purity is the testability win: the whole resolution is assertable on a `Plan`
 literal with no VM and no root (Layer-1 unit tests). The `Plan` is also the shared
@@ -133,16 +135,16 @@ dataplane's.
 `up` runs on a **pure → read → write** axis:
 
 ```
-up = loadConfig → resolveRuntime → buildModel → preflightAnchors → clearHostEdge → Bootstrap → applyPlan
+up = loadConfig → resolveRuntime → buildPlan → preflightAnchors → clearHostEdge → Bootstrap → applyPlan
        (env/IO)      (env/IO)        (pure)        (read host)       └──────────── write ──────────────┘
 ```
 
-`buildModel` is pure (no kernel). `preflightAnchors` is the *first* kernel touch but
+`buildPlan` is pure (no kernel). `preflightAnchors` is the *first* kernel touch but
 **read-only** — it validates the plan's link anchors against the live init netns, still
 fail-fast, before anything is mutated. Then the write phase (`clearHostEdge` → `Bootstrap` →
 `applyPlan`) changes the world. The kernel-touch rule from "Where the plan/dataplane line
 falls" is what splits link validation across these phases: the pure cross-spec conflicts
-(`ValidateLinkConflicts`, macvlan⊕ipvlan can't share a parent) run in `buildModel`; the
+(`ValidateLinkConflicts`, macvlan⊕ipvlan can't share a parent) run in `buildPlan`; the
 host-anchor probe (`ValidateLinkAnchors` — exists, right kind, not wireless/primary) reads the
 kernel, so it's preflight.
 
@@ -182,7 +184,7 @@ a capability the shell sequences:
 `fd int` and concrete values and acts. The package is **almost entirely effectful** —
 its job is kernel ops by fd. The one purely-derived artifact that was a *plain*
 transform of names, the router sysctl set, moved *out* to lowering (`routerSysctls` in
-`model.go`); `WriteSysctls` (the kernel write) stays. The pure builders that remain
+`plan.go`); `WriteSysctls` (the kernel write) stays. The pure builders that remain
 (`BuildNFT`, `ValidateLinkAnchors`) consume dataplane's own policy types, so they sit
 here for now. That fd-level seam is exactly why apply, not dataplane, owns the `Plan`:
 apply's one real dependency is the `Set`, the thing dataplane deliberately doesn't know.
@@ -228,7 +230,7 @@ state lives under `runtime.state_dir`: `routers/<net>`, `containers/<name>/netns
 
 - **The boundary is a type.** Takes `*netns.Set` ⇒ apply; returns/consumes a `*Plan` ⇒
   lowering. No interleaving, no trust-the-comment.
-- **Fail-fast is structural.** Resolution errors surface from `buildModel` before
+- **Fail-fast is structural.** Resolution errors surface from `buildPlan` before
   `Bootstrap`, so a bad config never half-builds a fabric.
 - **Testable without root.** The entire config→dataplane resolution is a pure function
   over a `Plan` literal.
@@ -241,7 +243,7 @@ state lives under `runtime.state_dir`: `routers/<net>`, `containers/<name>/netns
 | concern | package / file | pure? |
 |---|---|---|
 | model + structural validation | `internal/config` | ✓ |
-| lowering (`buildModel`) + `Plan` types | `cmd/turnip/model.go` | ✓ |
+| lowering (`buildPlan`) + `Plan` types | `cmd/turnip/plan.go` | ✓ |
 | apply driver | `cmd/turnip/apply.go` | ✗ |
 | shell: up / down / runtime resolution | `cmd/turnip/{up,down}.go`, `main.go` | ✗ |
 | dataplane capabilities (fd-level) | `internal/dataplane` | mixed* |
@@ -249,4 +251,4 @@ state lives under `runtime.state_dir`: `routers/<net>`, `containers/<name>/netns
 
 \* `dataplane` is mostly effectful fd primitives; the two pure builders left
 (`BuildNFT`, `ValidateLinkAnchors`) consume its own policy types. The plain-typed
-sysctl builder moved to lowering (`routerSysctls` in `model.go`).
+sysctl builder moved to lowering (`routerSysctls` in `plan.go`).
