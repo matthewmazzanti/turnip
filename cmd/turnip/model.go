@@ -30,7 +30,7 @@ type Plan struct {
 // NetworkPlan is one network's resolved L3 wiring in its router netns: the gateway, the routed
 // veths into attached containers, the optional host edge, and the fully-built router policy
 // artifacts (the sysctl set + the nft ruleset). apply only pushes these -- the pure builders
-// (RouterSysctls/BuildNFT) ran here, in lowering.
+// (routerSysctls here, dp.BuildNFT) ran in lowering.
 type NetworkPlan struct {
 	Name      string
 	Router    string // the router netns key, "router:<name>"
@@ -178,7 +178,7 @@ func lowerNetwork(name string, net config.Network, counts map[string]int) (Netwo
 	if err != nil {
 		return np, err
 	}
-	np.Sysctls = dp.RouterSysctls(routerIfs, uplinkRouterIf)
+	np.Sysctls = routerSysctls(routerIfs, uplinkRouterIf)
 	np.NFT = dp.BuildNFT(flows, edge)
 	return np, nil
 }
@@ -282,6 +282,38 @@ func interfaceCounts(cfg *config.Turnip) map[string]int {
 // default, so the implicit case can't conflict).
 func ownsDefault(configuredDefault bool, ifaceCount int) bool {
 	return configuredDefault || ifaceCount == 1
+}
+
+// routerSysctls is the sysctl set for a router netns:
+//
+//   - ip_forward on (we route);
+//   - all.rp_filter=0 so the per-veth values are authoritative (the kernel uses
+//     max(conf.all, conf.<if>), and a fresh netns may not default all to 0);
+//   - ipv6 disabled router-wide (the routed model has no L2 path between containers, so
+//     killing v6 on the router severs inter-container v6);
+//   - then per fabric veth: proxy_arp=1 (answer the gateway ARP / a future uplink) and
+//     rp_filter=1 (STRICT -- the anti-spoof pin, paired with that veth's /32 route).
+//
+// Pure lowering -- the result is written (by dataplane.WriteSysctls, in apply) AFTER the veths
+// exist (the per-veth conf.<if> dirs). uplinkRouterIf is the uplink veth's router-side name (or
+// "" for no uplink); it gets strict rp_filter too -- the reverse path for an internet source is
+// the default route = the uplink, while a container-spoofed source resolves to its own /32 veth
+// (not the uplink) and is dropped (the anti-spoof pin).
+func routerSysctls(routerIfs []string, uplinkRouterIf string) map[string]string {
+	s := map[string]string{
+		"net.ipv4.ip_forward":                "1",
+		"net.ipv4.conf.all.rp_filter":        "0",
+		"net.ipv6.conf.all.disable_ipv6":     "1",
+		"net.ipv6.conf.default.disable_ipv6": "1",
+	}
+	for _, rif := range routerIfs {
+		s["net.ipv4.conf."+rif+".proxy_arp"] = "1"
+		s["net.ipv4.conf."+rif+".rp_filter"] = "1"
+	}
+	if uplinkRouterIf != "" {
+		s["net.ipv4.conf."+uplinkRouterIf+".rp_filter"] = "1"
+	}
+	return s
 }
 
 // buildFlows lowers a network's flows to the dataplane Flow list, resolving each endpoint

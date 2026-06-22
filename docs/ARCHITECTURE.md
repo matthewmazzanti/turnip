@@ -139,8 +139,8 @@ a capability the shell sequences:
 | `Connect(routerFd, contFd, gw, Endpoint)` | a routed veth pair across two netns |
 | `HostEdgeConnect(routerFd, Uplink)` | the `/31` veth across init↔router |
 | `ConfigureHostNAT(net, Uplink, ips, dnats)` | host masquerade + container routes + ingress DNAT |
-| `RouterSysctls(...)` / `WriteSysctls(map)` | build / write the per-veth sysctls |
-| `BuildNFT(flows, edge)` / *(caller `nftlib.Load`)* | build the `inet turnip` ruleset |
+| `WriteSysctls(map)` | write a resolved sysctl map into the netns (`/proc/sys`) |
+| `BuildNFT(flows, edge)` / *(caller `nftlib.Load`)* | build / load the `inet turnip` ruleset |
 | `LinkConnect(contFd, LinkSpec)` | a container link (veth/macvlan/ipvlan/phys) |
 | `ValidateLinkAnchors([]LinkSpec)` | fail-fast anchor checks (pure) |
 | `TeardownHostEdge(net, hostIf)` | remove the init-netns uplink veth + nat zones |
@@ -148,11 +148,13 @@ a capability the shell sequences:
 **Doesn't:** know about `config` (it speaks `Flow`/`Endpoint`/`Gateway`, never
 `Network`/`Attachment`); know about the `netns.Set`, the netns naming scheme
 (`router:` / `container:`), bootstrapping, or pinning; decide *order*. It takes a raw
-`fd int` and concrete values and acts. It also splits cleanly into **pure builders**
-(`BuildNFT`, `RouterSysctls` — return data) and **effectful primitives** (the rest —
-take an fd, do netlink/nft/sysctl). That fd-level seam is exactly why apply, not
-dataplane, owns the `Plan`: apply's one real dependency is the `Set`, the thing
-dataplane deliberately doesn't know.
+`fd int` and concrete values and acts. The package is **almost entirely effectful** —
+its job is kernel ops by fd. The one purely-derived artifact that was a *plain*
+transform of names, the router sysctl set, moved *out* to lowering (`routerSysctls` in
+`model.go`); `WriteSysctls` (the kernel write) stays. The pure builders that remain
+(`BuildNFT`, `ValidateLinkAnchors`) consume dataplane's own policy types, so they sit
+here for now. That fd-level seam is exactly why apply, not dataplane, owns the `Plan`:
+apply's one real dependency is the `Set`, the thing dataplane deliberately doesn't know.
 
 ## internal/netns — netns + fd management
 
@@ -214,5 +216,6 @@ state lives under `runtime.state_dir`: `routers/<net>`, `containers/<name>/netns
 | dataplane capabilities (fd-level) | `internal/dataplane` | mixed* |
 | netns + fd lifecycle, re-exec boundary | `internal/netns` | ✗ |
 
-\* `dataplane` splits into pure builders (`BuildNFT`, `RouterSysctls`,
-`ValidateLinkAnchors`) and effectful fd primitives.
+\* `dataplane` is mostly effectful fd primitives; the two pure builders left
+(`BuildNFT`, `ValidateLinkAnchors`) consume its own policy types. The plain-typed
+sysctl builder moved to lowering (`routerSysctls` in `model.go`).
