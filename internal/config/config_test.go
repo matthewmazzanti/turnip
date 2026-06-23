@@ -13,7 +13,7 @@ const exampleJSON = `{
     "lan": {
       "gateway": "10.0.0.1",
       "gateway_if": "gw0",
-      "uplink": { "host_if": "veth-lan-host", "router_if": "vethR-lan-up", "link": "169.254.1.0", "nat": true },
+      "uplink": { "host_if": "veth-lan-host", "router_if": "vethR-lan-up", "link": "169.254.1.0" },
       "attach": {
         "zwave": { "ip": "10.0.0.11", "interface": "eth0", "egress": [ { "proto": ["udp", "tcp"], "port": 53 } ] },
         "hass":  { "ip": "10.0.0.12", "interface": "eth0", "egress": true },

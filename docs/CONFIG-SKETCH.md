@@ -60,7 +60,7 @@ on-disk artifact `turnip.example.json`.
     "lan": {
       "gateway": "10.0.0.1",
       "fabric_if": "fabric0",
-      "uplink": { "host_if": "veth-lan-host", "router_if": "vethR-lan-up", "link": "169.254.1.0/31", "nat": true },
+      "uplink": { "host_if": "veth-lan-host", "router_if": "vethR-lan-up", "link": "169.254.1.0/31" },
       "attach": {
         "zwave": { "ip": "10.0.0.11", "interface": "eth0", "egress": [ { "proto": ["udp", "tcp"], "port": 53 } ] },
         "hass":  { "ip": "10.0.0.12", "interface": "eth0", "egress": true },
@@ -142,7 +142,7 @@ need default-deny, use a router network.
       "type": "bridge",
       "subnet": "10.2.0.0/24",
       "gateway": "10.2.0.1",
-      "uplink": { "host_if": "veth-iot-host", "router_if": "vethR-iot-up", "link": "169.254.2.0/31", "nat": true },
+      "uplink": { "host_if": "veth-iot-host", "router_if": "vethR-iot-up", "link": "169.254.2.0/31" },
       "attach": {
         "sensor": { "ip": "10.2.0.10", "interface": "eth0", "egress": true }
       }
@@ -479,8 +479,10 @@ topology, not configurable.
   policy between two routers (never implied by co-membership).
 - **DNS.** A public resolver = an `egress` rule on udp/53 (+tcp/53). A host-local
   resolver is a different shape (egress/ingress to the host addr). Per deployment.
-- **NAT vs routed egress.** `nat = true` (masquerade) is the home default; routed
-  (`nat = false`) needs a static route for the subnet on your LAN router.
+- **NAT vs routed egress.** The host edge always masquerades today; there is **no `nat`
+  knob in the schema** (it was removed rather than silently no-op). When routed egress is
+  wired, `nat = false` would skip masquerade and instead need a static route for the subnet
+  on your LAN router.
 - **Per-flow direction.** *Decided:* `flows` are **directional** (`from` → `to`
   initiation only; conntrack carries the return path). The other direction is a
   second explicit flow. (Least-privilege: the directional `from`/`to` keys mean

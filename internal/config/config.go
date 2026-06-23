@@ -268,7 +268,9 @@ type LinkBase struct {
 // set kept closed to this package by the unexported isLink. Ownership is implied by type, never
 // a flag: veth/macvlan/ipvlan are virtual => owned; phys is physical => borrowed. The variants
 // are pure data -- behavior is dispatched by type switch at use-sites (validateLink in
-// validate.go, buildLinkSpec in cmd), not by methods. Base() exposes the shared fields.
+// validate.go, buildLinkSpec in cmd), not by methods. Base() exposes the shared fields. Each
+// variant carries a `Type` field only so strict decode accepts the "type" key; it's the
+// discriminator (read once in unmarshalLink), never read after dispatch.
 type Link interface {
 	isLink()
 	Base() *LinkBase
@@ -371,16 +373,13 @@ func unmarshalLink(b []byte) (Link, error) {
 // --- the network (a router or bridge netns) -------------------------------
 
 // Uplink is a veth between this network's router netns and the host netns -- what makes
-// egress/ingress possible, and what makes the run rootful.
+// egress/ingress possible, and what makes the run rootful. The host edge always masquerades
+// (routed egress, the deferred nat=false option, isn't wired -- see docs/CONFIG-SKETCH.md).
 type Uplink struct {
 	HostIf   string     `json:"host_if"`
 	RouterIf string     `json:"router_if"`
 	Link     netip.Addr `json:"link"` // base of the point-to-point /31 (ends are Link and Link+1)
-	Nat      *bool      `json:"nat"`  // masquerade; default true (false = routed)
 }
-
-// NAT reports the effective masquerade setting (default true when unset).
-func (u *Uplink) NAT() bool { return u.Nat == nil || *u.Nat }
 
 // Network is a router netns (default) or a bridge netns. Everything stateful is
 // network-scoped: the nft table, the gateway, the uplink/DNAT, so flows and attach are
