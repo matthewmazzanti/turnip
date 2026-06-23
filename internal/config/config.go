@@ -276,12 +276,14 @@ type LinkBase struct {
 	Default bool           `json:"default"` // owns the container default route
 }
 
-// Link is the discriminated union (on "type"). Ownership is implied by type, never a flag:
-// veth/macvlan/ipvlan are virtual => owned; phys is physical => borrowed.
+// Link is a sealed sum type (discriminated on "type"): one of the concrete structs below, the
+// set kept closed to this package by the unexported isLink. Ownership is implied by type, never
+// a flag: veth/macvlan/ipvlan are virtual => owned; phys is physical => borrowed. The variants
+// are pure data -- behavior is dispatched by type switch at use-sites (validateLink in
+// validate.go, buildLinkSpec in cmd), not by methods. Base() exposes the shared fields.
 type Link interface {
+	isLink()
 	Base() *LinkBase
-	Kind() LinkType
-	validate(cname string) error
 }
 
 // VethLink: a veth into a host bridge (Bridge) or the root netns (Peer == "host").
@@ -320,10 +322,11 @@ func (l *MacvlanLink) Base() *LinkBase { return &l.LinkBase }
 func (l *IpvlanLink) Base() *LinkBase  { return &l.LinkBase }
 func (l *PhysLink) Base() *LinkBase    { return &l.LinkBase }
 
-func (l *VethLink) Kind() LinkType    { return LinkVeth }
-func (l *MacvlanLink) Kind() LinkType { return LinkMacvlan }
-func (l *IpvlanLink) Kind() LinkType  { return LinkIpvlan }
-func (l *PhysLink) Kind() LinkType    { return LinkPhys }
+// isLink seals the sum type: only this package's structs satisfy Link.
+func (*VethLink) isLink()    {}
+func (*MacvlanLink) isLink() {}
+func (*IpvlanLink) isLink()  {}
+func (*PhysLink) isLink()    {}
 
 // --- container -------------------------------------------------------------
 

@@ -102,7 +102,7 @@ func TestLinksUnionShape(t *testing.T) {
 	]}},"networks":{}}`)
 	links := fab.Containers["box"].Links
 	mv, ok := links[0].(*MacvlanLink)
-	if !ok || mv.Kind() != LinkMacvlan {
+	if !ok {
 		t.Fatalf("link0 = %T, want *MacvlanLink", links[0])
 	}
 	if mv.Mode != MacvlanBridge {

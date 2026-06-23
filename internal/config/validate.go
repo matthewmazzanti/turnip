@@ -30,7 +30,7 @@ func Parse(data []byte) (*Turnip, error) {
 func (t *Turnip) Validate() error {
 	for cname, c := range t.Containers {
 		for _, l := range c.Links {
-			if err := l.validate(cname); err != nil {
+			if err := validateLink(cname, l); err != nil {
 				return err
 			}
 		}
@@ -229,48 +229,41 @@ func (b *LinkBase) validate(cname string) error {
 	return nil
 }
 
-func (l *VethLink) validate(cname string) error {
-	if err := l.LinkBase.validate(cname); err != nil {
+// validateLink runs a container link's field-level checks: the shared base, then the per-type
+// rules. A type switch over the sealed Link sum type -- the default fails closed if a variant
+// is ever added without a case here.
+func validateLink(cname string, l Link) error {
+	if err := l.Base().validate(cname); err != nil {
 		return err
 	}
-	hasBridge, hasPeer := l.Bridge != "", l.Peer != ""
-	if hasBridge == hasPeer {
-		return fmt.Errorf(`%s: veth link %q needs exactly one of "bridge" or "peer":"host"`, cname, l.Name)
+	switch lk := l.(type) {
+	case *VethLink:
+		hasBridge, hasPeer := lk.Bridge != "", lk.Peer != ""
+		if hasBridge == hasPeer {
+			return fmt.Errorf(`%s: veth link %q needs exactly one of "bridge" or "peer":"host"`, cname, lk.Name)
+		}
+		if hasPeer && lk.Peer != "host" {
+			return fmt.Errorf(`%s: veth link %q peer must be "host"`, cname, lk.Name)
+		}
+		if hasBridge {
+			return validateIfName(cname+" bridge", lk.Bridge)
+		}
+		return nil
+	case *MacvlanLink:
+		if !lk.Mode.valid() {
+			return fmt.Errorf("%s: link %q macvlan mode %q invalid", cname, lk.Name, lk.Mode)
+		}
+		return validateIfName(cname+" parent", lk.Parent)
+	case *IpvlanLink:
+		if !lk.Mode.valid() {
+			return fmt.Errorf("%s: link %q ipvlan mode %q invalid", cname, lk.Name, lk.Mode)
+		}
+		return validateIfName(cname+" parent", lk.Parent)
+	case *PhysLink:
+		return validateIfName(cname+" dev", lk.Dev)
+	default:
+		return fmt.Errorf("%s: unhandled link type %T", cname, l)
 	}
-	if hasPeer && l.Peer != "host" {
-		return fmt.Errorf(`%s: veth link %q peer must be "host"`, cname, l.Name)
-	}
-	if hasBridge {
-		return validateIfName(cname+" bridge", l.Bridge)
-	}
-	return nil
-}
-
-func (l *MacvlanLink) validate(cname string) error {
-	if err := l.LinkBase.validate(cname); err != nil {
-		return err
-	}
-	if !l.Mode.valid() {
-		return fmt.Errorf("%s: link %q macvlan mode %q invalid", cname, l.Name, l.Mode)
-	}
-	return validateIfName(cname+" parent", l.Parent)
-}
-
-func (l *IpvlanLink) validate(cname string) error {
-	if err := l.LinkBase.validate(cname); err != nil {
-		return err
-	}
-	if !l.Mode.valid() {
-		return fmt.Errorf("%s: link %q ipvlan mode %q invalid", cname, l.Name, l.Mode)
-	}
-	return validateIfName(cname+" parent", l.Parent)
-}
-
-func (l *PhysLink) validate(cname string) error {
-	if err := l.LinkBase.validate(cname); err != nil {
-		return err
-	}
-	return validateIfName(cname+" dev", l.Dev)
 }
 
 // --- cross-cutting (container-global) --------------------------------------
