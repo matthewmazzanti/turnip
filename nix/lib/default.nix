@@ -8,9 +8,6 @@
 # Components:
 #   mkOutputs -- describe one system's flake outputs once; transpose to the schema. (./outputs.nix)
 #                Takes its own `systems` arg at the call site.
-#
-# (The uv2nix helper `mkUvEnv` lived here too; it's parked under ../old/lib/python-env.nix
-# with the rest of the Python implementation during the Go rewrite.)
 { inputs }:
 let
   nixpkgs = inputs.nixpkgs;

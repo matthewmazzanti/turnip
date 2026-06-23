@@ -34,8 +34,8 @@ Two axes to keep separate while reading this:
 The declarative `turnip.json` parsed into the `Turnip` graph — `runtime`, `containers`,
 `networks` with their `attach` rosters, `flows`, `uplink`, and per-container `links`.
 This is the user's **intent**: symbolic (containers named, not addressed), optional
-(defaults unfilled), and nested by *ownership* (a network's ingress lives under the
-attachment that owns it).
+(defaults unfilled), and nested by *ownership* (a network's policy — internal, egress,
+ingress — lives in its one `flows` list).
 
 The security invariants are **code, not config** (rp_filter-strict, ipv6-off, the
 implicit gateway/icmp allows) — see [CONFIG-SKETCH](CONFIG-SKETCH.md). The config
@@ -60,8 +60,8 @@ fully-concrete dataplane description. Where the config is symbolic-and-nested, t
 - **Defaulting with global context.** `Default` route ownership folds in the
   container's interface count *across all networks and links* (sole interface ⇒
   default), which a single `config.Network` can't see.
-- **Re-grouping.** Ingress, stored per-attachment in the config, flattens into
-  NAT-oriented `DNAT` records; egress/ingress allows gather into an `Edge`.
+- **Re-grouping.** Ingress flows flatten into NAT-oriented `DNAT` records; the
+  egress/ingress flow allows gather into an `Edge`.
 
 The `Plan` types (`Plan`, `NetworkPlan`, `EndpointPlan`, `UplinkPlan`,
 `ContainerPlan`) are an **aggregate of `dataplane` structs** — `dp.Gateway`,
@@ -69,11 +69,10 @@ The `Plan` types (`Plan`, `NetworkPlan`, `EndpointPlan`, `UplinkPlan`,
 and paths the shell needs. They live in `cmd` (not `dataplane`) so the dataplane
 library stays config-agnostic.
 
-**Everything fallible *without the kernel* happens here.** `routerIf` rejects an
-over-IFNAMSIZ name, `buildFlows` rejects icmp/`port="any"`, `ValidateLinkConflicts`
-rejects a macvlan/ipvlan parent clash — all *before* `up` reads or mutates anything. (The
-host-dependent link-anchor probe is a separate read-only preflight phase — see "The shell".)
-A bad config fails with nothing touched.
+**Everything fallible *without the kernel* happens here.** `routerIf`/`linkHostIf` reject an
+over-IFNAMSIZ name and `buildFlows` rejects icmp/`port="any"` — all *before* `up` reads or
+mutates anything. (The host-dependent link-anchor probe is a separate read-only preflight phase
+— see "The shell".) A bad config fails with nothing touched.
 
 This purity is the testability win: the whole resolution is assertable on a `Plan`
 literal with no VM and no root (Layer-1 unit tests). The `Plan` is also the shared
@@ -143,10 +142,9 @@ up = loadConfig → resolveRuntime → buildPlan → preflightAnchors → clearH
 **read-only** — it validates the plan's link anchors against the live init netns, still
 fail-fast, before anything is mutated. Then the write phase (`clearHostEdge` → `Bootstrap` →
 `applyPlan`) changes the world. The kernel-touch rule from "Where the plan/dataplane line
-falls" is what splits link validation across these phases: the pure cross-spec conflicts
-(`ValidateLinkConflicts`, macvlan⊕ipvlan can't share a parent) run in `buildPlan`; the
-host-anchor probe (`ValidateLinkAnchors` — exists, right kind, not wireless/primary) reads the
-kernel, so it's preflight.
+falls" is what places link validation: the IFNAMSIZ checks are pure (`buildPlan`); the
+host-anchor probe (`ValidateLinkAnchors` — the bridge exists and is a bridge) reads the kernel,
+so it's preflight.
 
 `up = down + build` (clean slate): `clearHostEdge` scrubs prior init-netns host-edge
 state, and `Bootstrap` mints the netns fresh. `down` is the teardown half —
@@ -174,7 +172,7 @@ a capability the shell sequences:
 | `ConfigureHostNAT(net, Uplink, ips, dnats)` | host masquerade + container routes + ingress DNAT |
 | `WriteSysctls(map)` | write a resolved sysctl map into the netns (`/proc/sys`) |
 | `BuildNFT(flows, edge)` / *(caller `nftlib.Load`)* | build / load the `inet turnip` ruleset |
-| `LinkConnect(contFd, LinkSpec)` | a container link (veth/macvlan/ipvlan/phys) |
+| `LinkConnect(contFd, LinkSpec)` | a container veth link (into a host bridge, or the root netns) |
 | `ValidateLinkAnchors([]LinkSpec)` | fail-fast anchor checks (pure) |
 | `TeardownHostEdge(net, hostIf)` | remove the init-netns uplink veth + nat zones |
 

@@ -65,7 +65,7 @@ func TestInterfaceCounts(t *testing.T) {
 	// hass: one attachment (sole iface). box: a (default) link + an attachment (two ifaces;
 	// the validator requires exactly one marked default once a container is multi-homed).
 	cfg := mustParse(t, `{"containers":{"hass":{},
-	  "box":{"links":[{"type":"phys","dev":"enp3s0","name":"eth9","address":"192.168.9.10/24","default":true}]}},
+	  "box":{"links":[{"type":"veth","peer":"host","name":"eth9","address":"192.168.9.10/24","default":true}]}},
 	  "networks":{"lan":{"gateway":"10.0.0.1","gateway_if":"gw0","attach":{
 	    "hass":{"ip":"10.0.0.12","interface":"eth0"},
 	    "box":{"ip":"10.0.0.20","interface":"eth0"}}}}}`)
@@ -97,7 +97,7 @@ func TestOwnsDefault(t *testing.T) {
 func TestBuildFlows(t *testing.T) {
 	cfg := mustParse(t, `{"containers":{"a":{},"b":{}},"networks":{"n":{"gateway":"10.0.0.1","gateway_if":"gw0",
 	  "attach":{"a":{"ip":"10.0.0.5","interface":"eth0"},"b":{"ip":"10.0.0.6","interface":"eth0"}},
-	  "flows":[{"from":"a","to":"b","proto":"tcp","port":443}]}}}`)
+	  "flows":[{"type":"internal","from":"a","to":"b","proto":"tcp","port":443}]}}}`)
 	flows, err := buildFlows(cfg.Networks["n"])
 	if err != nil {
 		t.Fatalf("buildFlows: %v", err)
@@ -115,8 +115,8 @@ func TestBuildFlows(t *testing.T) {
 func TestBuildFlowsRejectsUnwired(t *testing.T) {
 	// icmp and port="any" both need a second nft map shape that isn't wired yet.
 	for _, flow := range []string{
-		`{"from":"a","to":"b","proto":"icmp","port":1}`,
-		`{"from":"a","to":"b","proto":"tcp","port":"any"}`,
+		`{"type":"internal","from":"a","to":"b","proto":"icmp","port":1}`,
+		`{"type":"internal","from":"a","to":"b","proto":"tcp","port":"any"}`,
 	} {
 		cfg := mustParse(t, `{"containers":{"a":{},"b":{}},"networks":{"n":{"gateway":"10.0.0.1","gateway_if":"gw0",
 		  "attach":{"a":{"ip":"10.0.0.5","interface":"eth0"},"b":{"ip":"10.0.0.6","interface":"eth0"}},
@@ -132,44 +132,36 @@ func TestBuildFlowsRejectsUnwired(t *testing.T) {
 func TestBuildLinkSpecs(t *testing.T) {
 	cfg := mustParse(t, `{"containers":{"box":{"links":[
 	  {"type":"veth","bridge":"br-lan","name":"eth0","address":"192.168.50.10/24"},
-	  {"type":"veth","peer":"host","name":"eth1","address":"10.9.0.2/30"},
-	  {"type":"macvlan","parent":"eth0","name":"lan0","address":"192.168.1.12/24","mode":"private"},
-	  {"type":"ipvlan","parent":"eth1","name":"lan1","address":"192.168.2.12/24"},
-	  {"type":"phys","dev":"enp3s0","name":"eth9","address":"192.168.9.10/24","default":true}
+	  {"type":"veth","peer":"host","name":"eth1","address":"10.9.0.2/30","default":true}
 	]}},"networks":{}}`)
 	specs, err := buildLinkSpecs(cfg)
 	if err != nil {
 		t.Fatalf("buildLinkSpecs: %v", err)
 	}
 	box := specs["box"]
-	if len(box) != 5 {
-		t.Fatalf("got %d specs, want 5", len(box))
+	if len(box) != 2 {
+		t.Fatalf("got %d specs, want 2", len(box))
 	}
 
-	// kind + the host-side anchor each kind selects.
+	// kind + the host-side end each veth anchor selects.
 	checks := []struct {
-		i              int
-		kind, hostIf   string
-		bridge, parent string
-		mode, dev      string
+		i            int
+		kind, hostIf string
+		bridge       string
 	}{
-		{0, "veth-bridge", "vethL-box-eth0", "br-lan", "", "", ""},
-		{1, "veth-host", "vethL-box-eth1", "", "", "", ""},
-		{2, "macvlan", "", "", "eth0", "private", ""},
-		{3, "ipvlan", "", "", "eth1", "l2", ""},
-		{4, "phys", "", "", "", "", "enp3s0"},
+		{0, "veth-bridge", "vethL-box-eth0", "br-lan"},
+		{1, "veth-host", "vethL-box-eth1", ""},
 	}
 	for _, c := range checks {
 		s := box[c.i]
-		if s.Kind != c.kind || s.HostIf != c.hostIf || s.Bridge != c.bridge ||
-			s.Parent != c.parent || s.Mode != c.mode || s.Dev != c.dev {
-			t.Errorf("spec[%d] = %+v, want kind=%q hostIf=%q bridge=%q parent=%q mode=%q dev=%q",
-				c.i, s, c.kind, c.hostIf, c.bridge, c.parent, c.mode, c.dev)
+		if s.Kind != c.kind || s.HostIf != c.hostIf || s.Bridge != c.bridge {
+			t.Errorf("spec[%d] = %+v, want kind=%q hostIf=%q bridge=%q",
+				c.i, s, c.kind, c.hostIf, c.bridge)
 		}
 	}
-	// phys carries default + the parsed address through.
-	if !box[4].Default || box[4].Address.String() != "192.168.9.10/24" {
-		t.Errorf("phys spec = %+v, want default + 192.168.9.10/24", box[4])
+	// the veth-host link carries default + the parsed address through.
+	if !box[1].Default || box[1].Address.String() != "10.9.0.2/30" {
+		t.Errorf("veth-host spec = %+v, want default + 10.9.0.2/30", box[1])
 	}
 }
 
@@ -223,9 +215,12 @@ func TestBuildEgressAllows(t *testing.T) {
 	  "gateway":"10.0.0.1","gateway_if":"gw0",
 	  "uplink":{"host_if":"h","router_if":"r","link":"169.254.1.0"},
 	  "attach":{
-	    "out":{"ip":"10.0.0.11","interface":"eth0","egress":true},
-	    "scoped":{"ip":"10.0.0.12","interface":"eth0","egress":[{"proto":["udp","tcp"],"port":53}]},
-	    "quiet":{"ip":"10.0.0.13","interface":"eth0"}}}}}`)
+	    "out":{"ip":"10.0.0.11","interface":"eth0"},
+	    "scoped":{"ip":"10.0.0.12","interface":"eth0"},
+	    "quiet":{"ip":"10.0.0.13","interface":"eth0"}},
+	  "flows":[
+	    {"type":"egress","from":"out","proto":"any"},
+	    {"type":"egress","from":"scoped","proto":["udp","tcp"],"port":53}]}}}`)
 	allows := buildEgressAllows(cfg.Networks["lan"])
 
 	// quiet has no egress -> not present. out is All. scoped has one (udp,tcp):53 rule.
@@ -252,8 +247,8 @@ func TestBuildIngress(t *testing.T) {
 	cfg := mustParse(t, `{"containers":{"svc":{}},"networks":{"lan":{
 	  "gateway":"10.0.0.1","gateway_if":"gw0",
 	  "uplink":{"host_if":"h","router_if":"r","link":"169.254.1.0"},
-	  "attach":{"svc":{"ip":"10.0.0.13","interface":"eth0",
-	    "ingress":[{"proto":"tcp","host_port":8080,"port":80}]}}}}}`)
+	  "attach":{"svc":{"ip":"10.0.0.13","interface":"eth0"}},
+	  "flows":[{"type":"ingress","to":"svc","proto":"tcp","host_port":8080,"port":80}]}}}`)
 	dnats, allows := buildIngress(cfg.Networks["lan"])
 	if len(dnats) != 1 || len(allows) != 1 {
 		t.Fatalf("got %d dnats, %d allows; want 1 each", len(dnats), len(allows))
@@ -279,7 +274,7 @@ func TestHostsFile(t *testing.T) {
 	    "zwave":{"ip":"10.0.0.11","interface":"eth0"},
 	    "hass":{"ip":"10.0.0.12","interface":"eth0"},
 	    "proxy":{"ip":"10.0.0.13","interface":"eth0"}},
-	    "flows":[{"from":"zwave","to":"hass","proto":"tcp","port":443}]},
+	    "flows":[{"type":"internal","from":"zwave","to":"hass","proto":"tcp","port":443}]},
 	  "iot":{"gateway":"10.1.0.1","gateway_if":"gw1","attach":{
 	    "zwave":{"ip":"10.1.0.11","interface":"eth1","default":true}}}}}`)
 	got := hostsFile(cfg, "zwave")

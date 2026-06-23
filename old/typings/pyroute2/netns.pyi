@@ -1,6 +1,0 @@
-# Partial local stub for pyroute2.netns -- scoped to the lifecycle helpers
-# netns.py uses (create / remove). pyroute2 ships no py.typed, and pyright's
-# source inference leaves these as unknown module attributes; pin just our
-# surface. Both take a full path (we pass $HOME/netns/<name> verbatim).
-def create(netns: str, *args: object, **kwargs: object) -> None: ...
-def remove(netns: str, *args: object, **kwargs: object) -> None: ...

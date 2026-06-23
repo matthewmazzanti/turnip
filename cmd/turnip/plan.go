@@ -81,18 +81,10 @@ func buildPlan(cfg *config.Turnip, owner netns.Owner, stateDir string) (*Plan, e
 		Owner: owner,
 	}
 
-	// links first: build every container's specs and validate the pure cross-container
-	// conflicts (macvlan/ipvlan can't share a parent) before distributing per container below.
+	// links first: build every container's veth specs (their IFNAMSIZ resolution can fail).
 	// The host-anchor checks happen later, in preflightAnchors (they read the live host).
 	linkSpecs, err := buildLinkSpecs(cfg)
 	if err != nil {
-		return nil, err
-	}
-	var allLinks []dp.LinkSpec
-	for _, cname := range sortedKeys(linkSpecs) {
-		allLinks = append(allLinks, linkSpecs[cname]...)
-	}
-	if err := dp.ValidateLinkConflicts(allLinks); err != nil {
 		return nil, err
 	}
 
@@ -257,12 +249,6 @@ func buildLinkSpec(cname string, link config.Link) (dp.LinkSpec, error) {
 		} else {
 			spec.Kind = "veth-host"
 		}
-	case *config.MacvlanLink:
-		spec.Kind, spec.Parent, spec.Mode = "macvlan", l.Parent, string(l.Mode)
-	case *config.IpvlanLink:
-		spec.Kind, spec.Parent, spec.Mode = "ipvlan", l.Parent, string(l.Mode)
-	case *config.PhysLink:
-		spec.Kind, spec.Dev = "phys", l.Dev
 	default:
 		return spec, fmt.Errorf("container %q: unknown link type %T", cname, link)
 	}
@@ -323,10 +309,10 @@ func routerSysctls(routerIfs []string, uplinkRouterIf string) map[string]string 
 	return s
 }
 
-// buildFlows lowers a network's flows to the dataplane Flow list, resolving each endpoint
-// container name to its /32. icmp / port="any" need a second nft map shape that isn't wired
-// yet, so they're rejected here (the caller wraps with the network name). Ports the flow
-// half of build_nft's caller.
+// buildFlows lowers a network's internal flows to the dataplane Flow matrix, resolving each
+// endpoint container name to its /32. icmp / port="any" need a second nft map shape that isn't
+// wired yet, so they're rejected here (the caller wraps with the network name). Egress/ingress
+// flows are the edge (buildEgressAllows / buildIngress), not the forward matrix.
 func buildFlows(net config.Network) ([]dp.Flow, error) {
 	ip := map[string]netip.Addr{}
 	for cname, att := range net.Attach {
@@ -334,58 +320,77 @@ func buildFlows(net config.Network) ([]dp.Flow, error) {
 	}
 	var flows []dp.Flow
 	for _, fl := range net.Flows {
-		if fl.Proto == config.ProtoICMP || fl.Port.Any {
+		f, ok := fl.(*config.InternalFlow)
+		if !ok {
+			continue
+		}
+		if f.Proto == config.ProtoICMP || f.Port.Any {
 			return nil, fmt.Errorf("icmp / port=\"any\" in flows not wired yet")
 		}
 		flows = append(flows, dp.Flow{
-			FromIP: ip[fl.From], ToIP: ip[fl.To],
-			Proto: string(fl.Proto), Port: uint16(fl.Port.Port),
+			FromIP: ip[f.From], ToIP: ip[f.To],
+			Proto: string(f.Proto), Port: uint16(f.Port.Port),
 		})
 	}
 	return flows, nil
 }
 
-// buildEgressAllows translates each attachment's egress config into the dataplane edge
-// allows: a container that may initiate out the uplink, any (All) or scoped (proto, port).
+// buildEgressAllows translates the network's egress flows into the dataplane edge allows: a
+// container that may initiate out the uplink, wide (proto="any" => All) or scoped (proto, port).
+// Multiple egress flows for one container fold into a single allow (grouped by source /32).
 func buildEgressAllows(net config.Network) []dp.EgressAllow {
-	var allows []dp.EgressAllow
-	for _, cname := range sortedKeys(net.Attach) {
-		att := net.Attach[cname]
-		if !att.Egress.All && len(att.Egress.Rules) == 0 {
+	byIP := map[netip.Addr]*dp.EgressAllow{}
+	var order []netip.Addr
+	for _, fl := range net.Flows {
+		f, ok := fl.(*config.EgressFlow)
+		if !ok {
 			continue
 		}
-		a := dp.EgressAllow{IP: att.IP, All: att.Egress.All}
-		for _, r := range att.Egress.Rules {
-			sc := dp.EgressScope{}
-			for _, p := range r.Proto {
-				sc.Protos = append(sc.Protos, string(p))
-			}
-			if r.Port != nil && !r.Port.Any {
-				sc.Port = r.Port.Port
-			}
-			a.Rules = append(a.Rules, sc)
+		ip := net.Attach[f.From].IP
+		a := byIP[ip]
+		if a == nil {
+			a = &dp.EgressAllow{IP: ip}
+			byIP[ip] = a
+			order = append(order, ip)
 		}
-		allows = append(allows, a)
+		if f.Proto.Any {
+			a.All = true
+			continue
+		}
+		sc := dp.EgressScope{}
+		for _, p := range f.Proto.List {
+			sc.Protos = append(sc.Protos, string(p))
+		}
+		if f.Port != nil && !f.Port.Any {
+			sc.Port = f.Port.Port
+		}
+		a.Rules = append(a.Rules, sc)
+	}
+	var allows []dp.EgressAllow
+	for _, ip := range order {
+		allows = append(allows, *byIP[ip])
 	}
 	return allows
 }
 
-// buildIngress translates each attachment's ingress config into the host DNAT rules
+// buildIngress translates the network's ingress flows into the host DNAT rules
 // (Listen:host_port -> container:port) and the matching router forward-chain allows.
 func buildIngress(net config.Network) ([]dp.DNAT, []dp.IngressAllow) {
 	var dnats []dp.DNAT
 	var allows []dp.IngressAllow
-	for _, cname := range sortedKeys(net.Attach) {
-		att := net.Attach[cname]
-		for _, ing := range att.Ingress {
-			dnats = append(dnats, dp.DNAT{
-				Listen: ing.Listen, Proto: string(ing.Proto),
-				HostPort: ing.HostPort, ContIP: att.IP, ContPort: ing.Port,
-			})
-			allows = append(allows, dp.IngressAllow{
-				IP: att.IP, Proto: string(ing.Proto), Port: ing.Port,
-			})
+	for _, fl := range net.Flows {
+		ing, ok := fl.(*config.IngressFlow)
+		if !ok {
+			continue
 		}
+		contIP := net.Attach[ing.To].IP
+		dnats = append(dnats, dp.DNAT{
+			Listen: ing.Listen, Proto: string(ing.Proto),
+			HostPort: ing.HostPort, ContIP: contIP, ContPort: ing.Port,
+		})
+		allows = append(allows, dp.IngressAllow{
+			IP: contIP, Proto: string(ing.Proto), Port: ing.Port,
+		})
 	}
 	return dnats, allows
 }
@@ -409,8 +414,9 @@ func hostsFile(cfg *config.Turnip, container string) string {
 			continue
 		}
 		for _, fl := range net.Flows {
-			if fl.From == container {
-				peers[fl.To] = net.Attach[fl.To].IP
+			// only internal flows name a reachable peer; egress/ingress cross the edge.
+			if f, ok := fl.(*config.InternalFlow); ok && f.From == container {
+				peers[f.To] = net.Attach[f.To].IP
 			}
 		}
 	}

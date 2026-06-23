@@ -5,7 +5,8 @@ import (
 	"testing"
 )
 
-// The shipped example (old/tests/turnip.example.json), inline so the test is self-contained.
+// The shipped example, inline so the test is self-contained. All policy is a flow now: the
+// internal reachability, the two egress forms (scoped + the wide "any"), and the ingress DNAT.
 const exampleJSON = `{
   "runtime": { "user": "homelab" },
   "containers": { "zwave": {}, "hass": {}, "proxy": {} },
@@ -15,11 +16,16 @@ const exampleJSON = `{
       "gateway_if": "gw0",
       "uplink": { "host_if": "veth-lan-host", "router_if": "vethR-lan-up", "link": "169.254.1.0" },
       "attach": {
-        "zwave": { "ip": "10.0.0.11", "interface": "eth0", "egress": [ { "proto": ["udp", "tcp"], "port": 53 } ] },
-        "hass":  { "ip": "10.0.0.12", "interface": "eth0", "egress": true },
-        "proxy": { "ip": "10.0.0.13", "interface": "eth0", "ingress": [ { "proto": "tcp", "host_port": 8443, "port": 443 } ] }
+        "zwave": { "ip": "10.0.0.11", "interface": "eth0" },
+        "hass":  { "ip": "10.0.0.12", "interface": "eth0" },
+        "proxy": { "ip": "10.0.0.13", "interface": "eth0" }
       },
-      "flows": [ { "from": "zwave", "to": "hass", "proto": "tcp", "port": 443 } ]
+      "flows": [
+        { "type": "internal", "from": "zwave", "to": "hass", "proto": "tcp", "port": 443 },
+        { "type": "egress",   "from": "zwave", "proto": ["udp","tcp"], "port": 53 },
+        { "type": "egress",   "from": "hass",  "proto": "any" },
+        { "type": "ingress",  "to": "proxy",   "proto": "tcp", "host_port": 8443, "port": 443 }
+      ]
     }
   }
 }`
@@ -58,16 +64,22 @@ func TestExampleLoads(t *testing.T) {
 	if got := lan.Uplink.Link.String(); got != "169.254.1.0" {
 		t.Errorf("uplink.link = %q", got)
 	}
-	zw := lan.Attach["zwave"].Egress.Rules[0].Proto
-	if len(zw) != 2 || zw[0] != ProtoUDP || zw[1] != ProtoTCP {
-		t.Errorf("zwave egress proto = %v, want [udp tcp]", zw)
+
+	internal, ok := lan.Flows[0].(*InternalFlow)
+	if !ok || internal.From != "zwave" || internal.To != "hass" {
+		t.Errorf("flow[0] = %+v, want internal zwave->hass", lan.Flows[0])
 	}
-	px := lan.Attach["proxy"].Ingress[0]
-	if px.HostPort != 8443 || px.Port != 443 {
-		t.Errorf("proxy ingress = host_port %d port %d, want 8443/443", px.HostPort, px.Port)
+	zwEg, ok := lan.Flows[1].(*EgressFlow)
+	if !ok || len(zwEg.Proto.List) != 2 || zwEg.Proto.List[0] != ProtoUDP || zwEg.Proto.List[1] != ProtoTCP {
+		t.Errorf("flow[1] = %+v, want egress zwave [udp tcp]:53", lan.Flows[1])
 	}
-	if lan.Flows[0].From != "zwave" || lan.Flows[0].To != "hass" {
-		t.Errorf("flow = %s->%s", lan.Flows[0].From, lan.Flows[0].To)
+	hassEg, ok := lan.Flows[2].(*EgressFlow)
+	if !ok || !hassEg.Proto.Any {
+		t.Errorf("flow[2] = %+v, want egress hass proto=any", lan.Flows[2])
+	}
+	ing, ok := lan.Flows[3].(*IngressFlow)
+	if !ok || ing.HostPort != 8443 || ing.Port != 443 || ing.To != "proxy" {
+		t.Errorf("flow[3] = %+v, want ingress proxy 8443/443", lan.Flows[3])
 	}
 	if !fab.RequiresRoot() {
 		t.Errorf("RequiresRoot = false, want true (the lan uplink)")
@@ -78,17 +90,20 @@ func TestIngressPortDefaultsToHostPort(t *testing.T) {
 	// no explicit container port -> defaults to host_port
 	fab := mustParse(t, `{"containers":{"a":{}},"networks":{"n":{"gateway":"10.0.0.1","gateway_if":"gw0",
 	  "uplink":{"host_if":"h","router_if":"r","link":"169.254.1.0"},
-	  "attach":{"a":{"ip":"10.0.0.5","interface":"eth0","ingress":[{"proto":"tcp","host_port":8080}]}}}}}`)
-	ing := fab.Networks["n"].Attach["a"].Ingress[0]
+	  "attach":{"a":{"ip":"10.0.0.5","interface":"eth0"}},
+	  "flows":[{"type":"ingress","to":"a","proto":"tcp","host_port":8080}]}}}`)
+	ing := fab.Networks["n"].Flows[0].(*IngressFlow)
 	if ing.Port != 8080 || ing.Listen.String() != "0.0.0.0" {
 		t.Errorf("ingress defaults = port %d listen %s, want 8080 / 0.0.0.0", ing.Port, ing.Listen)
 	}
 }
 
 func TestBridgeShapeAccepted(t *testing.T) {
+	// edge flows (egress/ingress) are fine on a bridge; only internal flows are router-only.
 	fab := mustParse(t, `{"containers":{"sensor":{}},"networks":{"iot":{"type":"bridge","subnet":"10.2.0.0/24",
 	  "gateway":"10.2.0.1","uplink":{"host_if":"vh","router_if":"vr","link":"169.254.2.0"},
-	  "attach":{"sensor":{"ip":"10.2.0.10","interface":"eth0","egress":true}}}}}`)
+	  "attach":{"sensor":{"ip":"10.2.0.10","interface":"eth0"}},
+	  "flows":[{"type":"egress","from":"sensor","proto":"any"}]}}}`)
 	if fab.Networks["iot"].Type != NetworkBridge {
 		t.Errorf("type = %q, want bridge", fab.Networks["iot"].Type)
 	}
@@ -96,17 +111,20 @@ func TestBridgeShapeAccepted(t *testing.T) {
 
 func TestLinksUnionShape(t *testing.T) {
 	fab := mustParse(t, `{"containers":{"box":{"links":[
-	  {"type":"macvlan","parent":"eth0","name":"lan0","address":"192.168.1.12/24","gateway":"192.168.1.1"},
-	  {"type":"veth","bridge":"br-lan","name":"eth2","address":"192.168.1.13/24"},
-	  {"type":"phys","dev":"enp3s0","name":"eth3","address":"192.168.1.20/24","default":true}
+	  {"type":"veth","bridge":"br-lan","name":"eth2","address":"192.168.1.13/24","gateway":"192.168.1.1"},
+	  {"type":"veth","peer":"host","name":"eth3","address":"192.168.50.2/30","default":true}
 	]}},"networks":{}}`)
 	links := fab.Containers["box"].Links
-	mv, ok := links[0].(*MacvlanLink)
+	vb, ok := links[0].(*VethLink)
 	if !ok {
-		t.Fatalf("link0 = %T, want *MacvlanLink", links[0])
+		t.Fatalf("link0 = %T, want *VethLink", links[0])
 	}
-	if mv.Mode != MacvlanBridge {
-		t.Errorf("macvlan mode = %q, want bridge (default)", mv.Mode)
+	if vb.Bridge != "br-lan" {
+		t.Errorf("veth bridge = %q, want br-lan", vb.Bridge)
+	}
+	vh := links[1].(*VethLink)
+	if vh.Peer != "host" {
+		t.Errorf("veth peer = %q, want host", vh.Peer)
 	}
 	if !fab.RequiresRoot() {
 		t.Errorf("RequiresRoot = false, want true (a link)")
@@ -114,15 +132,15 @@ func TestLinksUnionShape(t *testing.T) {
 }
 
 func TestEgressAnyToken(t *testing.T) {
-	fab := mustParse(t, netCfg(`"a":{"ip":"10.0.0.5","interface":"eth0","egress":[{"proto":"tcp","port":"any"}]}`))
-	if !fab.Networks["n"].Attach["a"].Egress.Rules[0].Port.Any {
+	fab := mustParse(t, flowCfg(`{"type":"egress","from":"a","proto":"tcp","port":"any"}`))
+	if !fab.Networks["n"].Flows[0].(*EgressFlow).Port.Any {
 		t.Errorf("egress port .Any = false, want true")
 	}
 }
 
 func TestICMPEgressPortless(t *testing.T) {
-	fab := mustParse(t, netCfg(`"a":{"ip":"10.0.0.5","interface":"eth0","egress":[{"proto":"icmp"}]}`))
-	if fab.Networks["n"].Attach["a"].Egress.Rules[0].Port != nil {
+	fab := mustParse(t, flowCfg(`{"type":"egress","from":"a","proto":"icmp"}`))
+	if fab.Networks["n"].Flows[0].(*EgressFlow).Port != nil {
 		t.Errorf("icmp egress port != nil")
 	}
 }
@@ -138,20 +156,26 @@ func TestRequiresRootFalseForPlainRouted(t *testing.T) {
 // --- rejections ------------------------------------------------------------
 
 func TestScopedEgressMissingPort(t *testing.T) {
-	parseErr(t, netCfg(`"a":{"ip":"10.0.0.5","interface":"eth0","egress":[{"proto":"tcp"}]}`), "missing 'port'")
+	parseErr(t, flowCfg(`{"type":"egress","from":"a","proto":"tcp"}`), "missing 'port'")
 }
 
 func TestEgressNeedsUplink(t *testing.T) {
 	parseErr(t, `{"containers":{"a":{}},"networks":{"n":{"gateway":"10.0.0.1","gateway_if":"f0",
-	  "attach":{"a":{"ip":"10.0.0.5","interface":"eth0","egress":true}}}}}`, "needs this network's uplink")
+	  "attach":{"a":{"ip":"10.0.0.5","interface":"eth0"}},
+	  "flows":[{"type":"egress","from":"a","proto":"any"}]}}}`, "needs this network's uplink")
 }
 
 func TestPortBounds(t *testing.T) {
-	parseErr(t, netCfg(`"a":{"ip":"10.0.0.5","interface":"eth0","ingress":[{"proto":"tcp","host_port":99999}]}`), "out of range")
+	parseErr(t, flowCfg(`{"type":"ingress","to":"a","proto":"tcp","host_port":99999}`), "out of range")
 }
 
 func TestICMPIngressRejected(t *testing.T) {
-	parseErr(t, netCfg(`"a":{"ip":"10.0.0.5","interface":"eth0","ingress":[{"proto":"icmp","host_port":1}]}`), "port-bearing proto")
+	parseErr(t, flowCfg(`{"type":"ingress","to":"a","proto":"icmp","host_port":1}`), "port-bearing proto")
+}
+
+func TestUnknownFlowType(t *testing.T) {
+	parseErr(t, flowCfg(`{"type":"sideways","from":"a","to":"b","proto":"tcp","port":1}`),
+		"must be one of internal/egress/ingress")
 }
 
 func TestSubnetForbiddenOnRouter(t *testing.T) {
@@ -159,10 +183,10 @@ func TestSubnetForbiddenOnRouter(t *testing.T) {
 	  "uplink":{"host_if":"h","router_if":"r","link":"169.254.1.0"},"attach":{}}}}`, "subnet is forbidden on a router")
 }
 
-func TestFlowsForbiddenOnBridge(t *testing.T) {
+func TestInternalFlowForbiddenOnBridge(t *testing.T) {
 	parseErr(t, `{"containers":{"a":{},"b":{}},"networks":{"b":{"type":"bridge","subnet":"10.2.0.0/24","gateway":"10.2.0.1",
 	  "attach":{"a":{"ip":"10.2.0.5","interface":"eth0"},"b":{"ip":"10.2.0.6","interface":"eth0"}},
-	  "flows":[{"from":"a","to":"b","proto":"tcp","port":1}]}}}`, "router-only")
+	  "flows":[{"type":"internal","from":"a","to":"b","proto":"tcp","port":1}]}}}`, "router-only")
 }
 
 func TestRouterRequiresGatewayIf(t *testing.T) {
@@ -173,7 +197,7 @@ func TestFlowEndpointMustBeAttached(t *testing.T) {
 	parseErr(t, `{"containers":{"a":{}},"networks":{"n":{"gateway":"10.0.0.1","gateway_if":"gw0",
 	  "uplink":{"host_if":"h","router_if":"r","link":"169.254.1.0"},
 	  "attach":{"a":{"ip":"10.0.0.5","interface":"eth0"}},
-	  "flows":[{"from":"a","to":"ghost","proto":"tcp","port":1}]}}}`, "not attached to this network")
+	  "flows":[{"type":"internal","from":"a","to":"ghost","proto":"tcp","port":1}]}}}`, "not attached to this network")
 }
 
 func TestUnknownContainerInAttach(t *testing.T) {
@@ -195,7 +219,7 @@ func TestZeroDefaultMultiIface(t *testing.T) {
 }
 
 func TestDuplicateInterface(t *testing.T) {
-	parseErr(t, `{"containers":{"a":{"links":[{"type":"phys","dev":"x","name":"eth0","address":"1.2.3.4/24"}]}},
+	parseErr(t, `{"containers":{"a":{"links":[{"type":"veth","peer":"host","name":"eth0","address":"1.2.3.4/24"}]}},
 	  "networks":{"n":{"gateway":"10.0.0.1","gateway_if":"gw0","uplink":{"host_if":"h","router_if":"r","link":"169.254.1.0"},
 	  "attach":{"a":{"ip":"10.0.0.5","interface":"eth0"}}}}}`, "duplicate interface")
 }
@@ -203,8 +227,11 @@ func TestDuplicateInterface(t *testing.T) {
 func TestHostPortCollision(t *testing.T) {
 	parseErr(t, `{"containers":{"a":{},"b":{}},"networks":{"n":{"gateway":"10.0.0.1","gateway_if":"gw0",
 	  "uplink":{"host_if":"h","router_if":"r","link":"169.254.1.0"},"attach":{
-	    "a":{"ip":"10.0.0.5","interface":"eth0","ingress":[{"proto":"tcp","host_port":8443,"port":443}]},
-	    "b":{"ip":"10.0.0.6","interface":"eth0","ingress":[{"proto":"tcp","host_port":8443,"port":444}]}}}}}`,
+	    "a":{"ip":"10.0.0.5","interface":"eth0"},
+	    "b":{"ip":"10.0.0.6","interface":"eth0"}},
+	  "flows":[
+	    {"type":"ingress","to":"a","proto":"tcp","host_port":8443,"port":443},
+	    {"type":"ingress","to":"b","proto":"tcp","host_port":8443,"port":444}]}}}`,
 		"host_port collision")
 }
 
@@ -242,4 +269,13 @@ func netCfg(attach string) string {
 	}
 	return `{"containers":` + containers + `,"networks":{"n":{"gateway":"10.0.0.1","gateway_if":"gw0",` +
 		`"uplink":{"host_if":"h","router_if":"r","link":"169.254.1.0"},"attach":{` + attach + `}}}}`
+}
+
+// flowCfg wraps a single flow in a minimal valid router network with an uplink and the
+// containers a/b attached (the endpoints flows reference).
+func flowCfg(flow string) string {
+	return `{"containers":{"a":{},"b":{}},"networks":{"n":{"gateway":"10.0.0.1","gateway_if":"gw0",` +
+		`"uplink":{"host_if":"h","router_if":"r","link":"169.254.1.0"},` +
+		`"attach":{"a":{"ip":"10.0.0.5","interface":"eth0"},"b":{"ip":"10.0.0.6","interface":"eth0"}},` +
+		`"flows":[` + flow + `]}}}`
 }

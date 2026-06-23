@@ -67,9 +67,9 @@ for when each lands.
 - **`peer` flow type + network→network transit** — `net:container` reachability
   across a router↔router link; keep the "phases stay global, validate acyclicity"
   invariant in mind so it stays additive (see "Inter-network routing & NAT").
-- **Non-veth `links`** (`macvlan`/`ipvlan`/`phys`) — dropped from the target for
-  now; veth (bridge / root-netns) covers the current use case. (These exist in the
-  code today; the target trims them — see "Implementation delta.")
+- **Non-veth `links`** (`macvlan`/`ipvlan`/`phys`) — dropped from the target;
+  veth (bridge / root-netns) covers the current use case. (Trimmed from the code —
+  see "Implementation delta.")
 - **`bridge` network type** — a second security model + L2 enforcement.
 
 ## The model in one file — `turnip.json` (baseline)
@@ -295,8 +295,8 @@ to it. Deliberate (a LAN trust escape), but it means a `link` is a conscious "th
 container is trusted on that domain."
 
 > **Scope: `veth` only.** The target supports the two veth anchors below.
-> `macvlan`/`ipvlan`/`phys` are **dropped from the target for now** (the current use
-> case is covered by veth). They exist in the code today; see "Implementation delta."
+> `macvlan`/`ipvlan`/`phys` are **dropped from the target** (the current use case is
+> covered by veth) and have been trimmed from the code; see "Implementation delta."
 
 ### Config — the `links` list
 
@@ -489,19 +489,21 @@ validation split into per-network rules + the container-global cross-cutting che
 Discovery is `--config` → `$TURNIP_CONFIG` → `./turnip.json`. `HOST_PREFIX = 32` is
 locked by topology, not configurable.
 
-### Implementation delta (current code → this target)
+### Implementation delta (now carried through)
 
-The code today implements the v1 three-primitive model; this target requires:
-- **Move policy off the attachment into typed flows.** Drop `Attachment.Egress` /
-  `Attachment.Ingress`; add a `type`-discriminated `Flow` union
-  (`internal`/`egress`/`ingress`) on the network. `egress`-true becomes
-  `{type:egress, proto:"any"}`; `ingress` rows become `{type:ingress, …}`.
-- **Add `proto:"any"`** (a `ProtoAny` token, portless) for the wide egress form.
-- **Reduce `links` to `veth`.** Remove `macvlan`/`ipvlan`/`phys` from the config
-  union (and, separately, from `internal/dataplane/links.go` if the trim is carried
-  through). The veth anchors (`bridge`, `peer:"host"`) stay.
-- Validation rules above re-home onto flows (uplink-required, host_port uniqueness,
-  endpoint membership) — mostly a relocation of existing checks.
+The code implements this target — the flow-only model on veth-only links. What the
+reshape from the v1 three-primitive model entailed (all landed):
+- **Policy moved off the attachment into typed flows.** `Attachment.Egress` /
+  `Attachment.Ingress` are gone; the network carries a `type`-discriminated `Flow`
+  union (`InternalFlow`/`EgressFlow`/`IngressFlow`). The wide egress is
+  `{type:egress, proto:"any"}`; ingress rows are `{type:ingress, …}`.
+- **`proto:"any"`** (a portless token, decoded by `egressProto`) expresses the wide
+  egress form.
+- **`links` reduced to `veth`.** `macvlan`/`ipvlan`/`phys` are removed from the
+  config union *and* from `internal/dataplane/links.go`. The veth anchors (`bridge`,
+  `peer:"host"`) stay.
+- Validation re-homed onto flows (uplink-required, host_port uniqueness, endpoint
+  membership) — a relocation of the existing checks.
 
 ## Open questions
 - **Single-network sugar.** Offer a flat top-level shorthand that desugars to one

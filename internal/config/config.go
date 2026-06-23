@@ -1,20 +1,22 @@
 // Package config is the declarative turnip model: the typed loader + validator for
 // turnip.json (see docs/CONFIG-SKETCH.md). This is the model ONLY -- WHO exists, WHO
-// may talk, WHAT crosses the edge -- never the mechanism that secures it. It is a port
-// of old/src/turnip/config.py (pydantic) onto encoding/json + an explicit Validate pass.
+// may talk, WHAT crosses the edge -- never the mechanism that secures it.
 //
 // Three entities, three scopes:
 //   - container   (containers.<name>)              identity + router-independent links
 //   - network     (networks.<name>)                a router/bridge netns: gateway, uplink, flows
-//   - attachment  (networks.<name>.attach.<name>)  container x network: ip, interface, egress/ingress
+//   - attachment  (networks.<name>.attach.<name>)  container x network: ip, interface, default
+//
+// All policy is a flow: intra-network reachability, egress to the internet, and inbound
+// port-forwards are rows in the per-network flows list, discriminated by type.
 //
 // Governing rule (default-deny): omission must never widen. Breadth is opt-in and visible
-// -- an explicit proto list, port = "any", a deliberate egress = true -- never the result
-// of a dropped field. A missing proto/port on a scoped rule is a load error, not a wildcard.
+// -- an explicit proto list, port = "any", a deliberate proto = "any" egress -- never the
+// result of a dropped field. A missing proto/port on a scoped flow is a load error, not a wildcard.
 //
-// Loading is split like the Python: Parse([]byte) is the pure model_validate equivalent
-// (unmarshal with extra="forbid" + defaults + Validate); reading $TURNIP_CONFIG / the file
-// lives in the caller (cmd/turnip), so this package has no IO.
+// Loading: Parse([]byte) is the pure entry point (unmarshal with extra="forbid" + defaults +
+// Validate); reading $TURNIP_CONFIG / the file lives in the caller (cmd/turnip), so this
+// package has no IO.
 package config
 
 import (
@@ -56,48 +58,14 @@ const (
 	NetworkBridge NetworkType = "bridge"
 )
 
-// LinkType discriminates the container-link union.
+// LinkType discriminates the container-link union. Only veth exists today; the field is
+// kept as a discriminator for forward-compat (macvlan/ipvlan/phys were trimmed -- see
+// docs/CONFIG-SKETCH.md).
 type LinkType string
 
 const (
-	LinkVeth    LinkType = "veth"
-	LinkMacvlan LinkType = "macvlan"
-	LinkIpvlan  LinkType = "ipvlan"
-	LinkPhys    LinkType = "phys"
+	LinkVeth LinkType = "veth"
 )
-
-type MacvlanMode string
-
-const (
-	MacvlanBridge   MacvlanMode = "bridge"
-	MacvlanPrivate  MacvlanMode = "private"
-	MacvlanVepa     MacvlanMode = "vepa"
-	MacvlanPassthru MacvlanMode = "passthru"
-)
-
-func (m MacvlanMode) valid() bool {
-	switch m {
-	case MacvlanBridge, MacvlanPrivate, MacvlanVepa, MacvlanPassthru:
-		return true
-	}
-	return false
-}
-
-type IpvlanMode string
-
-const (
-	IpvlanL2  IpvlanMode = "l2"
-	IpvlanL3  IpvlanMode = "l3"
-	IpvlanL3S IpvlanMode = "l3s"
-)
-
-func (m IpvlanMode) valid() bool {
-	switch m {
-	case IpvlanL2, IpvlanL3, IpvlanL3S:
-		return true
-	}
-	return false
-}
 
 // --- scalar unions ---------------------------------------------------------
 
@@ -121,8 +89,7 @@ func (p *PortPattern) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// protoList accepts the scalar "tcp" sugar as well as ["udp", "tcp"] (config.py's
-// EgressRule._listify).
+// protoList accepts the scalar "tcp" sugar as well as ["udp", "tcp"].
 type protoList []Proto
 
 func (pl *protoList) UnmarshalJSON(b []byte) error {
@@ -142,6 +109,27 @@ func (pl *protoList) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// egressProto is an egress flow's proto field: the wide "any" token (all L4 protocols,
+// portless -- the deliberate "this container gets the internet" form) or a concrete proto
+// scalar/list. "any" must stand alone; it never mixes into the list.
+type egressProto struct {
+	Any  bool
+	List []Proto
+}
+
+func (e *egressProto) UnmarshalJSON(b []byte) error {
+	if string(b) == `"any"` {
+		e.Any = true
+		return nil
+	}
+	var pl protoList
+	if err := pl.UnmarshalJSON(b); err != nil {
+		return err
+	}
+	e.List = pl
+	return nil
+}
+
 // --- runtime ---------------------------------------------------------------
 
 // Runtime is the execution environment (the WHERE, separate from the model). All fields
@@ -154,102 +142,104 @@ type Runtime struct {
 	Podman   string `json:"podman"`
 }
 
-// --- edges: egress / ingress ----------------------------------------------
+// --- the flow union: all policy is a flow ---------------------------------
 
-// EgressRule is one scoped outbound allowance. proto and port are both required (a dropped
-// field is a load error, never a wildcard) -- except ICMP, which is portless. proto may be
-// a list and fans out to one nft element per proto.
-type EgressRule struct {
-	Proto protoList    `json:"proto"`
-	Port  *PortPattern `json:"port"`
-}
+// FlowType discriminates the flow union. Every policy edge -- intra-network reachability,
+// leaving for the internet, inbound port-forwards -- is a flow row, keyed by type. The
+// non-container end (the internet) is implied by the type, never a magic endpoint name.
+type FlowType string
 
-// Egress on an attachment: a deliberate true (any external dest/proto/port), a list of
-// scoped rules, or false/absent (default-deny).
-type Egress struct {
-	All   bool         // egress: true
-	Rules []EgressRule // egress: [ {...}, ... ]
-}
+const (
+	FlowInternal FlowType = "internal" // container -> container, this network
+	FlowEgress   FlowType = "egress"   // container -> the internet, via the uplink
+	FlowIngress  FlowType = "ingress"  // the internet -> container (DNAT), via the uplink
+)
 
-func (e *Egress) UnmarshalJSON(b []byte) error {
-	switch string(b) {
-	case "true":
-		e.All = true
-		return nil
-	case "false", "null":
-		return nil
-	}
-	if len(b) > 0 && b[0] == '[' {
-		var raws []json.RawMessage
-		if err := json.Unmarshal(b, &raws); err != nil {
-			return err
-		}
-		for _, r := range raws {
-			var er EgressRule
-			if err := strictUnmarshal(r, &er); err != nil {
-				return err
-			}
-			e.Rules = append(e.Rules, er)
-		}
-		return nil
-	}
-	return fmt.Errorf("egress must be a bool or a list of {proto, port} rules")
-}
+// Flow is a sealed sum type (discriminated on "type"): one of the concrete structs below.
+// Each carries a `Type` field only so strict decode accepts the "type" key; it's the
+// discriminator (read once in unmarshalFlow), never read after dispatch. Behavior is
+// dispatched by type switch at use-sites (validate.go, plan.go), not by methods.
+type Flow interface{ isFlow() }
 
-// active mirrors Python's bool(egress): true, or a non-empty rule list.
-func (e Egress) active() bool { return e.All || len(e.Rules) > 0 }
-
-// IngressRule is one host->container DNAT mapping. It carries TWO ports because it does
-// DNAT: HostPort is published on the host edge, Port is the container port (defaults to
-// HostPort -- the one widening-safe default).
-type IngressRule struct {
-	Proto    Proto      `json:"proto"`
-	HostPort int        `json:"host_port"`
-	Port     int        `json:"port"`   // 0 = unset -> defaults to HostPort (in UnmarshalJSON)
-	Listen   netip.Addr `json:"listen"` // host address the DNAT listens on; default 0.0.0.0
-}
-
-// UnmarshalJSON seeds the defaults, then decodes over them (strict -- extra keys rejected).
-// Listen defaults to 0.0.0.0 (any host address). Port is NOT seeded: it mirrors HostPort when
-// omitted, a derivation from a sibling input, so it's filled after the decode reads HostPort.
-func (r *IngressRule) UnmarshalJSON(b []byte) error {
-	r.Listen = netip.AddrFrom4([4]byte{0, 0, 0, 0})
-	type raw IngressRule
-	if err := strictUnmarshal(b, (*raw)(r)); err != nil {
-		return err
-	}
-	if r.Port == 0 { // omitted -> the published host port
-		r.Port = r.HostPort
-	}
-	return nil
-}
-
-// --- intra-network policy: flows (router-only) ----------------------------
-
-// Flow is a who-may-initiate-to-whom edge in a router network's forward chain. Endpoints
-// are container names attached to THIS network. Directional: from may initiate to `to` on
-// (proto, port), and only that -- the return path rides conntrack, so no reverse entry.
-type Flow struct {
+// InternalFlow is a who-may-initiate-to-whom edge in a router network's forward chain.
+// Endpoints are container names attached to THIS network. Directional: From may initiate to
+// To on (proto, port), and only that -- the return path rides conntrack, so no reverse entry.
+type InternalFlow struct {
+	Type  FlowType    `json:"type"`
 	From  string      `json:"from"`
 	To    string      `json:"to"`
 	Proto Proto       `json:"proto"`
 	Port  PortPattern `json:"port"`
 }
 
+// EgressFlow lets From initiate out the uplink to the internet. Proto may be the wide "any"
+// (portless) or a concrete scalar/list; a port-bearing proto requires Port (a dropped port
+// is a load error, never a wildcard) -- except ICMP, which is portless.
+type EgressFlow struct {
+	Type  FlowType     `json:"type"`
+	From  string       `json:"from"`
+	Proto egressProto  `json:"proto"`
+	Port  *PortPattern `json:"port"`
+}
+
+// IngressFlow is one internet->container DNAT mapping. It carries TWO ports because it does
+// DNAT: HostPort is published on the host edge, Port is the container port (defaults to
+// HostPort -- the one widening-safe default). Matched on dest, not source (the client IP is
+// a wildcard after DNAT).
+type IngressFlow struct {
+	Type     FlowType   `json:"type"`
+	To       string     `json:"to"`
+	Proto    Proto      `json:"proto"`
+	HostPort int        `json:"host_port"`
+	Port     int        `json:"port"`   // 0 = unset -> defaults to HostPort (in unmarshalFlow)
+	Listen   netip.Addr `json:"listen"` // host address the DNAT listens on; default 0.0.0.0
+}
+
+func (*InternalFlow) isFlow() {}
+func (*EgressFlow) isFlow()   {}
+func (*IngressFlow) isFlow()  {}
+
+// unmarshalFlow decodes one flow, dispatching on "type". Stays strict (extra keys rejected).
+// Ingress seeds its defaults (Listen 0.0.0.0; Port mirrors HostPort when omitted) after the
+// decode, since the decode can't seed a port derived from a sibling field (HostPort).
+func unmarshalFlow(b []byte) (Flow, error) {
+	var disc struct {
+		Type FlowType `json:"type"`
+	}
+	if err := json.Unmarshal(b, &disc); err != nil {
+		return nil, err
+	}
+	switch disc.Type {
+	case FlowInternal:
+		var f InternalFlow
+		return &f, strictUnmarshal(b, &f)
+	case FlowEgress:
+		var f EgressFlow
+		return &f, strictUnmarshal(b, &f)
+	case FlowIngress:
+		f := IngressFlow{Listen: netip.AddrFrom4([4]byte{0, 0, 0, 0})}
+		if err := strictUnmarshal(b, &f); err != nil {
+			return nil, err
+		}
+		if f.Port == 0 { // omitted -> the published host port
+			f.Port = f.HostPort
+		}
+		return &f, nil
+	default:
+		return nil, fmt.Errorf("flow type %q must be one of internal/egress/ingress", disc.Type)
+	}
+}
+
 // --- the attachment (container x network) ---------------------------------
 
 // Attachment is a container's membership in one network, keyed by container under the
-// network (so the (network, container) pair is unique by construction).
+// network (so the (network, container) pair is unique by construction). It is pure placement
+// now -- every who-may-talk decision is a flow.
 type Attachment struct {
-	IP        netip.Addr    `json:"ip"`
-	Interface string        `json:"interface"`
-	Default   bool          `json:"default"` // owns the container's 0.0.0.0/0 route
-	Egress    Egress        `json:"egress"`
-	Ingress   []IngressRule `json:"ingress"`
+	IP        netip.Addr `json:"ip"`
+	Interface string     `json:"interface"`
+	Default   bool       `json:"default"` // owns the container's 0.0.0.0/0 route
 }
-
-// wantsEdge reports whether this attachment needs its network's uplink (any egress/ingress).
-func (a Attachment) wantsEdge() bool { return a.Egress.active() || len(a.Ingress) > 0 }
 
 // --- container links (holes into host networking) -------------------------
 
@@ -264,13 +254,11 @@ type LinkBase struct {
 	Default bool           `json:"default"` // owns the container default route
 }
 
-// Link is a sealed sum type (discriminated on "type"): one of the concrete structs below, the
-// set kept closed to this package by the unexported isLink. Ownership is implied by type, never
-// a flag: veth/macvlan/ipvlan are virtual => owned; phys is physical => borrowed. The variants
-// are pure data -- behavior is dispatched by type switch at use-sites (validateLink in
-// validate.go, buildLinkSpec in cmd), not by methods. Base() exposes the shared fields. Each
-// variant carries a `Type` field only so strict decode accepts the "type" key; it's the
-// discriminator (read once in unmarshalLink), never read after dispatch.
+// Link is a sealed sum type (discriminated on "type"), kept as a union for forward-compat
+// though veth is the only variant today. veth is virtual => owned (created from its anchor,
+// reaped with the netns). Behavior is dispatched by type switch at use-sites (validateLink in
+// validate.go, buildLinkSpec in cmd), not by methods. Base() exposes the shared fields. The
+// `Type` field exists only so strict decode accepts the "type" key (read once in unmarshalLink).
 type Link interface {
 	isLink()
 	Base() *LinkBase
@@ -284,39 +272,10 @@ type VethLink struct {
 	Peer   string   `json:"peer"` // "host" or ""
 }
 
-// MacvlanLink: own MAC/IP on the parent's LAN.
-type MacvlanLink struct {
-	LinkBase
-	Type   LinkType    `json:"type"`
-	Parent string      `json:"parent"`
-	Mode   MacvlanMode `json:"mode"` // default bridge
-}
-
-// IpvlanLink: single MAC (works on WiFi).
-type IpvlanLink struct {
-	LinkBase
-	Type   LinkType   `json:"type"`
-	Parent string     `json:"parent"`
-	Mode   IpvlanMode `json:"mode"` // default l2
-}
-
-// PhysLink: a BORROWED NIC/VF -- moved in, returned to root on down, never deleted.
-type PhysLink struct {
-	LinkBase
-	Type LinkType `json:"type"`
-	Dev  string   `json:"dev"`
-}
-
-func (l *VethLink) Base() *LinkBase    { return &l.LinkBase }
-func (l *MacvlanLink) Base() *LinkBase { return &l.LinkBase }
-func (l *IpvlanLink) Base() *LinkBase  { return &l.LinkBase }
-func (l *PhysLink) Base() *LinkBase    { return &l.LinkBase }
+func (l *VethLink) Base() *LinkBase { return &l.LinkBase }
 
 // isLink seals the sum type: only this package's structs satisfy Link.
-func (*VethLink) isLink()    {}
-func (*MacvlanLink) isLink() {}
-func (*IpvlanLink) isLink()  {}
-func (*PhysLink) isLink()    {}
+func (*VethLink) isLink() {}
 
 // --- container -------------------------------------------------------------
 
@@ -356,17 +315,8 @@ func unmarshalLink(b []byte) (Link, error) {
 	case LinkVeth:
 		var l VethLink
 		return &l, strictUnmarshal(b, &l)
-	case LinkMacvlan:
-		l := MacvlanLink{Mode: MacvlanBridge} // seed the default mode, decode over it
-		return &l, strictUnmarshal(b, &l)
-	case LinkIpvlan:
-		l := IpvlanLink{Mode: IpvlanL2}
-		return &l, strictUnmarshal(b, &l)
-	case LinkPhys:
-		var l PhysLink
-		return &l, strictUnmarshal(b, &l)
 	default:
-		return nil, fmt.Errorf("link type %q must be one of veth/macvlan/ipvlan/phys", disc.Type)
+		return nil, fmt.Errorf("link type %q must be veth", disc.Type)
 	}
 }
 
@@ -385,21 +335,42 @@ type Uplink struct {
 // network-scoped: the nft table, the gateway, the uplink/DNAT, so flows and attach are
 // per-network.
 type Network struct {
-	Type      NetworkType           `json:"type"` // default router
-	Gateway   netip.Addr            `json:"gateway"`
-	GatewayIf string                `json:"gateway_if"` // router: the dummy gateway iface
-	Subnet    netip.Prefix          `json:"subnet"`     // bridge-only; zero = unset
-	Uplink    *Uplink               `json:"uplink"`
-	Attach    map[string]Attachment `json:"attach"`
-	Flows     []Flow                `json:"flows"`
+	Type      NetworkType
+	Gateway   netip.Addr
+	GatewayIf string // router: the dummy gateway iface
+	Subnet    netip.Prefix
+	Uplink    *Uplink
+	Attach    map[string]Attachment
+	Flows     []Flow // the type-discriminated union; see unmarshalFlow
 }
 
-// UnmarshalJSON seeds the default type (router), then decodes over it -- so an omitted "type"
-// stays router rather than the empty string. Stays strict (extra keys rejected).
+// UnmarshalJSON seeds the default type (router) so an omitted "type" stays router, then decodes
+// the flows through the discriminated union (Flow is an interface, so it can't decode directly).
+// Stays strict (extra keys rejected).
 func (n *Network) UnmarshalJSON(b []byte) error {
-	n.Type = NetworkRouter
-	type raw Network
-	return strictUnmarshal(b, (*raw)(n))
+	var raw struct {
+		Type      NetworkType           `json:"type"`
+		Gateway   netip.Addr            `json:"gateway"`
+		GatewayIf string                `json:"gateway_if"`
+		Subnet    netip.Prefix          `json:"subnet"`
+		Uplink    *Uplink               `json:"uplink"`
+		Attach    map[string]Attachment `json:"attach"`
+		Flows     []json.RawMessage     `json:"flows"`
+	}
+	raw.Type = NetworkRouter
+	if err := strictUnmarshal(b, &raw); err != nil {
+		return err
+	}
+	n.Type, n.Gateway, n.GatewayIf = raw.Type, raw.Gateway, raw.GatewayIf
+	n.Subnet, n.Uplink, n.Attach = raw.Subnet, raw.Uplink, raw.Attach
+	for _, fr := range raw.Flows {
+		fl, err := unmarshalFlow(fr)
+		if err != nil {
+			return err
+		}
+		n.Flows = append(n.Flows, fl)
+	}
+	return nil
 }
 
 // --- the whole config ------------------------------------------------------

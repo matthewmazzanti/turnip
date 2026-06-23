@@ -10,8 +10,7 @@ is a declarative `turnip.json`; the mechanism builds the dataplane from it.
 > **Status: Go rewrite in progress (rootful).** The active implementation is
 > [`cmd/turnip`](cmd/turnip) (Go). It runs **rootful** — the host edge (uplinks,
 > container links) needs the init netns, so turnip runs as root and drops to the
-> rootless-podman owner to enter podman's namespaces. The reference Python
-> implementation it's based on is parked under [`old/`](old); the kernel-interface
+> rootless-podman owner to enter podman's namespaces. The kernel-interface
 > primitives (podman-userns bootstrap, netns fd collection + bind-mount persistence,
 > sysctl/nft/netlink over an fd) are validated in
 > [`spike/go-netns-bootstrap`](spike/go-netns-bootstrap). Design docs live in
@@ -48,7 +47,7 @@ proxy  netns:  eth0 10.0.0.13/32  default via 10.0.0.1
 The example flow matrix is hub-and-spoke with `hass` as the hub: `zwave`→`hass`
 and `hass`→`proxy` on tcp/443 (flows are **directional** — `from` initiates to
 `to`). Every container may reach the gateway. Edit `containers`/`networks`/`flows`
-in `turnip.json` to change it (example: `old/tests/turnip.example.json`).
+in `turnip.json` to change it.
 
 ## Layout
 
@@ -58,7 +57,6 @@ in `turnip.json` to change it (example: `old/tests/turnip.example.json`).
 | `internal/` | `config` (the declarative model + validation), `netns` (podman bootstrap, netns lifecycle, the SCM_RIGHTS fd bridge), `dataplane` (gateway/veth/route wiring + the nft flow matrix) |
 | `nix/` | the flake helpers (`nix/lib`) + the rootless-podman dev VM (`testvm.nix`, `turnip-host.nix`) |
 | `spike/go-netns-bootstrap/` | the validated kernel-interface primitives the port builds on |
-| `old/` | the reference Python implementation (`src/turnip/`, tests, the privilege probe) |
 | `docs/` | design docs — `ARCHITECTURE.md` (the config/plan/apply layering), `CONFIG-SKETCH.md` (config model + deferred-feature specs) |
 | `todo.md` | the open-work checklist |
 

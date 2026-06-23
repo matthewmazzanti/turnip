@@ -7,11 +7,10 @@ import (
 	"sort"
 )
 
-// Parse is the model_validate equivalent: unmarshal turnip.json with extra="forbid", then run
-// the full validation pass. Defaults are seeded as it decodes -- the per-type UnmarshalJSON
-// methods (Network type=router, IngressRule port/listen, the macvlan/ipvlan modes in
-// unmarshalLink) set their default on the receiver, then decode JSON over it -- so by Validate
-// every field is concrete. Pure -- no file/env IO (that lives in the caller).
+// Parse unmarshals turnip.json with extra="forbid", then runs the full validation pass.
+// Defaults are seeded as it decodes -- the per-type UnmarshalJSON methods (Network type=router,
+// ingress flow port/listen in unmarshalFlow) set their default on the receiver, then decode JSON
+// over it -- so by Validate every field is concrete. Pure -- no file/env IO (that lives in the caller).
 func Parse(data []byte) (*Turnip, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields() // extra="forbid": a typo is a load error, not a silent drop
@@ -64,9 +63,7 @@ func (n *Network) validate(name string) error {
 		if !n.Subnet.IsValid() {
 			return fmt.Errorf("network %q: bridge network requires 'subnet'", name)
 		}
-		if len(n.Flows) > 0 {
-			return fmt.Errorf("network %q: flows is router-only; a bridge segment has no L3 forward hop", name)
-		}
+		// internal flows are router-only (checked per-flow below); edge flows are fine on a bridge.
 		if !n.Subnet.Contains(n.Gateway) {
 			return fmt.Errorf("network %q: bridge gateway %s not within subnet %s", name, n.Gateway, n.Subnet)
 		}
@@ -91,28 +88,62 @@ func (n *Network) validate(name string) error {
 		if err := a.validate(ctx); err != nil {
 			return err
 		}
-		// the edge rides the uplink: no uplink, no path out -> the rule is meaningless
-		if a.wantsEdge() && n.Uplink == nil {
-			return fmt.Errorf("%s: egress/ingress needs this network's uplink", cname)
-		}
 		// on a bridge, attach ip is a real subnet address (not a /32)
 		if n.Subnet.IsValid() && !n.Subnet.Contains(a.IP) {
 			return fmt.Errorf("%s: ip %s not within subnet %s", cname, a.IP, n.Subnet)
 		}
 	}
 
-	for i := range n.Flows {
-		f := n.Flows[i]
-		if err := f.validate(fmt.Sprintf("network %q flow", name)); err != nil {
+	for _, fl := range n.Flows {
+		if err := n.validateFlow(name, fl); err != nil {
 			return err
-		}
-		for _, end := range []string{f.From, f.To} {
-			if _, ok := n.Attach[end]; !ok {
-				return fmt.Errorf("network %q: flow endpoint %q is not attached to this network", name, end)
-			}
 		}
 	}
 	return nil
+}
+
+// validateFlow checks one flow against this network: its own field rules, that its endpoint(s)
+// are attached here, and the edge prerequisites (egress/ingress need an uplink; internal needs
+// a router). A type switch over the sealed Flow union -- the default fails closed.
+func (n *Network) validateFlow(name string, fl Flow) error {
+	attached := func(c string) error {
+		if _, ok := n.Attach[c]; !ok {
+			return fmt.Errorf("network %q: flow endpoint %q is not attached to this network", name, c)
+		}
+		return nil
+	}
+	ctx := fmt.Sprintf("network %q flow", name)
+	switch f := fl.(type) {
+	case *InternalFlow:
+		if n.Type == NetworkBridge {
+			return fmt.Errorf("%s: internal flow is router-only; a bridge segment has no L3 forward hop", ctx)
+		}
+		if err := f.validate(ctx); err != nil {
+			return err
+		}
+		if err := attached(f.From); err != nil {
+			return err
+		}
+		return attached(f.To)
+	case *EgressFlow:
+		if n.Uplink == nil {
+			return fmt.Errorf("%s: egress flow needs this network's uplink", ctx)
+		}
+		if err := f.validate(ctx); err != nil {
+			return err
+		}
+		return attached(f.From)
+	case *IngressFlow:
+		if n.Uplink == nil {
+			return fmt.Errorf("%s: ingress flow needs this network's uplink", ctx)
+		}
+		if err := f.validate(ctx); err != nil {
+			return err
+		}
+		return attached(f.To)
+	default:
+		return fmt.Errorf("%s: unhandled flow type %T", ctx, fl)
+	}
 }
 
 func (u *Uplink) validate(ctx string) error {
@@ -133,31 +164,39 @@ func (u *Uplink) validate(ctx string) error {
 	return nil
 }
 
-// --- attachment + edges ----------------------------------------------------
+// --- attachment ------------------------------------------------------------
 
 func (a *Attachment) validate(ctx string) error {
 	if !a.IP.Is4() {
 		return fmt.Errorf("%s: ip must be an IPv4 address", ctx)
 	}
-	if err := validateIfName(ctx+" interface", a.Interface); err != nil {
-		return err
+	return validateIfName(ctx+" interface", a.Interface)
+}
+
+// --- flows (the per-type field rules; endpoint/edge checks are in validateFlow) ------------
+
+func (f *InternalFlow) validate(ctx string) error {
+	if !f.Proto.valid() {
+		return fmt.Errorf("%s: internal proto %q invalid", ctx, f.Proto)
 	}
-	for i := range a.Egress.Rules {
-		if err := a.Egress.Rules[i].validate(ctx); err != nil {
-			return err
-		}
-	}
-	for i := range a.Ingress {
-		if err := a.Ingress[i].validate(ctx); err != nil {
-			return err
-		}
+	if !f.Port.Any {
+		return portInRange(ctx+" port", f.Port.Port)
 	}
 	return nil
 }
 
-func (r *EgressRule) validate(ctx string) error {
+func (f *EgressFlow) validate(ctx string) error {
+	if f.Proto.Any { // the wide "this container gets the internet" form: portless
+		if f.Port != nil {
+			return fmt.Errorf("%s: egress proto \"any\" carries no port; drop the 'port' field", ctx)
+		}
+		return nil
+	}
+	if len(f.Proto.List) == 0 {
+		return fmt.Errorf("%s: egress flow needs a proto (a scalar, a list, or \"any\")", ctx)
+	}
 	portBearing := false
-	for _, p := range r.Proto {
+	for _, p := range f.Proto.List {
 		if !p.valid() {
 			return fmt.Errorf("%s: egress proto %q invalid", ctx, p)
 		}
@@ -165,43 +204,33 @@ func (r *EgressRule) validate(ctx string) error {
 			portBearing = true
 		}
 	}
-	if portBearing && r.Port == nil {
-		return fmt.Errorf("%s: egress rule for %v missing 'port' (fail-closed); use a port or \"any\"", ctx, []Proto(r.Proto))
+	if portBearing && f.Port == nil {
+		return fmt.Errorf("%s for %v missing 'port' (fail-closed); use a port or \"any\"", ctx, []Proto(f.Proto.List))
 	}
-	if r.Port != nil && !portBearing {
+	if f.Port != nil && !portBearing {
 		return fmt.Errorf("%s: icmp egress carries no port; drop the 'port' field", ctx)
 	}
-	if r.Port != nil && !r.Port.Any {
-		return portInRange(ctx+" egress port", r.Port.Port)
+	if f.Port != nil && !f.Port.Any {
+		return portInRange(ctx+" egress port", f.Port.Port)
 	}
 	return nil
 }
 
-func (r *IngressRule) validate(ctx string) error {
-	if !r.Proto.valid() {
-		return fmt.Errorf("%s: ingress proto %q invalid", ctx, r.Proto)
+func (f *IngressFlow) validate(ctx string) error {
+	if !f.Proto.valid() {
+		return fmt.Errorf("%s: ingress proto %q invalid", ctx, f.Proto)
 	}
-	if r.Proto == ProtoICMP {
+	if f.Proto == ProtoICMP {
 		return fmt.Errorf("%s: ingress (DNAT) needs a port-bearing proto: tcp or udp", ctx)
 	}
-	if err := portInRange(ctx+" ingress host_port", r.HostPort); err != nil {
+	if err := portInRange(ctx+" ingress host_port", f.HostPort); err != nil {
 		return err
 	}
-	if err := portInRange(ctx+" ingress port", r.Port); err != nil {
+	if err := portInRange(ctx+" ingress port", f.Port); err != nil {
 		return err
 	}
-	if r.Listen.IsValid() && !r.Listen.Is4() {
+	if f.Listen.IsValid() && !f.Listen.Is4() {
 		return fmt.Errorf("%s: ingress listen must be an IPv4 address", ctx)
-	}
-	return nil
-}
-
-func (f *Flow) validate(ctx string) error {
-	if !f.Proto.valid() {
-		return fmt.Errorf("%s: proto %q invalid", ctx, f.Proto)
-	}
-	if !f.Port.Any {
-		return portInRange(ctx+" port", f.Port.Port)
 	}
 	return nil
 }
@@ -249,18 +278,6 @@ func validateLink(cname string, l Link) error {
 			return validateIfName(cname+" bridge", lk.Bridge)
 		}
 		return nil
-	case *MacvlanLink:
-		if !lk.Mode.valid() {
-			return fmt.Errorf("%s: link %q macvlan mode %q invalid", cname, lk.Name, lk.Mode)
-		}
-		return validateIfName(cname+" parent", lk.Parent)
-	case *IpvlanLink:
-		if !lk.Mode.valid() {
-			return fmt.Errorf("%s: link %q ipvlan mode %q invalid", cname, lk.Name, lk.Mode)
-		}
-		return validateIfName(cname+" parent", lk.Parent)
-	case *PhysLink:
-		return validateIfName(cname+" dev", lk.Dev)
 	default:
 		return fmt.Errorf("%s: unhandled link type %T", cname, l)
 	}
@@ -301,14 +318,18 @@ func (t *Turnip) crossCutting() error {
 				return fmt.Errorf("network %q: attaches unknown container %q", net, cname)
 			}
 			ifaces[cname] = append(ifaces[cname], iface{a.Interface, a.Default})
-			for _, ing := range a.Ingress {
-				key := portKey{ing.Listen.String(), ing.Proto, ing.HostPort}
-				if prev, dup := ports[key]; dup {
-					return fmt.Errorf("host_port collision (%s %s %d): %s vs %s",
-						key.listen, key.proto, key.hostPort, cname, prev)
-				}
-				ports[key] = cname
+		}
+		for _, fl := range n.Flows {
+			ing, ok := fl.(*IngressFlow)
+			if !ok {
+				continue
 			}
+			key := portKey{ing.Listen.String(), ing.Proto, ing.HostPort}
+			if prev, dup := ports[key]; dup {
+				return fmt.Errorf("host_port collision (%s %s %d): %s vs %s",
+					key.listen, key.proto, key.hostPort, ing.To, prev)
+			}
+			ports[key] = ing.To
 		}
 	}
 

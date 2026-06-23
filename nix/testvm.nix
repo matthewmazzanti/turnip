@@ -94,25 +94,11 @@ in
   security.sudo.wheelNeedsPassword = false;
   services.openssh.enable = true;
 
-  # Keep dhcpcd off the spare NIC (eth1, added below): it must stay unconfigured so it never
-  # gains a default route -- a phys link refuses the default-route NIC, and an idle eth1 is
-  # exactly what a borrowable physical device looks like. eth0 stays the uplink.
-  networking.dhcpcd.denyInterfaces = [ "eth1" ];
-
   virtualisation = {
     memorySize = 2048;
     cores = 2;
     graphics = false; # serial console in the terminal; headless + ssh otherwise
     diskSize = 8192; # MB; room for podman images
-    # A second virtio NIC (eth1) so phys links have a REAL-driver device to borrow -- one
-    # the kernel auto-returns to init on netns teardown. A dummy/veth/vlan is virtual and
-    # gets DELETED instead of returned, so it can't exercise the borrow/return doctrine; a
-    # virtio-net device is non-netns-local and moves back. Its slirp net (10.9.0.0/24, no
-    # default offered to the guest since dhcpcd ignores eth1) just keeps qemu happy.
-    qemu.options = [
-      "-netdev user,id=spare0,net=10.9.0.0/24"
-      "-device virtio-net-pci,netdev=spare0,mac=52:54:00:12:34:57"
-    ];
     forwardPorts = [
       {
         from = "host";
