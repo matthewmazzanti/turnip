@@ -154,18 +154,6 @@ type Runtime struct {
 	Podman   string `json:"podman"`
 }
 
-// ResolvedRuntime is Runtime with the environment-dependent defaults filled in (by the
-// caller's resolve step -- this package stays free of env/IO). Not parsed from JSON.
-type ResolvedRuntime struct {
-	User     string
-	UID      int
-	GID      int
-	Home     string
-	StateDir string
-	Nft      string
-	Podman   string
-}
-
 // --- edges: egress / ingress ----------------------------------------------
 
 // EgressRule is one scoped outbound allowance. proto and port are both required (a dropped
