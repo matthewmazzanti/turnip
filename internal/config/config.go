@@ -217,8 +217,23 @@ func (e Egress) active() bool { return e.All || len(e.Rules) > 0 }
 type IngressRule struct {
 	Proto    Proto      `json:"proto"`
 	HostPort int        `json:"host_port"`
-	Port     int        `json:"port"`   // 0 = unset -> defaults to HostPort (setDefaults)
+	Port     int        `json:"port"`   // 0 = unset -> defaults to HostPort (in UnmarshalJSON)
 	Listen   netip.Addr `json:"listen"` // host address the DNAT listens on; default 0.0.0.0
+}
+
+// UnmarshalJSON seeds the defaults, then decodes over them (strict -- extra keys rejected).
+// Listen defaults to 0.0.0.0 (any host address). Port is NOT seeded: it mirrors HostPort when
+// omitted, a derivation from a sibling input, so it's filled after the decode reads HostPort.
+func (r *IngressRule) UnmarshalJSON(b []byte) error {
+	r.Listen = netip.AddrFrom4([4]byte{0, 0, 0, 0})
+	type raw IngressRule
+	if err := strictUnmarshal(b, (*raw)(r)); err != nil {
+		return err
+	}
+	if r.Port == 0 { // omitted -> the published host port
+		r.Port = r.HostPort
+	}
+	return nil
 }
 
 // --- intra-network policy: flows (router-only) ----------------------------
@@ -349,10 +364,10 @@ func unmarshalLink(b []byte) (Link, error) {
 		var l VethLink
 		return &l, strictUnmarshal(b, &l)
 	case LinkMacvlan:
-		var l MacvlanLink
+		l := MacvlanLink{Mode: MacvlanBridge} // seed the default mode, decode over it
 		return &l, strictUnmarshal(b, &l)
 	case LinkIpvlan:
-		var l IpvlanLink
+		l := IpvlanLink{Mode: IpvlanL2}
 		return &l, strictUnmarshal(b, &l)
 	case LinkPhys:
 		var l PhysLink
@@ -387,6 +402,14 @@ type Network struct {
 	Uplink    *Uplink               `json:"uplink"`
 	Attach    map[string]Attachment `json:"attach"`
 	Flows     []Flow                `json:"flows"`
+}
+
+// UnmarshalJSON seeds the default type (router), then decodes over it -- so an omitted "type"
+// stays router rather than the empty string. Stays strict (extra keys rejected).
+func (n *Network) UnmarshalJSON(b []byte) error {
+	n.Type = NetworkRouter
+	type raw Network
+	return strictUnmarshal(b, (*raw)(n))
 }
 
 // --- the whole config ------------------------------------------------------

@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"net/netip"
 	"sort"
 )
 
-// Parse is the model_validate equivalent: unmarshal turnip.json with extra="forbid",
-// fill in the defaults, then run the full validation pass. Pure -- no file/env IO (that
-// lives in the caller).
+// Parse is the model_validate equivalent: unmarshal turnip.json with extra="forbid", then run
+// the full validation pass. Defaults are seeded as it decodes -- the per-type UnmarshalJSON
+// methods (Network type=router, IngressRule port/listen, the macvlan/ipvlan modes in
+// unmarshalLink) set their default on the receiver, then decode JSON over it -- so by Validate
+// every field is concrete. Pure -- no file/env IO (that lives in the caller).
 func Parse(data []byte) (*Turnip, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields() // extra="forbid": a typo is a load error, not a silent drop
@@ -18,50 +19,10 @@ func Parse(data []byte) (*Turnip, error) {
 	if err := dec.Decode(&t); err != nil {
 		return nil, fmt.Errorf("parse turnip.json: %w", err)
 	}
-	t.setDefaults()
 	if err := t.Validate(); err != nil {
 		return nil, err
 	}
 	return &t, nil
-}
-
-// setDefaults fills the non-zero defaults JSON omission leaves as Go zero values: a
-// network's type (router), a link's mode (macvlan bridge / ipvlan l2), an ingress rule's
-// container port (= host_port) and listen address (0.0.0.0). Done before Validate so the
-// rules see concrete values. (Uplink.NAT defaults via its accessor, not here.)
-func (t *Turnip) setDefaults() {
-	for name, n := range t.Networks {
-		if n.Type == "" {
-			n.Type = NetworkRouter
-		}
-		for cn, a := range n.Attach {
-			for i := range a.Ingress {
-				ing := &a.Ingress[i]
-				if ing.Port == 0 {
-					ing.Port = ing.HostPort
-				}
-				if !ing.Listen.IsValid() {
-					ing.Listen = netip.AddrFrom4([4]byte{0, 0, 0, 0})
-				}
-			}
-			n.Attach[cn] = a
-		}
-		t.Networks[name] = n
-	}
-	for _, c := range t.Containers {
-		for _, l := range c.Links {
-			switch lk := l.(type) {
-			case *MacvlanLink:
-				if lk.Mode == "" {
-					lk.Mode = MacvlanBridge
-				}
-			case *IpvlanLink:
-				if lk.Mode == "" {
-					lk.Mode = IpvlanL2
-				}
-			}
-		}
-	}
 }
 
 // Validate runs the whole model check: container links (field-level), each network's
