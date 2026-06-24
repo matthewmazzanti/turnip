@@ -25,6 +25,8 @@ in
   imports = [ ./turnip-host.nix ./base-vm.nix ];
 
   networking.hostName = "turnip";
+  # Resolve the world peer by name on the LAN (the integration harness dials `world`).
+  networking.extraHosts = "192.168.50.20 world";
 
   # Go + python3: the dev toolchain, and python3 on the host PATH is what the integration
   # harness's in-netns connect probes exec (via `turnip probe`) -- matching the check's host node.

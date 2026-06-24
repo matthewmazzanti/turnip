@@ -7,21 +7,23 @@ default:
     @just --list
 
 # Boot a dev VM: build its run-*-vm and exec it with the 9p repo mount (absolute $PWD, injected
-# here before the run script cd's to its temp dir) + a shared-LAN NIC on a qemu mcast socket --
-# both VMs join the same group, forming one L2 segment (eth1 in the guest). MAC differs per VM.
+# here before the run script cd's to its temp dir) + a shared-LAN NIC. The LAN is a UDP
+# point-to-point socket on loopback (eth1 in the guest): the two VMs cross-send (each `udp=` the
+# other's `localaddr=`), which is deterministic for two local instances -- unlike a mcast socket,
+# whose frames don't reliably loop between qemu processes on one host. MAC + ports differ per VM.
 # Serial console; Ctrl-a x to quit.
-_boot attr disk mac:
-    QEMU_OPTS="-virtfs local,path=$PWD,security_model=mapped-xattr,mount_tag=turnip -netdev socket,id=lan,mcast=230.0.0.1:1234 -device virtio-net-pci,netdev=lan,mac={{mac}}" \
+_boot attr disk mac lan:
+    QEMU_OPTS="-virtfs local,path=$PWD,security_model=mapped-xattr,mount_tag=turnip -netdev socket,id=lan,{{lan}} -device virtio-net-pci,netdev=lan,mac={{mac}}" \
     NIX_DISK_IMAGE="$PWD/{{disk}}" \
     exec "$(nix build --no-link --print-out-paths .#{{attr}})"/bin/run-*-vm
 
 # Boot the HOST dev VM (the system under test) on ssh :2222, disk ./turnip.qcow2.
 host:
-    just _boot host turnip.qcow2 52:54:00:00:50:10
+    just _boot host turnip.qcow2 52:54:00:00:50:10 "udp=127.0.0.1:52001,localaddr=127.0.0.1:52000"
 
 # Boot the WORLD dev VM (the LAN peer) on ssh :2223, disk ./turnip-world.qcow2.
 world:
-    just _boot world turnip-world.qcow2 52:54:00:00:50:20
+    just _boot world turnip-world.qcow2 52:54:00:00:50:20 "udp=127.0.0.1:52000,localaddr=127.0.0.1:52001"
 
 # Boot the host VM on a fresh disk (clean slate).
 host-fresh:

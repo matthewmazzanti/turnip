@@ -10,6 +10,8 @@
   imports = [ ./base-vm.nix ];
 
   networking.hostName = "turnip-world";
+  # Resolve the host by name on the LAN (symmetry / convenience).
+  networking.extraHosts = "192.168.50.10 host";
 
   # Peer tooling: socat (the peer-echo listener) + the netns/diagnostic CLIs for poking the LAN.
   environment.systemPackages = [ pkgs.socat pkgs.python3 pkgs.iproute2 pkgs.iputils ];
