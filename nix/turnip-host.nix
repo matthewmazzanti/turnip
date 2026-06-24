@@ -1,6 +1,6 @@
 # Shared substrate: "a host that can run turnip" -- rootless podman owned by the run
-# user (homelab), plus the nft / ip tooling turnip drives. Imported by the dev VM
-# (nix/testvm.nix).
+# user (homelab), plus the nft / ip tooling turnip drives. Imported by the host dev VM
+# (nix/host-vm.nix) and the hermetic check's host node.
 #
 # (This used to carry two required options -- turnip.env / turnip.testImage -- so the
 # hermetic pytest integration check and the dev VM could share it. That check is parked

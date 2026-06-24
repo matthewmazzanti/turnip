@@ -54,14 +54,14 @@ turnip's own `Provision` pattern reused, not a parallel impl.
 normal).
 
 **Bootstrap order (where to stand it up first):**
-1. **Local single VM** (the existing `testvm`) — prove the one risky primitive: a rootful `__probe`
-   entering the *rootless-podman-owned* netns. Host-only, no world, already warm.
+1. **Local single VM** (the host dev VM, `just host`) — prove the one risky primitive: a rootful
+   `__probe` entering the *rootless-podman-owned* netns. Host-only, no world, already warm.
 2. **`checks.integration.driverInteractive`** — the two-node check's interactive driver; boots
    `host`+`world` once and keeps them warm. Iterate the suite, re-run a single test by name.
 3. **`nix flake check`** — same nodes, cold + hermetic. The gate; free once (2) is green.
 
 The check and the local loop are *one* nixosTest definition — `driverInteractive` is just its
-interactive entrypoint, not a separate harness. The single-node `testvm` is only the step-1
+interactive entrypoint, not a separate harness. The single host dev VM is only the step-1
 scratchpad for the fd-exec primitive.
 
 ---

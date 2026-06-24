@@ -55,7 +55,7 @@ in `turnip.json` to change it.
 |------|------|
 | `cmd/turnip/` | the CLI + orchestration (the imperative shell): config/env IO, the `buildPlan` lowering (config → `Plan`, `plan.go`), the `applyPlan` driver (`apply.go`), and `up`/`down` dispatch |
 | `internal/` | `config` (the declarative model + validation), `netns` (podman bootstrap, netns lifecycle, the SCM_RIGHTS fd bridge), `dataplane` (gateway/veth/route wiring + the nft flow matrix) |
-| `nix/` | the flake helpers (`nix/lib`) + the rootless-podman dev VM (`testvm.nix`, `turnip-host.nix`) |
+| `nix/` | the flake helpers (`nix/lib`) + the dev VMs (`host-vm.nix` / `world-vm.nix` / `base-vm.nix`) over the rootless-podman base (`turnip-host.nix`) |
 | `test/integration/` | the hermetic two-node dataplane check (`checks.integration`) |
 | `docs/` | design docs — `ARCHITECTURE.md` (the config/plan/apply layering), `CONFIG-SKETCH.md` (config model + deferred-feature specs) |
 | `todo.md` | the open-work checklist |

@@ -20,17 +20,19 @@
       systems = [ "x86_64-linux" "aarch64-linux" ];
       perSystem = { system, pkgs }:
         let
-          # The dev VM, layered explicitly: the qemu-vm machinery, the rootless-podman host
-          # base, then the dev-VM specifics (9p mount of this repo, ssh/console, login users,
-          # Go toolchain).
-          testVM = lib.nixosSystem {
+          # The interactive dev VMs, layered explicitly over the qemu-vm machinery. host-vm
+          # stacks turnip-host (rootless podman) + base-vm (9p mount, ssh, mgmt NIC) + the bridged
+          # LAN; world-vm is the LAN peer (base-vm only). The shared LAN segment is wired at launch
+          # (a qemu mcast socket NIC) -- see the justfile.
+          mkVM = roleModule: lib.nixosSystem {
             inherit system;
             modules = [
               "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"
-              ./nix/turnip-host.nix # base: rootless podman host + nft/ip tooling
-              ./nix/testvm.nix # dev VM: 9p mount, ssh/console, login users, Go
+              roleModule
             ];
           };
+          hostVM = mkVM ./nix/host-vm.nix;
+          worldVM = mkVM ./nix/world-vm.nix;
 
           # The turnip binary itself: `nix build .#turnip` -> result/bin/turnip.
           # vendorHash = null while the port is stdlib-only; set it once the netlink/nft
@@ -76,7 +78,8 @@
           packages = {
             inherit turnip;
             default = turnip; # `nix build` -> the turnip binary
-            vm = testVM.config.system.build.vm; # `nix build .#vm` -> result/bin/run-turnip-vm
+            host = hostVM.config.system.build.vm; # `nix build .#host` -> result/bin/run-turnip-vm
+            world = worldVM.config.system.build.vm; # `nix build .#world` -> run-turnip-world-vm
           };
 
           # Hermetic two-node integration check: `nix flake check` (or `nix build
@@ -140,7 +143,7 @@
             packages = [
               pkgs.go
               pkgs.gopls
-              pkgs.just # task runner (see ./justfile); `just vm` builds + boots the dev VM
+              pkgs.just # task runner (see ./justfile); `just host` / `just world` boot the dev VMs
               pkgs.qemu-utils # qemu-img: qcow2 info + snapshot/rollback (savevm)
             ];
           };

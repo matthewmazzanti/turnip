@@ -12,8 +12,9 @@ build/
 dist/
 *.egg-info/
 
-# turnip dev VM
+# turnip dev VMs (host + world disks)
 turnip.qcow2
+turnip-world.qcow2
 result
 result-*
 
