@@ -24,6 +24,7 @@
 package netns
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -97,19 +98,27 @@ func (s *Set) Enter(name string, fn func() error) error {
 
 // --- parent side: the bootstrap -------------------------------------------
 
-// podmanUnshareCmd builds `podman unshare <self> <args...>` running as the rootless owner.
-// Dropping to the owner via SysProcAttr.Credential (not `sudo -u`, which would close passed
-// fds) makes `podman unshare` enter THAT user's persistent podman userns. USER/LOGNAME are
-// set too, not just HOME/XDG_RUNTIME_DIR: under sudo they're still "root", and podman
-// consults $USER for the subuid/subgid range -- left as root it finds none and falls back
-// to a single uid mapping, whose userns disagrees with the autoSubUidGidRange `podman run`
-// uses. (self is os.Executable, NOT "/proc/self/exe", which execve resolves against podman.)
+// podmanUnshareCmd builds `podman unshare <self> <args...>` running as the rootless owner --
+// the re-exec boundary for the provisioner/teardown children. See asOwner for the credential
+// and environment handling that makes podman enter the owner's userns.
 func podmanUnshareCmd(owner Owner, args ...string) (*exec.Cmd, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return nil, fmt.Errorf("resolve self: %w", err)
 	}
+	// (self is os.Executable, NOT "/proc/self/exe", which execve resolves against podman.)
 	cmd := exec.Command("podman", append([]string{"unshare", self}, args...)...)
+	asOwner(cmd, owner)
+	return cmd, nil
+}
+
+// asOwner configures cmd to run as the rootless owner inside THAT user's persistent podman
+// userns. Dropping via SysProcAttr.Credential (not `sudo -u`, which would close any passed
+// fds) is what makes `podman unshare` enter the owner's userns. USER/LOGNAME are set too, not
+// just HOME/XDG_RUNTIME_DIR: under sudo they're still "root", and podman consults $USER for the
+// subuid/subgid range -- left as root it finds none and falls back to a single uid mapping,
+// whose userns disagrees with the autoSubUidGidRange `podman run` uses.
+func asOwner(cmd *exec.Cmd, owner Owner) {
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	cmd.Dir = "/" // the child runs as the (dropped) owner; don't inherit a CWD it can't chdir into (e.g. root's home under sudo)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -121,7 +130,6 @@ func podmanUnshareCmd(owner Owner, args ...string) (*exec.Cmd, error) {
 		"LOGNAME="+owner.User,
 		fmt.Sprintf("XDG_RUNTIME_DIR=/run/user/%d", owner.UID),
 	)
-	return cmd, nil
 }
 
 // Bootstrap re-execs this binary under `podman unshare` as owner; the provisioner child
@@ -131,14 +139,21 @@ func Bootstrap(owner Owner, specs []Spec) (*Set, error) {
 		return &Set{fds: map[string]int{}}, nil
 	}
 	// SEQPACKET socketpair: one (name, fd) per message, so name<->fd can't misalign.
-	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+	pair, err := unix.Socketpair(
+		unix.AF_UNIX,
+		unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC,
+		0,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("socketpair: %w", err)
 	}
 	parentSock := pair[0]
 	childFile := os.NewFile(uintptr(pair[1]), "netns-bridge") // owns pair[1]; -> fd 3 in child
 
-	cmd, err := podmanUnshareCmd(owner, append([]string{ProvisionArg}, encodeSpecs(specs)...)...)
+	cmd, err := podmanUnshareCmd(
+		owner,
+		append([]string{ProvisionArg}, encodeSpecs(specs)...)...,
+	)
 	if err != nil {
 		childFile.Close()
 		unix.Close(parentSock)
@@ -181,7 +196,10 @@ func Teardown(owner Owner, paths []string) error {
 	if len(paths) == 0 {
 		return nil
 	}
-	cmd, err := podmanUnshareCmd(owner, append([]string{TeardownArg}, paths...)...)
+	cmd, err := podmanUnshareCmd(
+		owner,
+		append([]string{TeardownArg}, paths...)...,
+	)
 	if err != nil {
 		return err
 	}
@@ -189,6 +207,34 @@ func Teardown(owner Owner, paths []string) error {
 		return fmt.Errorf("teardown (`podman unshare`) failed: %w", err)
 	}
 	return nil
+}
+
+// --- parent side: the probe (run a command inside a pinned netns) ----------
+
+// Probe runs cmd inside the netns pinned at nsPath: `podman unshare nsenter --net=<nsPath> --
+// <cmd>` as owner. `podman unshare` enters the owner's user+mount ns -- where the pin is
+// visible and we hold CAP_SYS_ADMIN over the netns -- and nsenter does the setns+exec. The pin
+// lives ONLY in podman's mount ns, so plain host nsenter couldn't resolve it: the unshare is
+// the load-bearing part, nsenter is just the entry. This is `podman run --network ns:<nsPath>`
+// minus the OCI/conmon cold-start -- the fast in-netns probe.
+//
+// Returns the probe command's exit code (err == nil): a non-zero code is a RESULT (the probe
+// ran and e.g. the connection was refused), not a harness failure. err != nil means the probe
+// could not be launched at all.
+func Probe(owner Owner, nsPath string, cmd []string) (int, error) {
+	if len(cmd) == 0 {
+		return 0, fmt.Errorf("probe: empty command")
+	}
+	c := exec.Command("podman", append([]string{"unshare", "nsenter", "--net=" + nsPath, "--"}, cmd...)...)
+	asOwner(c, owner)
+	if err := c.Run(); err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return ee.ExitCode(), nil // the probe ran; its status is the result
+		}
+		return 0, fmt.Errorf("probe (`podman unshare nsenter`): %w", err)
+	}
+	return 0, nil
 }
 
 // --- child side: the provisioner ------------------------------------------
@@ -316,7 +362,12 @@ func recvFDs(sock int) (map[string]int, error) {
 	for {
 		// MSG_CMSG_CLOEXEC: received fds arrive WITHOUT cloexec otherwise, leaking into a
 		// later exec.
-		n, oobn, _, _, err := unix.Recvmsg(sock, name, oob, unix.MSG_CMSG_CLOEXEC)
+		n, oobn, _, _, err := unix.Recvmsg(
+			sock,
+			name,
+			oob,
+			unix.MSG_CMSG_CLOEXEC,
+		)
 		if err != nil {
 			return out, fmt.Errorf("recvmsg: %w", err)
 		}

@@ -57,6 +57,10 @@ func run(args []string) error {
 		return up(*configPath)
 	case "down":
 		return down(*configPath)
+	case "probe":
+		// run a command inside a container's netns via `podman unshare nsenter` -- the
+		// test/debug probe. `turnip probe <container> -- <cmd...>`.
+		return probe(*configPath, fs.Args()[1:])
 	case netns.ProvisionArg:
 		// the re-exec'd provisioner child (inside podman's userns) -- not a user command;
 		// the name/path specs are the positional args after the sentinel.
@@ -76,6 +80,8 @@ func usage() {
 usage:
   turnip [up]        create + wire the namespaces the config implies (default)
   turnip down        tear them down
+  turnip probe <container> -- <cmd...>
+                     run a command inside a container's netns (fd-exec; no podman run)
 
 flags:
   -c, --config PATH  config file (default: $TURNIP_CONFIG, else ./turnip.json)
