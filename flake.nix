@@ -64,6 +64,13 @@
 
           # The fixture configs (one turnip.json per topology), referenced by -fixtures.
           fixtures = ./test/integration/fixtures;
+
+          # The world peer's egress target: a forking TCP listener on :8443 that replies with the
+          # source address it sees (SOCAT_PEERADDR). An egress connect reads this back to verify
+          # the source was masqueraded to the host edge (EG-2), not the container's 10.x.
+          peerEcho = pkgs.writeShellScript "peer-echo" ''
+            exec ${pkgs.socat}/bin/socat TCP-LISTEN:8443,reuseaddr,fork SYSTEM:'printf "%s" "$SOCAT_PEERADDR"'
+          '';
         in
         {
           packages = {
@@ -84,9 +91,18 @@
                 imports = [ ./nix/turnip-host.nix ];
                 environment.systemPackages = [ turnip pkgs.python3 pkgs.iputils pkgs.openssh ];
               };
-              # The external peer: just sshd, key-only root login authorized for the shared
-              # throwaway test key. Reached only over SSH from host.
+              # The external peer: sshd (control) + a peer-echo listener on :8443 (the egress
+              # target). Firewall off so the masqueraded egress connection lands. Reached from host.
               world = { ... }: {
+                networking.firewall.enable = false;
+                systemd.services.peer-echo = {
+                  description = "echo the source address a connecting client presents";
+                  wantedBy = [ "multi-user.target" ];
+                  serviceConfig = {
+                    ExecStart = "${peerEcho}";
+                    Restart = "always";
+                  };
+                };
                 services.openssh.enable = true;
                 services.openssh.settings.PermitRootLogin = "prohibit-password";
                 users.users.root.openssh.authorizedKeys.keyFiles = [ ./nix/testvm_key.pub ];
@@ -96,6 +112,7 @@
               start_all()
               host.wait_for_unit("multi-user.target")
               world.wait_for_unit("sshd.service")
+              world.wait_for_open_port(8443)  # the egress peer-echo target
 
               # rootless podman owner (homelab, uid 1001) must be live before `turnip up`.
               host.wait_until_succeeds("test -d /run/user/1001", timeout=90)

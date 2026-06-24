@@ -1,0 +1,17 @@
+{
+  "runtime": { "user": "homelab" },
+  "containers": { "egr": {} },
+  "networks": {
+    "wan": {
+      "gateway": "10.0.0.1",
+      "gateway_if": "gw0",
+      "uplink": { "host_if": "upwan", "router_if": "wan0", "link": "10.255.0.0" },
+      "attach": {
+        "egr": { "ip": "10.0.0.11", "interface": "eth0" }
+      },
+      "flows": [
+        { "type": "egress", "from": "egr", "proto": "tcp", "port": 8443 }
+      ]
+    }
+  }
+}

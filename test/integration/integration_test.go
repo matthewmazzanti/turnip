@@ -198,6 +198,32 @@ func (h *H) pings(t *testing.T, src, ip string) int {
 	return code
 }
 
+// recvPeer connects to ip:port and prints the source address the SERVER reports seeing. Run
+// against world's peer-echo, it reads back the (masqueraded) source of an egress connection.
+const recvPeer = `
+import socket, sys
+ip, port = sys.argv[1], int(sys.argv[2])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(4)
+s.connect((ip, port))
+sys.stdout.write(s.recv(64).decode())
+`
+
+// worldIPv4 resolves the world node's test-LAN IPv4 (via the host's /etc/hosts), so a container
+// can dial it numerically -- container netns have no name resolution for the peer.
+func (h *H) worldIPv4(t *testing.T) string {
+	t.Helper()
+	out, code, err := h.host.Run("getent", "ahostsv4", "world")
+	if err != nil || code != 0 {
+		t.Fatalf("resolve world ipv4: code=%d err=%v\n%s", code, err, out)
+	}
+	f := strings.Fields(out)
+	if len(f) == 0 {
+		t.Fatalf("no ipv4 for world in: %q", out)
+	}
+	return f[0]
+}
+
 // --- assertion helpers ----------------------------------------------------
 
 // wantTCP / wantUDP run a connect probe from src to ip:port and assert the verdict. want is a
@@ -381,4 +407,33 @@ func TestL2Isolation(t *testing.T) {
 			c.run(t)
 		})
 	}
+}
+
+// TestL3Egress is fixture L3 (§4 egress): one network with an uplink and a container egr with a
+// scoped egress flow (tcp:8443). egr reaches world on the allowed port and world sees a
+// MASQUERADED source (EG-1+EG-2); the unscoped port is dropped at the router (EG-3). Needs world.
+func TestL3Egress(t *testing.T) {
+	h := newH()
+	if h.world == nil {
+		t.Skip("needs -world (the egress target)")
+	}
+	h.up(t, "l3.json")
+	t.Cleanup(func() { h.down(t) })
+	world := h.worldIPv4(t)
+
+	// EG-1 + EG-2: egr egresses to world:8443 (allowed); world's peer-echo reports the source it
+	// saw, which must be masqueraded to the host edge -- not egr's 10.0.0.11.
+	out, code := h.probe(t, "egr", "python3", "-c", recvPeer, world, "8443")
+	if code != 0 {
+		t.Fatalf("EG-1: egr->world:8443 egress failed (code %d):\n%s", code, out)
+	}
+	seen := strings.TrimSpace(out)
+	if seen == "10.0.0.11" {
+		t.Errorf("EG-2: world saw the container IP %q -- masquerade not applied", seen)
+	} else if !strings.HasPrefix(seen, "192.168.") {
+		t.Errorf("EG-2: world saw %q, want the host's masqueraded test-LAN (192.168.x) addr", seen)
+	}
+
+	// EG-3: the egress is scoped to 8443, so 8080 is not allowed -> dropped at the router.
+	h.wantTCP(t, "EG-3", "egr", world, 8080, unreached)
 }
