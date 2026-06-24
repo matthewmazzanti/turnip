@@ -7,7 +7,8 @@
 #   nix/vm.sh run   host|world      foreground interactive boot (serial console; Ctrl-a x to quit)
 #   nix/vm.sh up    host|world      headless detached boot (console -> vm/<role>.log; QMP -> vm/<role>.sock)
 #   nix/vm.sh log   host|world [n]  tail the console log (default 40 lines)
-#   nix/vm.sh qmp   host|world '<json>'   send one QMP command
+#   nix/vm.sh qmp   host|world '<cmd>'    one qmp-shell command (e.g. query-status)
+#   nix/vm.sh snap  host|world save|restore <name>   qcow2 internal snapshot (checkpoint/rollback)
 #   nix/vm.sh stop  host|world      graceful ACPI powerdown
 #   nix/vm.sh reset host|world      reboot (QMP system_reset)
 #   nix/vm.sh pid   host|world      the qemu pid (by disk), or empty
@@ -39,8 +40,16 @@ qopts="-virtfs local,path=$root,security_model=mapped-xattr,mount_tag=turnip"
 qopts+=" -netdev socket,id=lan,$lan -device virtio-net-pci,netdev=lan,mac=$mac"
 
 runbin() { ls "$(nix build --no-link --print-out-paths "$root#$role")"/bin/run-*-vm; }
-# qmp: negotiate capabilities, then send the one command; replies ignored (fire-and-forget).
-qmp() { printf '%s\n%s\n' '{"execute":"qmp_capabilities"}' "$1" | socat -t1 - "UNIX-CONNECT:$sock" >/dev/null 2>&1; }
+
+# qmp sends one command via qmp-shell (the canned client: it negotiates capabilities and takes the
+# friendly `command arg=val` syntax). Resolved from PATH (dev shell) or nixpkgs (cached) so vm.sh
+# works either way -- same `nix build` it already leans on for the VM image.
+qmpshell=""
+qmp() {
+  [ -n "$qmpshell" ] || qmpshell=$(command -v qmp-shell 2>/dev/null \
+    || ls "$(nix build --no-link --print-out-paths nixpkgs#python3Packages.qemu-qmp)"/bin/qmp-shell)
+  echo "$1" | "$qmpshell" "$sock"
+}
 
 case "$cmd" in
   run)
@@ -52,8 +61,14 @@ case "$cmd" in
     disown || true
     echo "$role: booting detached -> $log (control: nix/vm.sh {log,stop,reset} $role)" ;;
   log)   tail -n "${3:-40}" "$log" ;;
-  qmp)   qmp "${3:?json arg}" ;;
+  qmp)   qmp "${3:?qmp-shell command, e.g. query-status}" ;;
   pid)   pgrep -f "file=$disk" || true ;;
+  snap)  # snap <role> save|restore <name> -- qcow2 internal snapshot via the human monitor
+    case "${3:?save|restore}" in
+      save)    qmp "human-monitor-command command-line=\"savevm ${4:?snapshot name}\""; echo "$role: saved snapshot '$4'" ;;
+      restore) qmp "human-monitor-command command-line=\"loadvm ${4:?snapshot name}\""; echo "$role: restored snapshot '$4'" ;;
+      *) echo "snap: want save|restore" >&2; exit 1 ;;
+    esac ;;
   ready) # poll ssh until the VM accepts a login (for scripted waits after `up`)
     for _ in $(seq 1 40); do
       if timeout 6 ssh -i "$root/nix/testvm_key" -p "$port" -o StrictHostKeyChecking=no \
@@ -63,8 +78,8 @@ case "$cmd" in
       sleep 2
     done
     echo "$role: not ready after timeout" >&2; exit 1 ;;
-  stop)  qmp '{"execute":"system_powerdown"}'; echo "$role: ACPI powerdown sent" ;;
-  reset) qmp '{"execute":"system_reset"}'; echo "$role: reset sent" ;;
+  stop)  qmp 'system_powerdown'; echo "$role: ACPI powerdown sent" ;;
+  reset) qmp 'system_reset'; echo "$role: reset sent" ;;
   fresh) rm -f "$disk"; echo "$role: disk removed ($disk)" ;;
   *) echo "unknown cmd: $cmd (want run|up|log|qmp|stop|reset|pid|fresh)" >&2; exit 1 ;;
 esac
