@@ -98,6 +98,7 @@
               # target). Firewall off so the masqueraded egress connection lands. Reached from host.
               world = { ... }: {
                 networking.firewall.enable = false;
+                environment.systemPackages = [ pkgs.socat ]; # the ingress client (L4 IN-1/IN-3)
                 systemd.services.peer-echo = {
                   description = "echo the source address a connecting client presents";
                   wantedBy = [ "multi-user.target" ];

@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 var (
@@ -207,6 +208,22 @@ s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(4)
 s.connect((ip, port))
 sys.stdout.write(s.recv(64).decode())
+`
+
+// acceptPeer binds 0.0.0.0:<port> in the target netns, accepts ONE connection, prints the peer's
+// source address, and exits. Run in svc's netns it reveals the source an INGRESS connection
+// presents -- which must be world's real IP, since ingress is DNAT-only (never masqueraded).
+const acceptPeer = `
+import socket, sys
+port = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", port)); s.listen(1); s.settimeout(10)
+try:
+    c, addr = s.accept()
+except (TimeoutError, socket.timeout):
+    sys.exit(2)
+sys.stdout.write(addr[0]); c.close()
 `
 
 // worldIPv4 resolves the world node's test-LAN IPv4 (via the host's /etc/hosts), so a container
@@ -436,4 +453,64 @@ func TestL3Egress(t *testing.T) {
 
 	// EG-3: the egress is scoped to 8443, so 8080 is not allowed -> dropped at the router.
 	h.wantTCP(t, "EG-3", "egr", world, 8080, unreached)
+}
+
+// TestL4Ingress is fixture L4 (§4 ingress): one network with an uplink and a container svc that
+// publishes host:8080 -> svc:8080 (the IngressFlow omits `port`, exercising the default-to-
+// host_port path). world (the external client) connects to the host's published port and lands on
+// svc via prerouting DNAT (IN-1); svc sees world's REAL source IP, since ingress is DNAT-only and
+// never masqueraded (IN-2); an unpublished port has no DNAT and is refused (IN-3). Needs world.
+func TestL4Ingress(t *testing.T) {
+	h := newH()
+	if h.world == nil {
+		t.Skip("needs -world (the ingress client)")
+	}
+	h.up(t, "l4.json")
+	t.Cleanup(func() { h.down(t) })
+	world := h.worldIPv4(t)
+
+	// The in-svc listener runs via a LOCAL probe (h.host.Run, not h.probe -- t.Fatalf is illegal
+	// off the test goroutine), so no ssh argv mangling. It prints the source it sees, then exits.
+	type res struct {
+		out  string
+		code int
+		err  error
+	}
+	srv := make(chan res, 1)
+	go func() {
+		argv := []string{*turnipBin, "-c", h.fixture, "probe", "svc", "--", "python3", "-c", acceptPeer, "8080"}
+		out, code, err := h.host.Run(argv...)
+		srv <- res{out, code, err}
+	}()
+	time.Sleep(1 * time.Second) // let the listener bind before the client dials
+
+	// IN-1: world connects to the published host port (8080 -> svc:8080 via DNAT). socat's args
+	// have no shell metacharacters, so they survive the ssh argv re-split. host resolves via the
+	// driver's /etc/hosts; the DNAT listens on 0.0.0.0 so any host edge address matches.
+	out, code, err := h.world.Run("socat", "-u", "/dev/null", "TCP:host:8080,connect-timeout=5")
+	if err != nil {
+		t.Fatalf("IN-1: world socat launch: %v\n%s", err, out)
+	}
+	if code != 0 {
+		t.Errorf("IN-1: world->host:8080 ingress did not connect (code %d):\n%s", code, out)
+	}
+
+	// IN-2: the source svc saw must be world's REAL ip -- ingress is DNAT-only, not masqueraded.
+	r := <-srv
+	if r.err != nil {
+		t.Fatalf("IN-2: svc listener: %v\n%s", r.err, r.out)
+	}
+	if r.code != 0 {
+		t.Fatalf("IN-2: svc listener exited %d (no connection seen):\n%s", r.code, r.out)
+	}
+	if seen := strings.TrimSpace(r.out); seen != world {
+		t.Errorf("IN-2: svc saw source %q, want world's real ip %q (ingress must not masquerade)", seen, world)
+	}
+
+	// IN-3: an unpublished port has no DNAT -> the connection is refused (or the host drops it).
+	if _, code, err = h.world.Run("socat", "-u", "/dev/null", "TCP:host:9999,connect-timeout=5"); err != nil {
+		t.Fatalf("IN-3: world socat launch: %v", err)
+	} else if code == 0 {
+		t.Errorf("IN-3: world->host:9999 connected, want refused (no DNAT for the unpublished port)")
+	}
 }

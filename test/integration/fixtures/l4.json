@@ -1,0 +1,17 @@
+{
+  "runtime": { "user": "homelab" },
+  "containers": { "svc": {} },
+  "networks": {
+    "pub": {
+      "gateway": "10.0.0.1",
+      "gateway_if": "gw0",
+      "uplink": { "host_if": "uppub", "router_if": "pub0", "link": "10.255.1.0" },
+      "attach": {
+        "svc": { "ip": "10.0.0.11", "interface": "eth0" }
+      },
+      "flows": [
+        { "type": "ingress", "to": "svc", "proto": "tcp", "host_port": 8080 }
+      ]
+    }
+  }
+}
