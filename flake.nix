@@ -145,6 +145,7 @@
               pkgs.gopls
               pkgs.just # task runner (see ./justfile); `just host` / `just world` boot the dev VMs
               pkgs.qemu-utils # qemu-img: qcow2 info + snapshot/rollback (savevm)
+              pkgs.python3Packages.qemu-qmp # `qmp-shell vm/<role>.sock` -- interactive QMP client
             ];
           };
         };
