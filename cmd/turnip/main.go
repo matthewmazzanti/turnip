@@ -80,8 +80,10 @@ func usage() {
 usage:
   turnip [up]        create + wire the namespaces the config implies (default)
   turnip down        tear them down
-  turnip probe <container> -- <cmd...>
-                     run a command inside a container's netns (fd-exec; no podman run)
+  turnip probe <target> -- <cmd...>
+                     run a command inside a netns (fd-exec; no podman run).
+                     <target>: a container name, or router:<net>
+
 
 flags:
   -c, --config PATH  config file (default: $TURNIP_CONFIG, else ./turnip.json)

@@ -82,7 +82,7 @@
               # probe toolbox (python3 drives the in-netns TCP connect; ip/nft from the base).
               host = { ... }: {
                 imports = [ ./nix/turnip-host.nix ];
-                environment.systemPackages = [ turnip pkgs.python3 pkgs.openssh ];
+                environment.systemPackages = [ turnip pkgs.python3 pkgs.iputils pkgs.openssh ];
               };
               # The external peer: just sshd, key-only root login. Reached only over SSH from
               # host; its authorized_keys is seeded at runtime by the driver (below).
