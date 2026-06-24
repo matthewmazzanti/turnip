@@ -41,15 +41,9 @@ qopts+=" -netdev socket,id=lan,$lan -device virtio-net-pci,netdev=lan,mac=$mac"
 
 runbin() { ls "$(nix build --no-link --print-out-paths "$root#$role")"/bin/run-*-vm; }
 
-# qmp sends one command via qmp-shell (the canned client: it negotiates capabilities and takes the
-# friendly `command arg=val` syntax). Resolved from PATH (dev shell) or nixpkgs (cached) so vm.sh
-# works either way -- same `nix build` it already leans on for the VM image.
-qmpshell=""
-qmp() {
-  [ -n "$qmpshell" ] || qmpshell=$(command -v qmp-shell 2>/dev/null \
-    || ls "$(nix build --no-link --print-out-paths nixpkgs#python3Packages.qemu-qmp)"/bin/qmp-shell)
-  echo "$1" | "$qmpshell" "$sock"
-}
+# qmp sends one command via qmp-shell (the canned client: negotiates capabilities, friendly
+# `command arg=val` syntax). qmp-shell comes from the flake devShell (direnv).
+qmp() { echo "$1" | qmp-shell "$sock"; }
 
 case "$cmd" in
   run)
