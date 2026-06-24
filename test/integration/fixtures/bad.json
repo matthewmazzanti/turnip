@@ -1,0 +1,17 @@
+{
+  "runtime": { "user": "homelab" },
+  "containers": { "adv": {}, "victim": {} },
+  "networks": {
+    "lan": {
+      "gateway": "10.0.0.1",
+      "gateway_if": "gw0",
+      "attach": {
+        "adv": { "ip": "10.0.0.11", "interface": "eth0" },
+        "victim": { "ip": "10.0.0.12", "interface": "eth0" }
+      },
+      "flows": [
+        { "type": "internal", "from": "adv", "to": "victim", "proto": "tcp", "port": 8080 }
+      ]
+    }
+  }
+}

@@ -199,6 +199,21 @@ func (h *H) pings(t *testing.T, src, ip string) int {
 	return code
 }
 
+// rpfDrops reads the strict-rp_filter drop counter (IPReversePathFilter) in a router netns. The
+// delta across a spoofed burst is the count the kernel dropped on reverse-path failure.
+func (h *H) rpfDrops(t *testing.T, router string) int {
+	t.Helper()
+	out, code := h.probe(t, router, "python3", "-c", rpfCounter)
+	if code != 0 {
+		t.Fatalf("read rp_filter counter in %s: code=%d\n%s", router, code, out)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil {
+		t.Fatalf("parse rp_filter counter %q: %v", out, err)
+	}
+	return n
+}
+
 // recvPeer connects to ip:port and prints the source address the SERVER reports seeing. Run
 // against world's peer-echo, it reads back the (masqueraded) source of an egress connection.
 const recvPeer = `
@@ -224,6 +239,46 @@ try:
 except (TimeoutError, socket.timeout):
     sys.exit(2)
 sys.stdout.write(addr[0]); c.close()
+`
+
+// spoofSend crafts n IP/ICMP echo packets with a chosen (often unowned) source address and emits
+// them on a raw IPPROTO_RAW socket (IP_HDRINCL) inside the source netns. argv: src dst n. The
+// netns holds CAP_NET_RAW via the probe (podman unshare), so the build+send succeeds locally; the
+// router's strict rp_filter is what drops a forged saddr (BAD-1). stdlib-only -- no scapy.
+const spoofSend = `
+import socket, struct, sys
+def cks(b):
+    if len(b) % 2: b += b"\x00"
+    s = sum(struct.unpack("!%dH" % (len(b)//2), b)); s = (s >> 16) + (s & 0xffff); s += s >> 16
+    return (~s) & 0xffff
+src, dst, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+pay = b"turnip-bad"
+icmp = struct.pack("!BBHHH", 8, 0, 0, 0x1234, 1) + pay
+icmp = struct.pack("!BBHHH", 8, 0, cks(icmp), 0x1234, 1) + pay
+tot = 20 + len(icmp)
+for _ in range(n):
+    h = struct.pack("!BBHHHBBH4s4s", 0x45, 0, tot, 0, 0, 64, 1, 0,
+                    socket.inet_aton(src), socket.inet_aton(dst))
+    h = struct.pack("!BBHHHBBH4s4s", 0x45, 0, tot, 0, 0, 64, 1, cks(h),
+                    socket.inet_aton(src), socket.inet_aton(dst))
+    s.sendto(h + icmp, (dst, 0))
+`
+
+// rpfCounter prints the netns-scoped IPReversePathFilter counter (strict rp_filter drops) from
+// /proc/net/netstat as a bare integer. Read in the router netns it counts forged-saddr drops.
+const rpfCounter = `
+import sys
+want = "IPReversePathFilter"
+val = 0
+with open("/proc/net/netstat") as f:
+    lines = f.read().splitlines()
+for i in range(0, len(lines) - 1, 2):
+    keys, vals = lines[i].split(), lines[i + 1].split()
+    if want in keys:
+        val = int(vals[keys.index(want)]); break
+sys.stdout.write(str(val))
 `
 
 // worldIPv4 resolves the world node's test-LAN IPv4 (via the host's /etc/hosts), so a container
@@ -539,5 +594,32 @@ func TestL4Ingress(t *testing.T) {
 		t.Fatalf("IN-3: world socat launch: %v", err)
 	} else if code == 0 {
 		t.Errorf("IN-3: world->host:9999 connected, want refused (no DNAT for the unpublished port)")
+	}
+}
+
+// TestBADSpoofedSource is fixture bad's anti-spoof invariant (§5 BAD-1, host-only): the adversary
+// container forges an UNOWNED source address (10.0.0.99, attached to no veth) and raw-sends a burst
+// at the gateway. The container's own stack emits them (CAP_NET_RAW via the probe), but the router
+// drops every one on reverse-path failure -- the forged saddr routes back to no interface, let
+// alone this veth. Asserted on the exact IPReversePathFilter counter delta, not a non-reply.
+//
+// The counter is netns-global, so this owns its router (a dedicated bad fixture) and reads
+// before/after around its own burst -- no parallel spoof-sender may share the router meanwhile.
+func TestBADSpoofedSource(t *testing.T) {
+	h := newH()
+	h.up(t, "bad.json")
+	t.Cleanup(func() { h.down(t) })
+
+	const burst = 5
+	before := h.rpfDrops(t, "router:lan")
+
+	// adv forges 10.0.0.99 (unowned) -> the gateway. The send itself succeeds in adv's netns.
+	out, code := h.probe(t, "adv", "python3", "-c", spoofSend, "10.0.0.99", "10.0.0.1", strconv.Itoa(burst))
+	if code != 0 {
+		t.Fatalf("BAD-1: spoof send failed (code %d):\n%s", code, out)
+	}
+
+	if got := h.rpfDrops(t, "router:lan") - before; got != burst {
+		t.Errorf("BAD-1: rp_filter dropped %d of %d forged-saddr packets, want all (before=%d)", got, burst, before)
 	}
 }
