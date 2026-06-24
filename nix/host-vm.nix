@@ -38,6 +38,13 @@ in
     openssh.authorizedKeys.keyFiles = [ ./testvm_key.pub ];
   };
 
+  # The throwaway test key, baked in for the integration harness to ssh the world peer -- no
+  # manual key staging. Root-owned 0600 so ssh accepts it when the harness runs as root.
+  environment.etc."turnip/ssh-key" = {
+    source = ./testvm_key;
+    mode = "0600";
+  };
+
   # The modeled LAN: eth1 (the qemu mcast NIC, wired at launch) is enslaved to br-lan, which holds
   # the addresses. Two IPs -- the second is the anchor for a yet-to-be-added secondary forward
   # rule. ConfigureWithoutCarrier brings the bridge up even before a peer appears on the segment.

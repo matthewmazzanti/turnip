@@ -6,6 +6,14 @@
 # Build + run:  just world   (boots qemu; persists ./turnip-world.qcow2; serial console)
 # Drive it:     nix/ssh-vm.sh world [dev] [cmd]   (world on :2223)
 { pkgs, ... }:
+let
+  # The egress masquerade observer: a forking listener on :8443 replying with the source it sees
+  # (SOCAT_PEERADDR). Wrapped in a script (not an inline ExecStart) so the socat SYSTEM quoting +
+  # $-expansion survive -- systemd's ExecStart parser would otherwise mangle them.
+  peerEcho = pkgs.writeShellScript "peer-echo" ''
+    exec ${pkgs.socat}/bin/socat TCP-LISTEN:8443,reuseaddr,fork SYSTEM:'printf "%s" "$SOCAT_PEERADDR"'
+  '';
+in
 {
   imports = [ ./base-vm.nix ];
 
@@ -36,7 +44,7 @@
     description = "echo the source address a connecting client presents";
     wantedBy = [ "multi-user.target" ];
     serviceConfig = {
-      ExecStart = "${pkgs.socat}/bin/socat TCP-LISTEN:8443,reuseaddr,fork SYSTEM:'printf \"%s\" \"$SOCAT_PEERADDR\"'";
+      ExecStart = peerEcho;
       Restart = "always";
     };
   };

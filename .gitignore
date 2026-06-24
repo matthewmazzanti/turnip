@@ -12,15 +12,10 @@ build/
 dist/
 *.egg-info/
 
-# turnip dev VMs (host + world disks)
-turnip.qcow2
-turnip-world.qcow2
+# turnip dev-VM state: disks, console logs, QMP sockets (nix/vm.sh writes here)
+vm/
 result
 result-*
 
-# nix/testvm_key is a committed throwaway SSH key: it authenticates between the dev VM /
+# nix/testvm_key is a committed throwaway SSH key: it authenticates between the dev VMs /
 # the hermetic integration nodes only -- no security value, kept in-repo on purpose.
-
-# headless dev-VM control artifacts (nix/vm.sh)
-.vm-*.log
-.vm-*.sock

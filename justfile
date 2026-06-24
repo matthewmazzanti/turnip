@@ -1,36 +1,43 @@
-# turnip dev tasks. `just` runs recipes from the repo root (where this justfile lives), so the
-# VMs' relative 9p mount (path=$PWD) and the ./*.qcow2 disks land here regardless of where you
-# invoke from -- the checkout-independence convention.
+# turnip dev tasks. The dev-VM launch/control logic lives in nix/vm.sh (single source of truth);
+# these recipes are thin wrappers. VM state (disks, console logs, QMP sockets) lives in vm/
+# (gitignored). `just` runs from the repo root, so the VMs' 9p mount + vm/ land here.
 
 # List recipes.
 default:
     @just --list
 
-# Boot a dev VM: build its run-*-vm and exec it with the 9p repo mount (absolute $PWD, injected
-# here before the run script cd's to its temp dir) + a shared-LAN NIC. The LAN is a UDP
-# point-to-point socket on loopback (eth1 in the guest): the two VMs cross-send (each `udp=` the
-# other's `localaddr=`), which is deterministic for two local instances -- unlike a mcast socket,
-# whose frames don't reliably loop between qemu processes on one host. MAC + ports differ per VM.
-# Serial console; Ctrl-a x to quit.
-_boot attr disk mac lan:
-    QEMU_OPTS="-virtfs local,path=$PWD,security_model=mapped-xattr,mount_tag=turnip -netdev socket,id=lan,{{lan}} -device virtio-net-pci,netdev=lan,mac={{mac}}" \
-    NIX_DISK_IMAGE="$PWD/{{disk}}" \
-    exec "$(nix build --no-link --print-out-paths .#{{attr}})"/bin/run-*-vm
-
-# Boot the HOST dev VM (the system under test) on ssh :2222, disk ./turnip.qcow2.
+# Boot the HOST / WORLD dev VM interactively (foreground serial console; Ctrl-a x to quit).
 host:
-    just _boot host turnip.qcow2 52:54:00:00:50:10 "udp=127.0.0.1:52001,localaddr=127.0.0.1:52000"
-
-# Boot the WORLD dev VM (the LAN peer) on ssh :2223, disk ./turnip-world.qcow2.
+    nix/vm.sh run host
 world:
-    just _boot world turnip-world.qcow2 52:54:00:00:50:20 "udp=127.0.0.1:52000,localaddr=127.0.0.1:52001"
+    nix/vm.sh run world
 
-# Boot the host VM on a fresh disk (clean slate).
+# Boot on a fresh disk (clean slate), interactively.
 host-fresh:
-    rm -f turnip.qcow2
-    just host
-
-# Boot the world VM on a fresh disk (clean slate).
+    nix/vm.sh fresh host
+    nix/vm.sh run host
 world-fresh:
-    rm -f turnip-world.qcow2
-    just world
+    nix/vm.sh fresh world
+    nix/vm.sh run world
+
+# Headless control (detached; managed across sessions). role = host|world.
+up role:
+    nix/vm.sh up {{role}}
+stop role:
+    nix/vm.sh stop {{role}}
+reset role:
+    nix/vm.sh reset {{role}}
+vmlog role:
+    nix/vm.sh log {{role}}
+
+# Run the integration suite against the running dev VMs (host drives world over the LAN). Build
+# the binaries, stage to host, run with the baked key + the 9p-mounted fixtures. Extra args pass
+# through, e.g. `just itest -test.run TestL3Egress`.
+itest *args:
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o vm/turnip ./cmd/turnip
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c -o vm/it.test ./test/integration
+    scp -i nix/testvm_key -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        vm/turnip vm/it.test dev@localhost:/tmp/
+    nix/ssh-vm.sh host dev 'sudo /tmp/it.test -test.v -test.parallel 8 \
+        -turnip /tmp/turnip -fixtures /mnt/turnip/test/integration/fixtures \
+        -world dev@world -ssh-key /etc/turnip/ssh-key {{args}}'
