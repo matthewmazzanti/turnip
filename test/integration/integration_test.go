@@ -7,12 +7,16 @@
 // The host vantage is local (the binary runs ON the host node, where turnip + root live); world
 // is the only SSH target (the dumb peer). Tests that need world skip when -world is unset, so a
 // single-node run still exercises the host-only majority.
+//
+// The harness (H) holds no *testing.T: every method takes the current t. That keeps it safe to
+// share one H across PARALLEL subtests (the fixture is up'd once, read-only during the probes).
 package integration
 
 import (
 	"bytes"
 	"errors"
 	"flag"
+	"fmt"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -30,6 +34,30 @@ var (
 // stateDir is where turnip pins netns for the homelab owner (uid 1001) -- the fixtures all use
 // runtime.user=homelab, so this is fixed.
 const stateDir = "/run/user/1001/turnip"
+
+// Connect-probe verdict codes (see connectTCP / connectUDP), plus an unreached sentinel for the
+// want* helpers meaning "blocked by any mechanism" (got != reached).
+const (
+	reached   = 0  // connected, or RST-refused: the packet got through
+	denied    = 3  // timed out: silently dropped (fail-closed)
+	otherErr  = 4  // other socket error (e.g. an ICMP unreachable from a no-route)
+	unreached = -1 // want* sentinel: not reached, mechanism unspecified
+)
+
+func verdict(code int) string {
+	switch code {
+	case reached:
+		return "reached"
+	case denied:
+		return "denied(timeout)"
+	case otherErr:
+		return "other-error"
+	case unreached:
+		return "unreached"
+	default:
+		return fmt.Sprintf("code(%d)", code)
+	}
+}
 
 // Target is an execution endpoint: the host (local) or the world peer (ssh). Run executes argv
 // (argv[0] is the program) and returns combined output + the process exit code. err is set only
@@ -67,16 +95,16 @@ func (s ssh) Run(argv ...string) (string, int, error) {
 	return local{}.Run(full...)
 }
 
-// H is one test's harness: the host (local turnip) and the optional world peer.
+// H is the harness: the host (local turnip), the optional world peer, and the up'd fixture path.
+// It carries no *testing.T -- methods take t -- so one H is safe across parallel subtests.
 type H struct {
-	t       *testing.T
 	host    Target
 	world   Target // nil when -world is unset
-	fixture string // path of the currently-up fixture (set by up)
+	fixture string // path of the currently-up fixture (set by up; read-only during probes)
 }
 
-func newH(t *testing.T) *H {
-	h := &H{t: t, host: local{}}
+func newH() *H {
+	h := &H{host: local{}}
 	if *worldAddr != "" {
 		h.world = ssh{addr: *worldAddr, key: *sshKey}
 	}
@@ -84,46 +112,38 @@ func newH(t *testing.T) *H {
 }
 
 // up brings up a fixture by name (a file under -fixtures) with the real turnip binary.
-func (h *H) up(fixture string) {
-	h.t.Helper()
+func (h *H) up(t *testing.T, fixture string) {
+	t.Helper()
 	h.fixture = filepath.Join(*fixturesDir, fixture)
 	out, code, err := h.host.Run(*turnipBin, "-c", h.fixture, "up")
 	if err != nil || code != 0 {
-		h.t.Fatalf("turnip up %s: code=%d err=%v\n%s", fixture, code, err, out)
+		t.Fatalf("turnip up %s: code=%d err=%v\n%s", fixture, code, err, out)
 	}
 }
 
 // down tears the fixture down -- the isolation reset between fixtures. Best-effort (logs, never
 // fails the test): a failed teardown shouldn't mask the assertions that already ran.
-func (h *H) down() {
-	h.t.Helper()
+func (h *H) down(t *testing.T) {
+	t.Helper()
 	out, code, err := h.host.Run(*turnipBin, "-c", h.fixture, "down")
 	if err != nil || code != 0 {
-		h.t.Logf("turnip down: code=%d err=%v\n%s", code, err, out)
+		t.Logf("turnip down: code=%d err=%v\n%s", code, err, out)
 	}
 }
 
 // probe runs cmd inside a netns (target = a container name or "router:<net>") via `turnip probe`,
 // returning combined output + the command's exit code. A launch failure is fatal.
-func (h *H) probe(target string, cmd ...string) (string, int) {
-	h.t.Helper()
+func (h *H) probe(t *testing.T, target string, cmd ...string) (string, int) {
+	t.Helper()
 	argv := append([]string{*turnipBin, "-c", h.fixture, "probe", target, "--"}, cmd...)
 	out, code, err := h.host.Run(argv...)
 	if err != nil {
-		h.t.Fatalf("probe %s %v: %v\n%s", target, cmd, err, out)
+		t.Fatalf("probe %s %v: %v\n%s", target, cmd, err, out)
 	}
 	return out, code
 }
 
 // --- traffic primitives ---------------------------------------------------
-
-// connect verdict codes (see connectTCP / connectUDP): 0 reached (allowed), 3 timed out (denied),
-// 4 other socket error (e.g. no route).
-const (
-	reached  = 0
-	denied   = 3
-	otherErr = 4
-)
 
 // connectTCP is a stdlib TCP connect with a short timeout, run inside the source netns. Its exit
 // code reports the POLICY verdict WITHOUT a listener on the destination: an allowed flow with no
@@ -163,28 +183,67 @@ except OSError:
     sys.exit(4)
 `
 
-// reachesTCP / reachesUDP probe whether src can reach ip:port under policy (verdict codes above).
-func (h *H) reachesTCP(src, ip string, port int) int {
-	_, code := h.probe(src, "python3", "-c", connectTCP, ip, strconv.Itoa(port))
+func (h *H) reachesTCP(t *testing.T, src, ip string, port int) int {
+	_, code := h.probe(t, src, "python3", "-c", connectTCP, ip, strconv.Itoa(port))
 	return code
 }
 
-func (h *H) reachesUDP(src, ip string, port int) int {
-	_, code := h.probe(src, "python3", "-c", connectUDP, ip, strconv.Itoa(port))
+func (h *H) reachesUDP(t *testing.T, src, ip string, port int) int {
+	_, code := h.probe(t, src, "python3", "-c", connectUDP, ip, strconv.Itoa(port))
 	return code
 }
 
-// pings reports whether src can ICMP-ping ip (exit 0 = reply; non-zero = no reply / dropped).
-func (h *H) pings(src, ip string) int {
-	_, code := h.probe(src, "ping", "-c1", "-W2", ip)
+func (h *H) pings(t *testing.T, src, ip string) int {
+	_, code := h.probe(t, src, "ping", "-c1", "-W2", ip)
 	return code
+}
+
+// --- assertion helpers ----------------------------------------------------
+
+// wantTCP / wantUDP run a connect probe from src to ip:port and assert the verdict. want is a
+// verdict code (reached / denied / otherErr) for an exact match, or unreached for "blocked, by
+// any mechanism" (used where a no-route may legitimately drop OR ICMP-unreachable).
+func (h *H) wantTCP(t *testing.T, label, src, ip string, port, want int) {
+	t.Helper()
+	wantVerdict(t, label, fmt.Sprintf("%s->%s:%d tcp", src, ip, port), h.reachesTCP(t, src, ip, port), want)
+}
+
+func (h *H) wantUDP(t *testing.T, label, src, ip string, port, want int) {
+	t.Helper()
+	wantVerdict(t, label, fmt.Sprintf("%s->%s:%d udp", src, ip, port), h.reachesUDP(t, src, ip, port), want)
+}
+
+// wantPing asserts src can (reachable) or cannot (!reachable) ICMP-ping ip.
+func (h *H) wantPing(t *testing.T, label, src, ip string, reachable bool) {
+	t.Helper()
+	code := h.pings(t, src, ip)
+	if reachable && code != 0 {
+		t.Errorf("%s: ping %s->%s got no reply (code %d), want reachable", label, src, ip, code)
+	}
+	if !reachable && code == 0 {
+		t.Errorf("%s: ping %s->%s got a reply, want dropped", label, src, ip)
+	}
+}
+
+// wantVerdict is the exact/unreached comparison shared by wantTCP/wantUDP.
+func wantVerdict(t *testing.T, label, edge string, got, want int) {
+	t.Helper()
+	if want == unreached {
+		if got == reached {
+			t.Errorf("%s (%s): %s, want unreached", label, edge, verdict(got))
+		}
+		return
+	}
+	if got != want {
+		t.Errorf("%s (%s): %s, want %s", label, edge, verdict(got), verdict(want))
+	}
 }
 
 // has asserts out contains want (an inspection assertion for the structural checks).
-func (h *H) has(out, want, label string) {
-	h.t.Helper()
+func has(t *testing.T, out, want, label string) {
+	t.Helper()
 	if !strings.Contains(out, want) {
-		h.t.Errorf("%s: missing %q in:\n%s", label, want, out)
+		t.Errorf("%s: missing %q in:\n%s", label, want, out)
 	}
 }
 
@@ -192,7 +251,7 @@ func (h *H) has(out, want, label string) {
 
 // TestWorldReachable proves the host->world SSH channel that the egress/ingress scenarios ride.
 func TestWorldReachable(t *testing.T) {
-	h := newH(t)
+	h := newH()
 	if h.world == nil {
 		t.Skip("no -world configured")
 	}
@@ -206,9 +265,9 @@ func TestWorldReachable(t *testing.T) {
 // pinned, the gateway + routed veths exist, the nft flow matrix is loaded fail-closed, and the
 // router's anti-spoof sysctls are set. Observed via host stat + router/container netns probes.
 func TestL1Structure(t *testing.T) {
-	h := newH(t)
-	h.up("l1.json")
-	defer h.down()
+	h := newH()
+	h.up(t, "l1.json")
+	defer h.down(t)
 
 	// NET-1: the netns are pinned at their state-dir paths.
 	for _, p := range []string{
@@ -222,19 +281,19 @@ func TestL1Structure(t *testing.T) {
 	}
 
 	// NET-2: the gateway dummy carries the gateway address in the router netns.
-	gw, _ := h.probe("router:lan", "ip", "addr", "show", "gw0")
-	h.has(gw, "10.0.0.1", "NET-2 gateway gw0")
+	gw, _ := h.probe(t, "router:lan", "ip", "addr", "show", "gw0")
+	has(t, gw, "10.0.0.1", "NET-2 gateway gw0")
 
 	// NET-3: the container side -- eth0 holds the /32 and the default route points at the gateway.
-	addr, _ := h.probe("zwave", "ip", "addr", "show", "eth0")
-	h.has(addr, "10.0.0.11/32", "NET-3 zwave eth0")
-	rt, _ := h.probe("zwave", "ip", "route")
-	h.has(rt, "default via 10.0.0.1", "NET-3 zwave default route")
+	addr, _ := h.probe(t, "zwave", "ip", "addr", "show", "eth0")
+	has(t, addr, "10.0.0.11/32", "NET-3 zwave eth0")
+	rt, _ := h.probe(t, "zwave", "ip", "route")
+	has(t, rt, "default via 10.0.0.1", "NET-3 zwave default route")
 
 	// NET-4: the nft flow matrix is loaded, forward + input both fail-closed (policy drop).
-	nft, _ := h.probe("router:lan", "nft", "list", "ruleset")
-	h.has(nft, "chain forward", "NET-4 forward chain")
-	h.has(nft, "chain input", "NET-4 input chain")
+	nft, _ := h.probe(t, "router:lan", "nft", "list", "ruleset")
+	has(t, nft, "chain forward", "NET-4 forward chain")
+	has(t, nft, "chain input", "NET-4 input chain")
 	if n := strings.Count(nft, "policy drop"); n < 2 {
 		t.Errorf("NET-4: want >=2 'policy drop' (forward+input), got %d in:\n%s", n, nft)
 	}
@@ -245,7 +304,7 @@ func TestL1Structure(t *testing.T) {
 		{"/proc/sys/net/ipv4/conf/vethR-zwave/rp_filter", "1", "NET-5 rp_filter strict"},
 		{"/proc/sys/net/ipv6/conf/all/disable_ipv6", "1", "NET-5 ipv6 disabled"},
 	} {
-		out, _ := h.probe("router:lan", "cat", c.path)
+		out, _ := h.probe(t, "router:lan", "cat", c.path)
 		if strings.TrimSpace(out) != c.want {
 			t.Errorf("%s: %s = %q, want %q", c.label, c.path, strings.TrimSpace(out), c.want)
 		}
@@ -253,39 +312,40 @@ func TestL1Structure(t *testing.T) {
 }
 
 // TestL1InternalFlow is fixture L1's internal flow matrix (§3): one network, zwave+hass, a single
-// zwave->hass:8080 flow. The allowed flow connects (and its return path rides conntrack);
-// everything else -- wrong port, wrong proto, icmp, no-such-peer, reverse direction -- is dropped.
+// zwave->hass:8080 flow. The allowed flow connects (return path rides conntrack); everything else
+// drops. The rows run as PARALLEL subtests (each is timeout-bound and read-only), wrapped in a
+// "flows" group so the deferred down() waits for them.
 func TestL1InternalFlow(t *testing.T) {
-	h := newH(t)
-	h.up("l1.json")
-	defer h.down()
+	h := newH()
+	h.up(t, "l1.json")
+	defer h.down(t)
 
-	// FLOW-1 (+FLOW-2 return path): the one allowed flow reaches hass.
-	if code := h.reachesTCP("zwave", "10.0.0.12", 8080); code != reached {
-		t.Errorf("FLOW-1 zwave->hass:8080: want reached(%d), got %d", reached, code)
+	flows := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		// FLOW-1 (+FLOW-2 return path): the one allowed flow reaches hass.
+		{"FLOW-1_allowed", func(t *testing.T) { h.wantTCP(t, "FLOW-1", "zwave", "10.0.0.12", 8080, reached) }},
+		// FLOW-3 (+FLOW-8 fail-closed): reverse direction has no flow; hass reaches nothing.
+		{"FLOW-3_reverse", func(t *testing.T) { h.wantTCP(t, "FLOW-3", "hass", "10.0.0.11", 8080, denied) }},
+		{"FLOW-8_zeroflow", func(t *testing.T) { h.wantTCP(t, "FLOW-8", "hass", "10.0.0.11", 9090, denied) }},
+		// FLOW-4: wrong port is not in the vmap -> dropped.
+		{"FLOW-4_wrongport", func(t *testing.T) { h.wantTCP(t, "FLOW-4", "zwave", "10.0.0.12", 9090, denied) }},
+		// FLOW-5: wrong proto (udp on the tcp flow's port) -> dropped.
+		{"FLOW-5_wrongproto", func(t *testing.T) { h.wantUDP(t, "FLOW-5", "zwave", "10.0.0.12", 8080, denied) }},
+		// FLOW-6: no icmp flow -> ping dropped.
+		{"FLOW-6_icmp", func(t *testing.T) { h.wantPing(t, "FLOW-6", "zwave", "10.0.0.12", false) }},
+		// FLOW-7: an address with no attachment -> no route / dropped (drop OR icmp-unreachable).
+		{"FLOW-7_nopeer", func(t *testing.T) { h.wantTCP(t, "FLOW-7", "zwave", "10.0.0.99", 8080, unreached) }},
 	}
-	// FLOW-4: wrong port is not in the vmap -> dropped.
-	if code := h.reachesTCP("zwave", "10.0.0.12", 9090); code != denied {
-		t.Errorf("FLOW-4 zwave->hass:9090 (wrong port): want denied(%d), got %d", denied, code)
-	}
-	// FLOW-5: wrong proto (udp on the tcp flow's port) -> dropped.
-	if code := h.reachesUDP("zwave", "10.0.0.12", 8080); code != denied {
-		t.Errorf("FLOW-5 zwave->hass udp/8080 (wrong proto): want denied(%d), got %d", denied, code)
-	}
-	// FLOW-6: no icmp flow -> ping dropped.
-	if code := h.pings("zwave", "10.0.0.12"); code == 0 {
-		t.Errorf("FLOW-6 zwave->hass icmp: want dropped (non-zero ping), got 0")
-	}
-	// FLOW-7: an address with no attachment -> no route / dropped.
-	if code := h.reachesTCP("zwave", "10.0.0.99", 8080); code == reached {
-		t.Errorf("FLOW-7 zwave->10.0.0.99 (no peer): want unreachable, got reached")
-	}
-	// FLOW-3 (and FLOW-8 fail-closed): the reverse direction has no flow -> dropped; hass, with no
-	// outgoing flow, reaches nothing.
-	if code := h.reachesTCP("hass", "10.0.0.11", 8080); code != denied {
-		t.Errorf("FLOW-3 hass->zwave:8080 (reverse): want denied(%d), got %d", denied, code)
-	}
-	if code := h.reachesTCP("hass", "10.0.0.11", 9090); code != denied {
-		t.Errorf("FLOW-8 hass->zwave:9090 (zero-flow container): want denied(%d), got %d", denied, code)
-	}
+
+	// The group blocks until its parallel children finish, so defer down() runs after them.
+	t.Run("flows", func(t *testing.T) {
+		for _, f := range flows {
+			t.Run(f.name, func(t *testing.T) {
+				t.Parallel()
+				f.run(t)
+			})
+		}
+	})
 }

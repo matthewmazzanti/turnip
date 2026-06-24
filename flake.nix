@@ -84,11 +84,12 @@
                 imports = [ ./nix/turnip-host.nix ];
                 environment.systemPackages = [ turnip pkgs.python3 pkgs.iputils pkgs.openssh ];
               };
-              # The external peer: just sshd, key-only root login. Reached only over SSH from
-              # host; its authorized_keys is seeded at runtime by the driver (below).
+              # The external peer: just sshd, key-only root login authorized for the shared
+              # throwaway test key. Reached only over SSH from host.
               world = { ... }: {
                 services.openssh.enable = true;
                 services.openssh.settings.PermitRootLogin = "prohibit-password";
+                users.users.root.openssh.authorizedKeys.keyFiles = [ ./nix/testvm_key.pub ];
               };
             };
             testScript = ''
@@ -102,19 +103,16 @@
                   "su homelab -c 'XDG_RUNTIME_DIR=/run/user/1001 podman info >/dev/null'",
                   timeout=120)
 
-              # host -> world SSH: mint a throwaway key on host, bridge the pubkey to world's
-              # authorized_keys via the driver (no committed secret; trust set up at runtime).
-              host.succeed("ssh-keygen -t ed25519 -N \"\" -f /root/id")
-              pub = host.succeed("cat /root/id.pub").strip()
-              world.succeed("install -d -m700 /root/.ssh")
-              world.succeed(f"echo '{pub}' > /root/.ssh/authorized_keys")
-              world.succeed("chmod 600 /root/.ssh/authorized_keys")
+              # host -> world SSH: the shared committed test key (world authorizes its pubkey).
+              host.succeed("install -m600 ${./nix/testvm_key} /root/id")
               host.wait_until_succeeds(
                   "ssh -i /root/id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
                   " -o ConnectTimeout=5 root@world true", timeout=90)
 
+              # -test.parallel overrides the GOMAXPROCS default so the timeout-bound flow subtests
+              # actually overlap (the work is subprocess-wait-bound, so a few vCPUs suffice).
               print(host.succeed(
-                  "${turnipTest}/bin/turnip-integration.test -test.v"
+                  "${turnipTest}/bin/turnip-integration.test -test.v -test.parallel 8"
                   " -turnip ${turnip}/bin/turnip"
                   " -fixtures ${fixtures}"
                   " -world root@world -ssh-key /root/id 2>&1"))

@@ -14,6 +14,8 @@ dist/
 
 # turnip dev VM
 turnip.qcow2
-nix/testvm_key
 result
 result-*
+
+# nix/testvm_key is a committed throwaway SSH key: it authenticates between the dev VM /
+# the hermetic integration nodes only -- no security value, kept in-repo on purpose.
