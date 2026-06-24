@@ -390,6 +390,33 @@ func TestL1InternalFlow(t *testing.T) {
 	}
 }
 
+// TestL1Gateway is fixture L1's router-local input chain (§4 IN-5/IN-6, host-only): the router's
+// own address (the gateway) is default-deny but for ICMP. A container pings the gateway and gets a
+// reply (input accepts icmp), but a TCP connect to the gateway on any port is dropped (input
+// policy drop -- no router-local service is exposed). Same H/fixture, parallel rows.
+func TestL1Gateway(t *testing.T) {
+	h := newH()
+	h.up(t, "l1.json")
+	t.Cleanup(func() { h.down(t) })
+
+	const gw = "10.0.0.1"
+	checks := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		// IN-5: icmp to the gateway is accepted into the router netns -> a ping reply.
+		{"IN-5_ping_gateway", func(t *testing.T) { h.wantPing(t, "IN-5", "zwave", gw, true) }},
+		// IN-6: tcp to the gateway has no input accept -> dropped (policy drop, no service exposed).
+		{"IN-6_tcp_gateway", func(t *testing.T) { h.wantTCP(t, "IN-6", "zwave", gw, 22, denied) }},
+	}
+	for _, c := range checks {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			c.run(t)
+		})
+	}
+}
+
 // TestL2Isolation is fixture L2 (§2 NET-6): two networks, lan {alpha,bravo} and iot
 // {charlie,delta}, each with its own internal flow. Each network's intra-flow works, but the two
 // are isolated -- a container in one cannot reach an address in the other, since the router netns
