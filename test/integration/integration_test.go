@@ -318,7 +318,7 @@ func TestL1Structure(t *testing.T) {
 func TestL1InternalFlow(t *testing.T) {
 	h := newH()
 	h.up(t, "l1.json")
-	defer h.down(t)
+	t.Cleanup(func() { h.down(t) }) // runs after the parallel subtests complete -- no group wrapper
 
 	flows := []struct {
 		name string
@@ -339,13 +339,46 @@ func TestL1InternalFlow(t *testing.T) {
 		{"FLOW-7_nopeer", func(t *testing.T) { h.wantTCP(t, "FLOW-7", "zwave", "10.0.0.99", 8080, unreached) }},
 	}
 
-	// The group blocks until its parallel children finish, so defer down() runs after them.
-	t.Run("flows", func(t *testing.T) {
-		for _, f := range flows {
-			t.Run(f.name, func(t *testing.T) {
-				t.Parallel()
-				f.run(t)
-			})
+	for _, f := range flows {
+		t.Run(f.name, func(t *testing.T) {
+			t.Parallel()
+			f.run(t)
+		})
+	}
+}
+
+// TestL2Isolation is fixture L2 (§2 NET-6): two networks, lan {alpha,bravo} and iot
+// {charlie,delta}, each with its own internal flow. Each network's intra-flow works, but the two
+// are isolated -- a container in one cannot reach an address in the other, since the router netns
+// are siloed (no route, no forwarding path between them).
+func TestL2Isolation(t *testing.T) {
+	h := newH()
+	h.up(t, "l2.json")
+	t.Cleanup(func() { h.down(t) })
+
+	// NET-6 structure: both router netns are pinned (one per network).
+	for _, p := range []string{stateDir + "/routers/lan", stateDir + "/routers/iot"} {
+		if _, code, _ := h.host.Run("test", "-e", p); code != 0 {
+			t.Errorf("NET-6: router netns %s not present", p)
 		}
-	})
+	}
+
+	checks := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		// each network's own flow still works.
+		{"intra_lan_allowed", func(t *testing.T) { h.wantTCP(t, "L2-intra", "alpha", "10.0.0.12", 8080, reached) }},
+		{"intra_iot_allowed", func(t *testing.T) { h.wantTCP(t, "L2-intra", "charlie", "10.1.0.12", 8080, reached) }},
+		// cross-network is isolated, both directions and to either peer.
+		{"lan_to_iot_gw_isolated", func(t *testing.T) { h.wantTCP(t, "NET-6", "alpha", "10.1.0.11", 8080, unreached) }},
+		{"lan_to_iot_peer_isolated", func(t *testing.T) { h.wantTCP(t, "NET-6", "alpha", "10.1.0.12", 8080, unreached) }},
+		{"iot_to_lan_isolated", func(t *testing.T) { h.wantTCP(t, "NET-6", "charlie", "10.0.0.11", 8080, unreached) }},
+	}
+	for _, c := range checks {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			c.run(t)
+		})
+	}
 }

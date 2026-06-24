@@ -52,7 +52,10 @@ in
   # spike needs real root + podman, which is what this sandbox is for. Sources are
   # read-only (9p), so build out-of-tree, e.g. `go build -o /tmp/spike .` with
   # GOCACHE/GOPATH under $HOME (their defaults are already writable).
-  environment.systemPackages = [ pkgs.go ];
+  # Go toolchain + python3: python3 is what the integration harness's in-netns connect probes
+  # exec (via `turnip probe`), so it must be on the host PATH for the warm dev-VM loop to run the
+  # `go test -c` binary -- matching the check's host node. (Needs `just vm-fresh` to take effect.)
+  environment.systemPackages = [ pkgs.go pkgs.python3 ];
 
   # Load the python test image into homelab's rootless store at boot, and name it in the
   # environment (derived from the image so it can't drift). A oneshot rather than a baked

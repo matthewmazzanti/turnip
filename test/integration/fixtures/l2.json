@@ -1,0 +1,28 @@
+{
+  "runtime": { "user": "homelab" },
+  "containers": { "alpha": {}, "bravo": {}, "charlie": {}, "delta": {} },
+  "networks": {
+    "lan": {
+      "gateway": "10.0.0.1",
+      "gateway_if": "gw0",
+      "attach": {
+        "alpha": { "ip": "10.0.0.11", "interface": "eth0" },
+        "bravo": { "ip": "10.0.0.12", "interface": "eth0" }
+      },
+      "flows": [
+        { "type": "internal", "from": "alpha", "to": "bravo", "proto": "tcp", "port": 8080 }
+      ]
+    },
+    "iot": {
+      "gateway": "10.1.0.1",
+      "gateway_if": "gw0",
+      "attach": {
+        "charlie": { "ip": "10.1.0.11", "interface": "eth0" },
+        "delta": { "ip": "10.1.0.12", "interface": "eth0" }
+      },
+      "flows": [
+        { "type": "internal", "from": "charlie", "to": "delta", "proto": "tcp", "port": 8080 }
+      ]
+    }
+  }
+}
