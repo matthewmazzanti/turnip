@@ -14,7 +14,7 @@
 // re-exec'd child, see Provision) creates each netns and ships its fd back over SCM_RIGHTS.
 // The rootful parent then drives the dataplane against those fds (internal/dataplane).
 //
-// Two constraints the design respects (both validated in spike/go-netns-bootstrap):
+// Two constraints the design respects:
 //   - The provisioner cannot setns BACK to the host netns (it's owned by the ancestor init
 //     userns -> EPERM); unshare always mints a fresh netns regardless, so it chains forward
 //     and bind-mounts each WHILE IN IT, then exits.
@@ -322,7 +322,7 @@ func pinNetns(path string) error {
 // TODO: refine before this is load-bearing -- the "Go retires the locked thread" guarantee
 // only fires when the GOROUTINE EXITS, which inNetns doesn't do (it returns to a live
 // caller), so a poisoned thread stays pinned to that goroutine. The orchestration likely
-// wants each setns episode on a dedicated short-lived goroutine. (Carried from the spike.)
+// wants each setns episode on a dedicated short-lived goroutine.
 func inNetns(fd int, fn func() error) error {
 	runtime.LockOSThread()
 	orig, err := unix.Open("/proc/thread-self/ns/net", unix.O_RDONLY|unix.O_CLOEXEC, 0)

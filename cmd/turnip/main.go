@@ -4,7 +4,7 @@
 // The reference Python implementation lives under ./old (its modules map onto the
 // planned package layout below); README.md at the repo root and ./docs (CONFIG-SKETCH.md,
 // IMPLEMENTATION-PLAN.md) describe the model this port targets. The kernel-interface
-// primitives are proven in ./spike/go-netns-bootstrap.
+// primitives live in internal/netns (the podman-userns bootstrap + the SCM_RIGHTS fd bridge).
 //
 // Planned layout as the port grows (cmd is the imperative shell; internal/* are the
 // pure-ish mechanism, mirroring the Python modules):

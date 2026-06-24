@@ -204,8 +204,8 @@ these are not user commands). The provisioner creates each netns, bind-mounts it
 persistence *while inside it*, and ships its fd back to the rootful parent over
 `SCM_RIGHTS`. The parent collects them into a `Set` and drives the dataplane against
 those fds. (Both load-bearing constraints — the provisioner can't `setns` back to the
-host netns, and `unshare` chains forward minting a fresh netns — are validated in
-[`spike/go-netns-bootstrap`](../spike/go-netns-bootstrap).)
+host netns, and `unshare` chains forward minting a fresh netns — are embodied in
+[`internal/netns`](../internal/netns).)
 
 **The `Set`** is the parent's handle to the live netns:
 

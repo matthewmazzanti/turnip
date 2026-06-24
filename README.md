@@ -12,9 +12,9 @@ is a declarative `turnip.json`; the mechanism builds the dataplane from it.
 > container links) needs the init netns, so turnip runs as root and drops to the
 > rootless-podman owner to enter podman's namespaces. The kernel-interface
 > primitives (podman-userns bootstrap, netns fd collection + bind-mount persistence,
-> sysctl/nft/netlink over an fd) are validated in
-> [`spike/go-netns-bootstrap`](spike/go-netns-bootstrap). Design docs live in
-> [`docs/`](docs).
+> sysctl/nft/netlink over an fd) live in [`internal/netns`](internal/netns) +
+> [`internal/dataplane`](internal/dataplane), exercised by the hermetic integration
+> check (`nix flake check`). Design docs live in [`docs/`](docs).
 
 ## Why routed instead of a bridge
 
@@ -56,7 +56,7 @@ in `turnip.json` to change it.
 | `cmd/turnip/` | the CLI + orchestration (the imperative shell): config/env IO, the `buildPlan` lowering (config → `Plan`, `plan.go`), the `applyPlan` driver (`apply.go`), and `up`/`down` dispatch |
 | `internal/` | `config` (the declarative model + validation), `netns` (podman bootstrap, netns lifecycle, the SCM_RIGHTS fd bridge), `dataplane` (gateway/veth/route wiring + the nft flow matrix) |
 | `nix/` | the flake helpers (`nix/lib`) + the rootless-podman dev VM (`testvm.nix`, `turnip-host.nix`) |
-| `spike/go-netns-bootstrap/` | the validated kernel-interface primitives the port builds on |
+| `test/integration/` | the hermetic two-node dataplane check (`checks.integration`) |
 | `docs/` | design docs — `ARCHITECTURE.md` (the config/plan/apply layering), `CONFIG-SKETCH.md` (config model + deferred-feature specs) |
 | `todo.md` | the open-work checklist |
 
@@ -88,10 +88,9 @@ phase-1 child creates each netns there, **pins it with a bind-mount** (so `podma
 --network ns:<path>` can attach later), and ships its fd back to the root parent over
 SCM_RIGHTS. The parent then drives the whole dataplane against those fds: sysctls via a
 `setns` episode, nft via the netns-bound netlink socket (`google/nftables` `WithNetNSFd`,
-no `nft` subprocess), and links/addrs/routes via `vishvananda/netlink`. See
-[`spike/go-netns-bootstrap`](spike/go-netns-bootstrap) for the validated walk-through and
-the capability reasoning (init-root holds `CAP_NET_ADMIN` over the podman-userns-owned
-netns).
+no `nft` subprocess), and links/addrs/routes via `vishvananda/netlink`. The capability
+reasoning: init-root holds `CAP_NET_ADMIN` over the podman-userns-owned netns, so the
+parent can drive the dataplane against the collected fds.
 
 - **The "virtual" gateway is made real.** A pure Cilium-style virtual gateway relies on
   a default route (via an uplink) for proxy_arp to answer. A network with no uplink is

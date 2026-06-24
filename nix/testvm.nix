@@ -47,11 +47,6 @@ in
 {
   networking.hostName = "turnip";
 
-  # Go toolchain for building/running the rootful rewrite spike inside the VM
-  # (spike/go-netns-bootstrap, live-mounted at /mnt/turnip/spike). VM-only: the
-  # spike needs real root + podman, which is what this sandbox is for. Sources are
-  # read-only (9p), so build out-of-tree, e.g. `go build -o /tmp/spike .` with
-  # GOCACHE/GOPATH under $HOME (their defaults are already writable).
   # Go toolchain + python3: python3 is what the integration harness's in-netns connect probes
   # exec (via `turnip probe`), so it must be on the host PATH for the warm dev-VM loop to run the
   # `go test -c` binary -- matching the check's host node. (Needs `just vm-fresh` to take effect.)
