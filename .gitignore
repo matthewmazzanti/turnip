@@ -20,3 +20,7 @@ result-*
 
 # nix/testvm_key is a committed throwaway SSH key: it authenticates between the dev VM /
 # the hermetic integration nodes only -- no security value, kept in-repo on purpose.
+
+# headless dev-VM control artifacts (nix/vm.sh)
+.vm-*.log
+.vm-*.sock
