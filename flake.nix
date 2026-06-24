@@ -43,12 +43,82 @@
             subPackages = [ "cmd/turnip" ];
             meta.mainProgram = "turnip";
           };
+
+          # The compiled integration test binary (`go test -c`): the harness driver run on the
+          # host node by checks.integration. Reuses turnip's src + vendoring; the test package is
+          # stdlib-only, so no new module deps (vendorHash unchanged).
+          turnipTest = turnip.overrideAttrs (_: {
+            pname = "turnip-integration-test";
+            doCheck = false;
+            buildPhase = ''
+              runHook preBuild
+              go test -c -o turnip-integration.test ./test/integration
+              runHook postBuild
+            '';
+            installPhase = ''
+              runHook preInstall
+              install -Dm755 turnip-integration.test $out/bin/turnip-integration.test
+              runHook postInstall
+            '';
+          });
+
+          # The fixture configs (one turnip.json per topology), referenced by -fixtures.
+          fixtures = ./test/integration/fixtures;
         in
         {
           packages = {
             inherit turnip;
             default = turnip; # `nix build` -> the turnip binary
             vm = testVM.config.system.build.vm; # `nix build .#vm` -> result/bin/run-turnip-vm
+          };
+
+          # Hermetic two-node integration check: `nix flake check` (or `nix build
+          # .#checks.<sys>.integration`). host runs turnip + the harness; world is a dumb SSH
+          # peer. Iterate warm via `.driverInteractive`. See docs/TEST-PLAN.md.
+          checks.integration = pkgs.testers.runNixOSTest {
+            name = "turnip-integration";
+            nodes = {
+              # The system under test: rootless-podman host (turnip-host base) + turnip + the
+              # probe toolbox (python3 drives the in-netns TCP connect; ip/nft from the base).
+              host = { ... }: {
+                imports = [ ./nix/turnip-host.nix ];
+                environment.systemPackages = [ turnip pkgs.python3 pkgs.openssh ];
+              };
+              # The external peer: just sshd, key-only root login. Reached only over SSH from
+              # host; its authorized_keys is seeded at runtime by the driver (below).
+              world = { ... }: {
+                services.openssh.enable = true;
+                services.openssh.settings.PermitRootLogin = "prohibit-password";
+              };
+            };
+            testScript = ''
+              start_all()
+              host.wait_for_unit("multi-user.target")
+              world.wait_for_unit("sshd.service")
+
+              # rootless podman owner (homelab, uid 1001) must be live before `turnip up`.
+              host.wait_until_succeeds("test -d /run/user/1001", timeout=90)
+              host.wait_until_succeeds(
+                  "su homelab -c 'XDG_RUNTIME_DIR=/run/user/1001 podman info >/dev/null'",
+                  timeout=120)
+
+              # host -> world SSH: mint a throwaway key on host, bridge the pubkey to world's
+              # authorized_keys via the driver (no committed secret; trust set up at runtime).
+              host.succeed("ssh-keygen -t ed25519 -N \"\" -f /root/id")
+              pub = host.succeed("cat /root/id.pub").strip()
+              world.succeed("install -d -m700 /root/.ssh")
+              world.succeed(f"echo '{pub}' > /root/.ssh/authorized_keys")
+              world.succeed("chmod 600 /root/.ssh/authorized_keys")
+              host.wait_until_succeeds(
+                  "ssh -i /root/id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+                  " -o ConnectTimeout=5 root@world true", timeout=90)
+
+              print(host.succeed(
+                  "${turnipTest}/bin/turnip-integration.test -test.v"
+                  " -turnip ${turnip}/bin/turnip"
+                  " -fixtures ${fixtures}"
+                  " -world root@world -ssh-key /root/id 2>&1"))
+            '';
           };
 
           devShells.default = pkgs.mkShell {

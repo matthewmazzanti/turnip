@@ -1,0 +1,17 @@
+{
+  "runtime": { "user": "homelab" },
+  "containers": { "zwave": {}, "hass": {} },
+  "networks": {
+    "lan": {
+      "gateway": "10.0.0.1",
+      "gateway_if": "gw0",
+      "attach": {
+        "zwave": { "ip": "10.0.0.11", "interface": "eth0" },
+        "hass": { "ip": "10.0.0.12", "interface": "eth0" }
+      },
+      "flows": [
+        { "type": "internal", "from": "zwave", "to": "hass", "proto": "tcp", "port": 8080 }
+      ]
+    }
+  }
+}
