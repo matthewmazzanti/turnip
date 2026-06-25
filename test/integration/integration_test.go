@@ -304,6 +304,25 @@ for _ in range(n):
     s.sendto(h + seg_b, (dst, 0))
 `
 
+// arpPoison blasts n gratuitous ARP replies out iface claiming claim_ip is at THIS netns's MAC --
+// the lateral ARP-spoof a container would attempt to hijack a peer's address. AF_PACKET raw frame
+// (CAP_NET_RAW via the probe). argv: iface claim_ip n. Prints the source MAC it used (hex).
+const arpPoison = `
+import socket, struct, sys
+iface, claim_ip, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with open("/sys/class/net/%s/address" % iface) as f:
+    mac = bytes.fromhex(f.read().strip().replace(":", ""))
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+s.bind((iface, 0))
+bcast = b"\xff" * 6
+ip = socket.inet_aton(claim_ip)
+eth = bcast + mac + struct.pack("!H", 0x0806)
+arp = struct.pack("!HHBBH", 1, 0x0800, 6, 4, 2) + mac + ip + bcast + ip  # oper=2 reply, gratuitous
+for _ in range(n):
+    s.send(eth + arp)
+sys.stdout.write(mac.hex())
+`
+
 // rpfCounter prints the netns-scoped IPReversePathFilter counter (strict rp_filter drops) from
 // /proc/net/netstat as a bare integer. Read in the router netns it counts forged-saddr drops.
 const rpfCounter = `
@@ -725,5 +744,35 @@ func TestBADOutOfState(t *testing.T) {
 
 	if got := h.ctInvalid(t, "router:lan") - before; got != burst {
 		t.Errorf("BAD-4: conntrack marked %d of %d out-of-state ACKs invalid, want all (before=%d)", got, burst, before)
+	}
+}
+
+// TestBADArpPoison is fixture bad's ARP-spoof invariant (§5, host-only): adv blasts gratuitous ARP
+// claiming victim's IP (10.0.0.12) is at adv's MAC -- the lateral hijack attempt. The poison gains
+// nothing because the routed-/32 model decides delivery by ROUTING, not ARP: the router's /32
+// device route (which the container can't touch) keeps 10.0.0.12 egressing vethR-victim, and an
+// unsolicited ARP for an IP unknown on that veth plants no usable neighbor entry (arp_accept=0
+// default). Two structural assertions on the router netns the attacker has no access to.
+func TestBADArpPoison(t *testing.T) {
+	h := newH()
+	h.up(t, "bad.json")
+	t.Cleanup(func() { h.down(t) })
+
+	out, code := h.probe(t, "adv", "python3", "-c", arpPoison, "eth0", "10.0.0.12", "10")
+	if code != 0 {
+		t.Fatalf("BAD-ARP: gratuitous arp send failed (code %d):\n%s", code, out)
+	}
+
+	// 1) The poison plants no 10.0.0.12 neighbor on the attacker's router veth.
+	neigh, _ := h.probe(t, "router:lan", "ip", "neigh", "show", "dev", "vethR-adv")
+	if strings.Contains(neigh, "10.0.0.12") {
+		t.Errorf("BAD-ARP: router planted a 10.0.0.12 neighbor on vethR-adv (poison took):\n%s", neigh)
+	}
+
+	// 2) Routing is the authority: victim's IP still egresses victim's veth, never the attacker's.
+	rt, _ := h.probe(t, "router:lan", "ip", "route", "get", "10.0.0.12")
+	has(t, rt, "dev vethR-victim", "BAD-ARP route authority")
+	if strings.Contains(rt, "vethR-adv") {
+		t.Errorf("BAD-ARP: 10.0.0.12 routes via the attacker's veth vethR-adv:\n%s", rt)
 	}
 }
