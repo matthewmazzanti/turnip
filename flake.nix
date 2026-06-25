@@ -50,9 +50,6 @@
             '';
           });
 
-          # The fixture configs (one turnip.json per topology), referenced by -fixtures.
-          fixtures = ./test/integration/fixtures;
-
           # Every VM this repo builds (nix/vm/), grouped by usecase: vms.interactive.{host,world}
           # are the built dev VMs; vms.test.{host,world} are the hermetic-check role configs fed to
           # runNixOSTest below; vms.probeImage is the shared netns-probe OCI image (TestPodmanRun's
@@ -102,7 +99,6 @@
               print(host.succeed(
                   "${turnipTest}/bin/turnip-integration.test -test.v -test.parallel 8"
                   " -turnip ${turnip}/bin/turnip"
-                  " -fixtures ${fixtures}"
                   " -image /etc/turnip/probe-image.tar.gz"  # the OCI archive TestPodmanRun loads + runs
                   " -world root@world -ssh-key /etc/turnip/ssh-key 2>&1"))
             '';

@@ -30,15 +30,12 @@ reset role:
 vmlog role:
     nix/vm.sh log {{role}}
 
-# Run the integration suite against the running dev VMs (host drives world over the LAN). Build
-# the binaries, stage to host, run with the baked key + the 9p-mounted fixtures. Extra args pass
-# through, e.g. `just itest -test.run TestL3Egress`.
+# Run the integration suite against the running dev VMs (host drives world over the LAN). Build the
+# binaries into vm/ (fixtures embedded in it.test); they're reached in the VM via the 9p mount at
+# /mnt/turnip/vm/ (no scp). Extra args pass through, e.g. `just itest -test.run TestL3Egress`.
 itest *args:
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o vm/turnip ./cmd/turnip
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c -o vm/it.test ./test/integration
-    scp -i nix/vm/testvm_key -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        vm/turnip vm/it.test dev@localhost:/tmp/
-    nix/ssh-vm.sh host dev 'sudo /tmp/it.test -test.v -test.parallel 8 \
-        -turnip /tmp/turnip -fixtures /mnt/turnip/test/integration/fixtures \
-        -world dev@world -ssh-key /etc/turnip/ssh-key \
+    nix/ssh-vm.sh host dev 'sudo /mnt/turnip/vm/it.test -test.v -test.parallel 8 \
+        -turnip /mnt/turnip/vm/turnip -world dev@world -ssh-key /etc/turnip/ssh-key \
         -image /etc/turnip/probe-image.tar.gz {{args}}'

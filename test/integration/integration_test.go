@@ -14,9 +14,11 @@ package integration
 
 import (
 	"bytes"
+	"embed"
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -26,12 +28,19 @@ import (
 )
 
 var (
-	turnipBin   = flag.String("turnip", "turnip", "path to the turnip binary")
-	fixturesDir = flag.String("fixtures", ".", "directory holding the *.json fixtures")
-	worldAddr   = flag.String("world", "", "ssh target for the world peer (user@host); empty => world tests skip")
-	sshKey      = flag.String("ssh-key", "", "ssh identity file for the world target")
-	imageArch   = flag.String("image", "", "OCI image archive (podman-loadable) for the real `podman run` test; empty => TestPodmanRun skips")
+	turnipBin = flag.String("turnip", "turnip", "path to the turnip binary")
+	worldAddr = flag.String("world", "", "ssh target for the world peer (user@host); empty => world tests skip")
+	sshKey    = flag.String("ssh-key", "", "ssh identity file for the world target")
+	imageArch = flag.String("image", "", "OCI image archive (podman-loadable) for the real `podman run` test; empty => TestPodmanRun skips")
 )
+
+// The fixture configs are embedded into the test binary (`go test -c`), so the harness is
+// self-contained -- no -fixtures dir to route from a nix store path (the check) or a 9p mount (the
+// dev VM). up() materializes the named fixture to a temp file for `turnip -c` (they're co-located:
+// the binary runs ON the host node where turnip runs). Editing a fixture + recompiling picks it up.
+//
+//go:embed fixtures/*.json
+var fixturesFS embed.FS
 
 // stateDir is where turnip pins netns for the homelab owner (uid 1001) -- the fixtures all use
 // runtime.user=homelab, so this is fixed. The owner* constants are the same rootless owner from
@@ -119,10 +128,18 @@ func newH() *H {
 	return h
 }
 
-// up brings up a fixture by name (a file under -fixtures) with the real turnip binary.
+// up brings up a fixture by name (an embedded *.json) with the real turnip binary. The fixture is
+// written to a temp file turnip reads via -c; h.fixture holds that path for down()/probe() to reuse.
 func (h *H) up(t *testing.T, fixture string) {
 	t.Helper()
-	h.fixture = filepath.Join(*fixturesDir, fixture)
+	data, err := fixturesFS.ReadFile("fixtures/" + fixture)
+	if err != nil {
+		t.Fatalf("read embedded fixture %s: %v", fixture, err)
+	}
+	h.fixture = filepath.Join(t.TempDir(), fixture)
+	if err := os.WriteFile(h.fixture, data, 0o644); err != nil {
+		t.Fatalf("write fixture %s: %v", fixture, err)
+	}
 	out, code, err := h.host.Run(*turnipBin, "-c", h.fixture, "up")
 	if err != nil || code != 0 {
 		t.Fatalf("turnip up %s: code=%d err=%v\n%s", fixture, code, err, out)
