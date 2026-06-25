@@ -20,20 +20,6 @@
       systems = [ "x86_64-linux" "aarch64-linux" ];
       perSystem = { system, pkgs }:
         let
-          # The interactive dev VMs, layered explicitly over the qemu-vm machinery. host-vm
-          # stacks turnip-host (rootless podman) + base-vm (9p mount, ssh, mgmt NIC) + the bridged
-          # LAN; world-vm is the LAN peer (base-vm only). The shared LAN segment is wired at launch
-          # (a qemu mcast socket NIC) -- see the justfile.
-          mkVM = roleModule: lib.nixosSystem {
-            inherit system;
-            modules = [
-              "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"
-              roleModule
-            ];
-          };
-          hostVM = mkVM ./nix/host-vm.nix;
-          worldVM = mkVM ./nix/world-vm.nix;
-
           # The turnip binary itself: `nix build .#turnip` -> result/bin/turnip.
           # vendorHash = null while the port is stdlib-only; set it once the netlink/nft
           # deps land (nix prints the expected hash on the first mismatch).
@@ -67,31 +53,23 @@
           # The fixture configs (one turnip.json per topology), referenced by -fixtures.
           fixtures = ./test/integration/fixtures;
 
-          # The world peer's egress target: a forking TCP listener on :8443 that replies with the
-          # source address it sees (SOCAT_PEERADDR). An egress connect reads this back to verify
-          # the source was masqueraded to the host edge (EG-2), not the container's 10.x.
-          peerEcho = pkgs.writeShellScript "peer-echo" ''
-            exec ${pkgs.socat}/bin/socat TCP-LISTEN:8443,reuseaddr,fork SYSTEM:'printf "%s" "$SOCAT_PEERADDR"'
-          '';
-
-          # A minimal OCI image carrying just python3 -- the payload for a REAL `podman run
+          # The minimal python netns-probe OCI image: the payload for a REAL `podman run
           # --network ns:<pin>` against a turnip netns (the operator path, vs the `turnip probe`
-          # shortcut the rest of the harness uses). python3Minimal has socket+sys, which is all the
-          # connect probe needs; PATH is set so the container can invoke `python3` by name. Built
-          # with nix (no registry pull -> hermetic); `podman load`ed by the owner in TestPodmanRun.
-          probeImage = pkgs.dockerTools.buildLayeredImage {
-            name = "turnip-probe";
-            tag = "latest";
-            contents = [ pkgs.python3Minimal ];
-            config.Env = [ "PATH=${pkgs.python3Minimal}/bin" ];
-          };
+          # shortcut the rest of the harness uses). `podman load`ed by the owner in TestPodmanRun.
+          # Shared builder with the host dev VM's richer toolbox image (nix/vm/probe-image.nix).
+          probeImage = import ./nix/vm/probe-image.nix { inherit pkgs; };
+
+          # Every VM this repo builds (nix/vm/), grouped by usecase: vms.interactive.{host,world}
+          # are the built dev VMs; vms.test.{host,world} are the hermetic-check role configs fed to
+          # runNixOSTest below. mkVM lives in nix/vm/default.nix, hence lib/nixpkgs/system threaded in.
+          vms = import ./nix/vm { inherit pkgs turnip lib nixpkgs system; };
         in
         {
           packages = {
             inherit turnip probeImage;
             default = turnip; # `nix build` -> the turnip binary
-            host = hostVM.config.system.build.vm; # `nix build .#host` -> result/bin/run-turnip-vm
-            world = worldVM.config.system.build.vm; # `nix build .#world` -> run-turnip-world-vm
+            host = vms.interactive.host; # `nix build .#host` -> result/bin/run-turnip-vm
+            world = vms.interactive.world; # `nix build .#world` -> result/bin/run-turnip-world-vm
           };
 
           # Hermetic two-node integration check: `nix flake check` (or `nix build
@@ -100,29 +78,10 @@
           checks.integration = pkgs.testers.runNixOSTest {
             name = "turnip-integration";
             nodes = {
-              # The system under test: rootless-podman host (turnip-host base) + turnip + the
-              # probe toolbox (python3 drives the in-netns TCP connect; ip/nft from the base).
-              host = { ... }: {
-                imports = [ ./nix/turnip-host.nix ];
-                environment.systemPackages = [ turnip pkgs.python3 pkgs.iputils pkgs.openssh ];
-              };
-              # The external peer: sshd (control) + a peer-echo listener on :8443 (the egress
-              # target). Firewall off so the masqueraded egress connection lands. Reached from host.
-              world = { ... }: {
-                networking.firewall.enable = false;
-                environment.systemPackages = [ pkgs.socat ]; # the ingress client (L4 IN-1/IN-3)
-                systemd.services.peer-echo = {
-                  description = "echo the source address a connecting client presents";
-                  wantedBy = [ "multi-user.target" ];
-                  serviceConfig = {
-                    ExecStart = "${peerEcho}";
-                    Restart = "always";
-                  };
-                };
-                services.openssh.enable = true;
-                services.openssh.settings.PermitRootLogin = "prohibit-password";
-                users.users.root.openssh.authorizedKeys.keyFiles = [ ./nix/testvm_key.pub ];
-              };
+              # The system under test + the external peer; both from nix/vm/ (vms.test). See
+              # docs/TEST-PLAN.md for the topology and what each role carries.
+              host = vms.test.host;
+              world = vms.test.world;
             };
             testScript = ''
               start_all()

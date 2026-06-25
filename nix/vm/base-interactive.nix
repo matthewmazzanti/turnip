@@ -1,10 +1,11 @@
-# base-vm.nix -- the shared dev-VM substrate for the interactive host/world VMs: the read-only
-# 9p mount of the repo, ssh/console access + the admin login, and systemd-networkd with eth0 as
-# the user-mode MANAGEMENT NIC (the host-forwarded ssh port -- out of band, not the modeled
-# topology). The LAN interface (eth1) and any bridge are configured per role (host-vm / world-vm),
-# and the LAN segment itself is wired at launch by the justfile (a qemu mcast socket NIC).
+# base-interactive.nix -- the shared substrate for the interactive dev VMs (the interactive.host /
+# interactive.world stacks in default.nix): the read-only 9p mount of the repo, ssh/console access +
+# the admin login, and systemd-networkd with eth0 as the user-mode MANAGEMENT NIC (the host-forwarded
+# ssh port -- out of band, not the modeled topology). The LAN interface (eth1) and any bridge are
+# configured per role, and the LAN segment itself is wired at launch by the justfile (qemu mcast NIC).
 #
-# Stacks under the qemu-vm machinery; host-vm also stacks turnip-host.nix (rootless podman).
+# Stacks under the qemu-vm machinery; the host stack also includes base-vm.nix (rootless podman), the
+# capability base. This substrate is independent of base-vm -- the world stack has no podman.
 { ... }:
 {
   system.stateVersion = "25.05";
@@ -21,12 +22,12 @@
   };
 
   # Admin user: console login (dev/dev) + key ssh + passwordless sudo. The rootless-podman owner
-  # (homelab) is defined by turnip-host.nix and gets its login creds in host-vm.nix.
+  # (homelab) is defined by base-vm.nix and gets its login creds in the host body (default.nix).
   users.users.dev = {
     isNormalUser = true;
     extraGroups = [ "wheel" ];
     password = "dev";
-    openssh.authorizedKeys.keyFiles = [ ./testvm_key.pub ];
+    openssh.authorizedKeys.keyFiles = [ ../testvm_key.pub ];
   };
   security.sudo.wheelNeedsPassword = false;
   services.openssh.enable = true;

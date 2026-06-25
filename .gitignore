@@ -12,8 +12,9 @@ build/
 dist/
 *.egg-info/
 
-# turnip dev-VM state: disks, console logs, QMP sockets (nix/vm.sh writes here)
-vm/
+# turnip dev-VM state: disks, console logs, QMP sockets (nix/vm.sh writes here).
+# Anchored to the repo root -- the state dir is $root/vm; nix/vm/ (the VM modules) is tracked.
+/vm/
 result
 result-*
 

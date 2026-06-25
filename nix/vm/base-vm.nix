@@ -1,10 +1,8 @@
-# Shared substrate: "a host that can run turnip" -- rootless podman owned by the run
-# user (homelab), plus the nft / ip tooling turnip drives. Imported by the host dev VM
-# (nix/host-vm.nix) and the hermetic check's host node.
-#
-# (This used to carry two required options -- turnip.env / turnip.testImage -- so the
-# hermetic pytest integration check and the dev VM could share it. That check is parked
-# under ./old during the Go rewrite, so the base is now just the rootless-podman host.)
+# base-vm.nix -- the capability base: "a host that can run turnip" -- rootless podman owned by the
+# run user (homelab), plus the nft / ip tooling turnip drives. This is the foundation a turnip host
+# needs, independent of the interactive dev substrate (nix/vm/base-interactive.nix). Imported by the
+# host dev VM and the hermetic check's host node -- both the interactive.host / test.host stacks in
+# nix/vm/default.nix.
 { pkgs, ... }:
 {
   system.stateVersion = "25.05";
