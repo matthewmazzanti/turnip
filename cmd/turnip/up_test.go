@@ -324,46 +324,69 @@ func mustAddrT(t *testing.T, s string) netip.Addr {
 	return addr
 }
 
-// TestRouterSysctls covers the router-netns knob set: the global pins, per-veth proxy_arp +
-// strict rp_filter, and the uplink veth's strict rp_filter (only when an uplink exists).
+// TestRouterSysctls covers the router-netns knob set: ip_forward applied FIRST (it re-derives the
+// per-interface router defaults), the global pins (rp_filter/source-route/redirects/conntrack/
+// ipv6), per-veth proxy_arp + strict rp_filter + send_redirects off, and the uplink veth's
+// strict rp_filter + send_redirects off (only when an uplink exists).
 func TestRouterSysctls(t *testing.T) {
 	got := routerSysctls([]string{"vethR-a", "vethR-b"}, "vethR-up")
 
-	want := map[string]string{
-		"net.ipv4.ip_forward":                  "1",
-		"net.ipv4.conf.all.rp_filter":          "0", // per-veth values are authoritative
-		"net.netfilter.nf_conntrack_tcp_loose": "0", // out-of-state pkts -> ct invalid, not picked up
-		"net.ipv6.conf.all.disable_ipv6":       "1",
-		"net.ipv6.conf.default.disable_ipv6":   "1",
-		"net.ipv4.conf.vethR-a.proxy_arp":      "1",
-		"net.ipv4.conf.vethR-a.rp_filter":      "1",
-		"net.ipv4.conf.vethR-b.proxy_arp":      "1",
-		"net.ipv4.conf.vethR-b.rp_filter":      "1",
-		"net.ipv4.conf.vethR-up.rp_filter":     "1",
+	// ip_forward must be the first write: it re-derives the router defaults the pins below override.
+	if len(got) == 0 || got[0].Key != "net.ipv4.ip_forward" {
+		t.Fatalf("ip_forward must be the first sysctl applied, got %v", got)
 	}
-	if len(got) != len(want) {
-		t.Errorf("got %d keys, want %d:\n%v", len(got), len(want), got)
+
+	m := map[string]string{}
+	for _, s := range got {
+		if _, dup := m[s.Key]; dup {
+			t.Errorf("duplicate sysctl key %q", s.Key)
+		}
+		m[s.Key] = s.Val
+	}
+
+	want := map[string]string{
+		"net.ipv4.ip_forward":                       "1",
+		"net.ipv4.conf.all.rp_filter":               "0", // per-veth values are authoritative
+		"net.ipv4.conf.all.accept_source_route":     "0", // drop SRR (router-mode default is TRUE)
+		"net.ipv4.conf.all.send_redirects":          "0", // no ICMP redirects from the router
+		"net.netfilter.nf_conntrack_tcp_loose":      "0", // out-of-state pkts -> ct invalid, not picked up
+		"net.netfilter.nf_conntrack_tcp_be_liberal": "0", // out-of-window TCP -> ct invalid too
+		"net.ipv6.conf.all.disable_ipv6":            "1",
+		"net.ipv6.conf.default.disable_ipv6":        "1",
+		"net.ipv4.conf.vethR-a.proxy_arp":           "1",
+		"net.ipv4.conf.vethR-a.rp_filter":           "1",
+		"net.ipv4.conf.vethR-a.send_redirects":      "0",
+		"net.ipv4.conf.vethR-b.proxy_arp":           "1",
+		"net.ipv4.conf.vethR-b.rp_filter":           "1",
+		"net.ipv4.conf.vethR-b.send_redirects":      "0",
+		"net.ipv4.conf.vethR-up.rp_filter":          "1",
+		"net.ipv4.conf.vethR-up.send_redirects":     "0",
+	}
+	if len(m) != len(want) {
+		t.Errorf("got %d keys, want %d:\n%v", len(m), len(want), m)
 	}
 	for k, v := range want {
-		if got[k] != v {
-			t.Errorf("%s = %q, want %q", k, got[k], v)
+		if m[k] != v {
+			t.Errorf("%s = %q, want %q", k, m[k], v)
 		}
 	}
 }
 
-// TestRouterSysctlsNoUplink: with no uplink the uplink rp_filter key must be absent, and the
-// global pins + per-veth keys are still present.
+// TestRouterSysctlsNoUplink: with no uplink the uplink per-if keys must be absent, and the global
+// pins + per-veth keys are still present.
 func TestRouterSysctlsNoUplink(t *testing.T) {
 	got := routerSysctls([]string{"vethR-a"}, "")
-	for k := range got {
-		if k == "net.ipv4.conf..rp_filter" {
-			t.Errorf("empty uplink produced a bare rp_filter key: %v", got)
+	m := map[string]string{}
+	for _, s := range got {
+		if s.Key == "net.ipv4.conf..rp_filter" || s.Key == "net.ipv4.conf..send_redirects" {
+			t.Errorf("empty uplink produced a bare per-interface key: %v", got)
 		}
+		m[s.Key] = s.Val
 	}
-	if got["net.ipv4.conf.vethR-a.proxy_arp"] != "1" {
+	if m["net.ipv4.conf.vethR-a.proxy_arp"] != "1" {
 		t.Errorf("per-veth proxy_arp missing: %v", got)
 	}
-	if _, ok := got["net.ipv4.ip_forward"]; !ok {
+	if _, ok := m["net.ipv4.ip_forward"]; !ok {
 		t.Errorf("ip_forward missing: %v", got)
 	}
 }

@@ -466,7 +466,11 @@ func TestL1Structure(t *testing.T) {
 	for _, c := range []struct{ path, want, label string }{
 		{"/proc/sys/net/ipv4/ip_forward", "1", "NET-5 ip_forward"},
 		{"/proc/sys/net/ipv4/conf/vethR-zwave/rp_filter", "1", "NET-5 rp_filter strict"},
+		{"/proc/sys/net/ipv4/conf/all/accept_source_route", "0", "NET-5 source-route off"},
+		{"/proc/sys/net/ipv4/conf/all/send_redirects", "0", "NET-5 all send_redirects off"},
+		{"/proc/sys/net/ipv4/conf/vethR-zwave/send_redirects", "0", "NET-5 per-veth send_redirects off"},
 		{"/proc/sys/net/netfilter/nf_conntrack_tcp_loose", "0", "NET-5 ct tcp_loose off"},
+		{"/proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal", "0", "NET-5 ct be_liberal off"},
 		{"/proc/sys/net/ipv6/conf/all/disable_ipv6", "1", "NET-5 ipv6 disabled"},
 	} {
 		out, _ := h.probe(t, "router:lan", "cat", c.path)

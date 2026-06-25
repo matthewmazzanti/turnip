@@ -37,8 +37,8 @@ type NetworkPlan struct {
 	Gateway   dp.Gateway
 	Endpoints []EndpointPlan    // routed veths, sorted by container
 	Uplink    *UplinkPlan       // nil = no host edge
-	Sysctls   map[string]string // the router netns sysctls (built from the veth/uplink ifnames)
-	NFT       nftlib.Ruleset    // the forward flow matrix + edge allows + input lockdown
+	Sysctls   []dp.Sysctl    // the router netns sysctls, in apply order (built from the veth/uplink ifnames)
+	NFT       nftlib.Ruleset // the forward flow matrix + edge allows + input lockdown
 }
 
 // EndpointPlan pairs a routed veth's dataplane Endpoint with the container netns it connects.
@@ -56,9 +56,9 @@ type EndpointPlan struct {
 type UplinkPlan struct {
 	Uplink       dp.Uplink
 	ContainerIPs []netip.Addr      // container /32s to route via the uplink (init netns)
-	DNATs        []dp.DNAT         // ingress host_port -> container:port (kept for reference/logs)
-	HostSysctls  map[string]string // init-netns sysctls (ip_forward)
-	HostNFT      nftlib.Ruleset    // the `ip turnip_host_<net>` nat zone (masquerade + DNAT)
+	DNATs        []dp.DNAT      // ingress host_port -> container:port (kept for reference/logs)
+	HostSysctls  []dp.Sysctl    // init-netns sysctls (ip_forward)
+	HostNFT      nftlib.Ruleset // the `ip turnip_host_<net>` nat zone (masquerade + DNAT)
 }
 
 // ContainerPlan is one container's local setup: the generated /etc/hosts (path + body) and its
@@ -160,7 +160,7 @@ func lowerNetwork(name string, net config.Network, counts map[string]int) (Netwo
 			Uplink:       uplink,
 			ContainerIPs: ips,
 			DNATs:        dnats,
-			HostSysctls:  map[string]string{"net.ipv4.ip_forward": "1"}, // the host routes/forwards this net
+			HostSysctls:  []dp.Sysctl{dp.Sys("net.ipv4.ip_forward", "1")}, // the host routes/forwards this net
 			HostNFT:      dp.BuildHostNFT(name, uplink, dnats),
 		}
 		edge = &dp.Edge{
@@ -279,39 +279,61 @@ func ownsDefault(configuredDefault bool, ifaceCount int) bool {
 
 // routerSysctls is the sysctl set for a router netns:
 //
-//   - ip_forward on (we route);
-//   - all.rp_filter=0 so the per-veth values are authoritative (the kernel uses
-//     max(conf.all, conf.<if>), and a fresh netns may not default all to 0);
+// The set is ORDERED (see dp.Sysctl): everything is pinned explicitly rather than trusting the
+// netns to have inherited a safe value -- a fresh IPv4 netns copies conf/{all,default} from
+// init_net's LIVE values, so a host override would otherwise leak in.
+//
+//   - ip_forward on (we route) -- FIRST, because writing it re-derives the per-interface RFC1812
+//     router defaults (send_redirects / accept_source_route flip toward enabled); the pins below
+//     must follow so they win;
+//   - all.rp_filter=0 so the per-veth values are authoritative (the kernel uses max(conf.all,
+//     conf.<if>); pinning all=0 also blocks a host all=1 from forcing strict everywhere);
+//   - all.accept_source_route=0: forwarding => RFC1812 defaults this TRUE; drop source-routed
+//     (SRR) packets (acceptance ANDs all+iface, so all=0 closes it everywhere);
+//   - all.send_redirects=0: a forwarding router emits ICMP redirects by default -- off. (In our
+//     /32 p2p model they never fire anyway, since in/out veths always differ -- hardening hygiene);
 //   - nf_conntrack_tcp_loose=0 so conntrack does NOT pick up mid-stream connections: a bare
 //     out-of-state ACK/RST/FIN becomes `ct invalid` (-> the forward chain's invalid drop) instead
-//     of a forwarded `ct new`. This makes "every new connection begins with a SYN in the allowed
-//     direction" real. Safe here because the routed model is strictly symmetric (each container's
-//     traffic crosses its one router, and a fresh netns has no connection to pick up) -- the loose
-//     default only matters for asymmetric paths where conntrack misses the SYN;
+//     of a forwarded `ct new`. Safe because the routed model is strictly symmetric (each
+//     container's traffic crosses its one router) -- loose only matters for asymmetric paths;
+//   - nf_conntrack_tcp_be_liberal=0 (the default, pinned): out-of-WINDOW TCP also stays `ct
+//     invalid`, reinforcing tcp_loose=0;
 //   - ipv6 disabled router-wide (the routed model has no L2 path between containers, so
 //     killing v6 on the router severs inter-container v6);
-//   - then per fabric veth: proxy_arp=1 (answer the gateway ARP / a future uplink) and
-//     rp_filter=1 (STRICT -- the anti-spoof pin, paired with that veth's /32 route).
+//   - then per fabric veth: proxy_arp=1 (answer the gateway ARP), rp_filter=1 (STRICT -- the
+//     anti-spoof pin, paired with that veth's /32 route), and send_redirects=0 (redirects fire if
+//     EITHER all OR the iface is set, and the iface can inherit a host conf/default=1, so the
+//     all=0 above is not sufficient on its own).
 //
 // Pure lowering -- the result is written (by dataplane.WriteSysctls, in apply) AFTER the veths
-// exist (the per-veth conf.<if> dirs). uplinkRouterIf is the uplink veth's router-side name (or
-// "" for no uplink); it gets strict rp_filter too -- the reverse path for an internet source is
-// the default route = the uplink, while a container-spoofed source resolves to its own /32 veth
-// (not the uplink) and is dropped (the anti-spoof pin).
-func routerSysctls(routerIfs []string, uplinkRouterIf string) map[string]string {
-	s := map[string]string{
-		"net.ipv4.ip_forward":                  "1",
-		"net.ipv4.conf.all.rp_filter":          "0",
-		"net.netfilter.nf_conntrack_tcp_loose": "0",
-		"net.ipv6.conf.all.disable_ipv6":       "1",
-		"net.ipv6.conf.default.disable_ipv6":   "1",
+// exist (the per-veth conf.<if> dirs) and after the nft load (the conntrack knobs need the netns
+// conntrack hooks, which the ct-state rules register). uplinkRouterIf is the uplink veth's
+// router-side name (or "" for no uplink); it gets strict rp_filter too -- the reverse path for an
+// internet source is the default route = the uplink, while a container-spoofed source resolves to
+// its own /32 veth (not the uplink) and is dropped (the anti-spoof pin).
+func routerSysctls(routerIfs []string, uplinkRouterIf string) []dp.Sysctl {
+	s := []dp.Sysctl{
+		dp.Sys("net.ipv4.ip_forward", "1"), // FIRST: re-derives router defaults the pins below override
+		dp.Sys("net.ipv4.conf.all.rp_filter", "0"),
+		dp.Sys("net.ipv4.conf.all.accept_source_route", "0"),
+		dp.Sys("net.ipv4.conf.all.send_redirects", "0"),
+		dp.Sys("net.netfilter.nf_conntrack_tcp_loose", "0"),
+		dp.Sys("net.netfilter.nf_conntrack_tcp_be_liberal", "0"),
+		dp.Sys("net.ipv6.conf.all.disable_ipv6", "1"),
+		dp.Sys("net.ipv6.conf.default.disable_ipv6", "1"),
 	}
 	for _, rif := range routerIfs {
-		s["net.ipv4.conf."+rif+".proxy_arp"] = "1"
-		s["net.ipv4.conf."+rif+".rp_filter"] = "1"
+		s = append(s,
+			dp.Sys("net.ipv4.conf."+rif+".proxy_arp", "1"),
+			dp.Sys("net.ipv4.conf."+rif+".rp_filter", "1"),
+			dp.Sys("net.ipv4.conf."+rif+".send_redirects", "0"),
+		)
 	}
 	if uplinkRouterIf != "" {
-		s["net.ipv4.conf."+uplinkRouterIf+".rp_filter"] = "1"
+		s = append(s,
+			dp.Sys("net.ipv4.conf."+uplinkRouterIf+".rp_filter", "1"),
+			dp.Sys("net.ipv4.conf."+uplinkRouterIf+".send_redirects", "0"),
+		)
 	}
 	return s
 }

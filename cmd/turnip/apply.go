@@ -99,7 +99,7 @@ func applyNetwork(set *netns.Set, np NetworkPlan) error {
 	if err := set.Enter(np.Router, func() error { return dp.WriteSysctls(np.Sysctls) }); err != nil {
 		return fmt.Errorf("network %q sysctls: %w", np.Name, err)
 	}
-	fmt.Printf("    sysctls: ip_forward + per-veth proxy_arp/rp_filter (strict) + ct tcp_loose off + ipv6 off\n")
+	fmt.Printf("    sysctls: ip_forward + per-veth proxy_arp/rp_filter (strict) + redirects/source-route off + ct tcp_loose/be_liberal off + ipv6 off\n")
 	return nil
 }
 
