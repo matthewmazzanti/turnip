@@ -18,5 +18,5 @@ dist/
 result
 result-*
 
-# nix/testvm_key is a committed throwaway SSH key: it authenticates between the dev VMs /
+# nix/vm/testvm_key is a committed throwaway SSH key: it authenticates between the dev VMs /
 # the hermetic integration nodes only -- no security value, kept in-repo on purpose.

@@ -1,37 +1,34 @@
-# nix/vm/default.nix -- every VM this repo builds, grouped by usecase. Two usecases, two roles each:
+# nix/vm/default.nix -- every VM this repo builds, grouped by usecase. Two usecases, two roles each.
+# Each role has ONE base (host-base / world-base) shared by both its usecases; the interactive
+# variant grows from that same base plus ./interactive.nix (the dev carve-outs: 9p, mgmt NIC, dev
+# user, qemu sizing) and a couple of role-specific extras.
 #
-#   interactive.{host,world}  the standalone dev VMs, booted by `just host` / `just world` and
-#                             driven over ssh. Each is an inline role module (its shared building
-#                             blocks pulled in via `imports`) wrapped with the qemu-vm machinery
-#                             (mkVM) into a runnable image -- a built VM derivation.
-#   test.{host,world}         the hermetic-check role configs, fed to runNixOSTest (which supplies
-#                             its own VM machinery, so these carry only the role config -- no dev
-#                             substrate).
+#   test.host        = host-base  + { turnip }
+#   test.world       = world-base
+#   interactive.host = host-base  + interactive + { go, :2222, test image }
+#   interactive.world= world-base + interactive + { :2223, dev tooling }
 #
-# Shared building blocks (base-vm = rootless-podman capability, base-interactive = dev substrate,
-# peer-echo, probe-image) live in sibling files, imported by the role definitions below. The roles
-# close over the turnip package + pkgs from this scope; mkVM needs lib/nixpkgs/system to wrap a role
-# module into an image.
+# The bases mirror the runNixOSTest LAN (host 192.168.1.1 / world 192.168.1.2), so the hermetic
+# check and the dev VMs run identical network config. mkVM wraps an interactive role module with the
+# qemu-vm machinery into a runnable image; the test roles are fed to runNixOSTest, which supplies its
+# own VM machinery. The roles close over the turnip package + pkgs from this scope.
 #
 #   import ./nix/vm { inherit pkgs turnip lib nixpkgs system; }
 #     -> { interactive = { host; world; }; test = { host; world; }; }
 { pkgs, turnip, lib, nixpkgs, system }:
 let
   # Wrap an inline role module with the qemu-vm machinery into a runnable image
-  # (`result/bin/run-*-vm`). The role module pulls its shared building blocks in via `imports`.
+  # (`result/bin/run-*-vm`). The role module pulls its base + carve-outs in via `imports`.
   mkVM = roleModule: (lib.nixosSystem {
     inherit system;
     modules = [ "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix" roleModule ];
   }).config.system.build.vm;
 in
 {
-  # mkVM mapped over the inline role modules (each pulls its shared building blocks in via imports).
   interactive = lib.mapAttrs (_: mkVM) {
-    # The interactive HOST dev VM: the system under test. Imports the capability base (rootless
-    # podman) + the dev substrate, then adds the dev toolchain, the podman-attach test image, and
-    # the modeled LAN -- a single data interface (eth1) enslaved to a bridge (br-lan) that carries
-    # the IPs, mirroring a bridged server. A container's veth-bridge link enslaves into br-lan and
-    # appears as a new IP on that LAN.
+    # The interactive HOST dev VM: the system under test. host-base brings rootless podman, the host
+    # toolkit, and the modeled LAN (br-lan / 192.168.1.1); interactive.nix brings the dev substrate.
+    # On top: Go (build turnip from the 9p mount) and the podman-attach test image.
     #   just host  (boots qemu; persists vm/host.qcow2; serial console, Ctrl-a x to quit)
     #   nix/ssh-vm.sh [dev|homelab] [cmd]   (host on :2222)
     host = { pkgs, ... }:
@@ -45,46 +42,13 @@ in
         };
       in
       {
-        imports = [ ./base-vm.nix ./base-interactive.nix ];
+        imports = [ ./host-base.nix ./interactive.nix ];
 
         networking.hostName = "turnip";
-        # Resolve the world peer by name on the LAN (the integration harness dials `world`).
-        networking.extraHosts = "192.168.50.20 world";
 
-        # Go + python3: the dev toolchain, and python3 on the host PATH is what the integration
-        # harness's in-netns connect probes exec (via `turnip probe`) -- matching the check's host.
-        environment.systemPackages = [ pkgs.go pkgs.python3 ];
-
-        # homelab (the rootless-podman owner, declared by base-vm) gets its VM login creds here.
-        users.users.homelab = {
-          password = "homelab";
-          openssh.authorizedKeys.keyFiles = [ ../testvm_key.pub ];
-        };
-
-        # The throwaway test key, baked in for the integration harness to ssh the world peer -- no
-        # manual key staging. Root-owned 0600 so ssh accepts it when the harness runs as root.
-        environment.etc."turnip/ssh-key" = {
-          source = ../testvm_key;
-          mode = "0600";
-        };
-
-        # The modeled LAN: eth1 (the qemu mcast NIC, wired at launch) is enslaved to br-lan, which
-        # holds the addresses. Two IPs -- the second is the anchor for a yet-to-be-added secondary
-        # forward rule. ConfigureWithoutCarrier brings the bridge up before a peer appears.
-        systemd.network.netdevs."20-br-lan".netdevConfig = {
-          Name = "br-lan";
-          Kind = "bridge";
-        };
-        systemd.network.networks."21-eth1-lan" = {
-          matchConfig.Name = "eth1";
-          networkConfig.Bridge = "br-lan";
-        };
-        systemd.network.networks."22-br-lan" = {
-          matchConfig.Name = "br-lan";
-          address = [ "192.168.50.10/24" "192.168.50.11/24" ];
-          networkConfig.ConfigureWithoutCarrier = true;
-          linkConfig.RequiredForOnline = "no";
-        };
+        # Go: the dev toolchain (build turnip from the 9p mount). The host toolkit (python3 + the
+        # inspection CLIs the harness's in-netns probes exec) comes from host-base.
+        environment.systemPackages = [ pkgs.go ];
 
         # Host-forwarded ssh: host VM on :2222.
         virtualisation.forwardPorts = [
@@ -111,29 +75,18 @@ in
         };
       };
 
-    # The interactive WORLD dev VM: the external LAN peer for egress/ingress/veth-link exploration
-    # -- no podman, no turnip (no base-vm); a dumb peer. A static address on the shared LAN (eth1)
-    # puts it alongside the host's br-lan; peer-echo (imported) is the egress masquerade observer.
+    # The interactive WORLD dev VM: the external LAN peer for egress/ingress/veth-link exploration.
+    # world-base brings peer-echo, sshd, socat, and the static LAN (192.168.1.2); interactive.nix
+    # brings the dev substrate. On top: the netns/diagnostic CLIs for poking the LAN.
     #   just world  (boots qemu; persists vm/world.qcow2; serial console)
     #   nix/ssh-vm.sh world [dev] [cmd]   (world on :2223)
     world = { pkgs, ... }: {
-      imports = [ ./base-interactive.nix ./peer-echo.nix ];
+      imports = [ ./world-base.nix ./interactive.nix ];
 
       networking.hostName = "turnip-world";
-      # Resolve the host by name on the LAN (symmetry / convenience).
-      networking.extraHosts = "192.168.50.10 host";
 
-      # Peer tooling: socat (the peer-echo listener) + the netns/diagnostic CLIs for poking the LAN.
-      environment.systemPackages = [ pkgs.socat pkgs.python3 pkgs.iproute2 pkgs.iputils ];
-
-      # The shared LAN: a static address on eth1 (the qemu mcast NIC), alongside the host's br-lan
-      # (192.168.50.10/.11). Reachable from a host container's veth-bridge link too.
-      systemd.network.networks."21-eth1-lan" = {
-        matchConfig.Name = "eth1";
-        address = [ "192.168.50.20/24" ];
-        networkConfig.ConfigureWithoutCarrier = true;
-        linkConfig.RequiredForOnline = "no";
-      };
+      # Diagnostic tooling for poking the LAN (socat comes from world-base).
+      environment.systemPackages = [ pkgs.python3 pkgs.iproute2 pkgs.iputils ];
 
       # Host-forwarded ssh: world VM on :2223.
       virtualisation.forwardPorts = [
@@ -142,24 +95,18 @@ in
     };
   };
 
-  # The hermetic-check role configs (checks.integration nodes).
+  # The hermetic-check role configs (checks.integration nodes) -- each just its role base.
   test = {
-    # The system under test: the rootless-podman capability base + turnip + the probe toolbox
-    # (python3 drives the in-netns TCP connect; ip/nft from the base).
+    # The system under test: host-base (rootless podman + the probe/inspection toolkit + the modeled
+    # LAN) + the turnip binary under test.
     host = {
-      imports = [ ./base-vm.nix ];
-      environment.systemPackages = [ turnip pkgs.python3 pkgs.iputils pkgs.openssh ];
+      imports = [ ./host-base.nix ];
+      environment.systemPackages = [ turnip ];
     };
 
-    # The external peer: sshd (control) + the shared peer-echo listener on :8443 (the egress
-    # target). Firewall off so the masqueraded egress connection lands.
+    # The external peer: world-base (peer-echo + sshd + socat + the static LAN). No extras.
     world = {
-      imports = [ ./peer-echo.nix ];
-      networking.firewall.enable = false;
-      environment.systemPackages = [ pkgs.socat ]; # the ingress client (L4 IN-1/IN-3)
-      services.openssh.enable = true;
-      services.openssh.settings.PermitRootLogin = "prohibit-password";
-      users.users.root.openssh.authorizedKeys.keyFiles = [ ../testvm_key.pub ];
+      imports = [ ./world-base.nix ];
     };
   };
 }

@@ -95,10 +95,10 @@
                   "su homelab -c 'XDG_RUNTIME_DIR=/run/user/1001 podman info >/dev/null'",
                   timeout=120)
 
-              # host -> world SSH: the shared committed test key (world authorizes its pubkey).
-              host.succeed("install -m600 ${./nix/testvm_key} /root/id")
+              # host -> world SSH via the baked-in key (base-vm: /etc/turnip/ssh-key; world
+              # authorizes its pubkey) -- no manual key staging.
               host.wait_until_succeeds(
-                  "ssh -i /root/id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+                  "ssh -i /etc/turnip/ssh-key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
                   " -o ConnectTimeout=5 root@world true", timeout=90)
 
               # -test.parallel overrides the GOMAXPROCS default so the timeout-bound flow subtests
@@ -108,7 +108,7 @@
                   " -turnip ${turnip}/bin/turnip"
                   " -fixtures ${fixtures}"
                   " -image ${probeImage}"  # the python3 OCI archive TestPodmanRun loads + runs
-                  " -world root@world -ssh-key /root/id 2>&1"))
+                  " -world root@world -ssh-key /etc/turnip/ssh-key 2>&1"))
             '';
           };
 

@@ -65,7 +65,7 @@ case "$cmd" in
     esac ;;
   ready) # poll ssh until the VM accepts a login (for scripted waits after `up`)
     for _ in $(seq 1 40); do
-      if timeout 6 ssh -i "$root/nix/testvm_key" -p "$port" -o StrictHostKeyChecking=no \
+      if timeout 6 ssh -i "$root/nix/vm/testvm_key" -p "$port" -o StrictHostKeyChecking=no \
            -o UserKnownHostsFile=/dev/null -o ConnectTimeout=4 dev@localhost true 2>/dev/null; then
         echo "$role: ready"; exit 0
       fi

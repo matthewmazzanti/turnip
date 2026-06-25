@@ -27,6 +27,6 @@ if [ "${1:-}" = host ] || [ "${1:-}" = world ]; then
 fi
 
 user=${1:-$default_user}
-exec ssh -i "$here/testvm_key" -p "$port" \
+exec ssh -i "$here/vm/testvm_key" -p "$port" \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   "$user@localhost" "${@:2}"

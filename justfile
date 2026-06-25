@@ -36,7 +36,7 @@ vmlog role:
 itest *args:
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o vm/turnip ./cmd/turnip
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c -o vm/it.test ./test/integration
-    scp -i nix/testvm_key -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    scp -i nix/vm/testvm_key -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         vm/turnip vm/it.test dev@localhost:/tmp/
     nix/ssh-vm.sh host dev 'sudo /tmp/it.test -test.v -test.parallel 8 \
         -turnip /tmp/turnip -fixtures /mnt/turnip/test/integration/fixtures \
