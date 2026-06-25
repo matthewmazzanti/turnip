@@ -25,10 +25,16 @@
   security.sudo.wheelNeedsPassword = false;
   services.openssh.enable = true;
 
+  # graphics=true keeps -nographic OUT of the generated runner, so `up` can detach with qemu's own
+  # -daemonize (no sleep/setsid hack -- see nix/vm.sh). The serial console isn't on stdio by default
+  # then; vm.sh wires it per command (run: -serial mon:stdio; up: -serial file). qemu.consoles pins
+  # the serial port as the primary console (graphics=true otherwise prefers tty0), so the full boot
+  # lands on the serial -- the `run` terminal and the `up` log.
   virtualisation = {
     memorySize = 2048;
     cores = 2;
-    graphics = false; # serial console in the terminal; headless + ssh otherwise
+    graphics = true;
+    qemu.consoles = [ "tty0" "ttyS0,115200n8" ];
     diskSize = 8192; # MB; room for podman images
     # Live-mount the host repo at /mnt/turnip over 9p (tag `turnip`), READ-ONLY. We declare only the
     # GUEST mount; the host path (absolute) is injected at launch by the justfile.

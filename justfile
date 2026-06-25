@@ -1,10 +1,14 @@
 # turnip dev tasks. The dev-VM launch/control logic lives in nix/vm.sh (single source of truth);
-# these recipes are thin wrappers. VM state (disks, console logs, QMP sockets) lives in vm/
-# (gitignored). `just` runs from the repo root, so the VMs' 9p mount + vm/ land here.
+# `just vm <cmd> <role>` delegates straight to it. VM state (disks, console logs, QMP sockets) lives
+# in vm/ (gitignored). `just` runs from the repo root, so the VMs' 9p mount + vm/ land here.
 
 # List recipes.
 default:
     @just --list
+
+# Delegate to nix/vm.sh: `just vm <cmd> <role>` (run|up|ready|log|qmp|snap|stop|reset|pid|fresh).
+vm *args:
+    nix/vm.sh {{args}}
 
 # Boot the HOST / WORLD dev VM interactively (foreground serial console; Ctrl-a x to quit).
 host:
@@ -20,35 +24,33 @@ world-fresh:
     nix/vm.sh fresh world
     nix/vm.sh run world
 
-# Headless control (detached; managed across sessions). role = host|world.
-up role:
-    nix/vm.sh up {{role}}
-stop role:
-    nix/vm.sh stop {{role}}
-reset role:
-    nix/vm.sh reset {{role}}
-vmlog role:
-    nix/vm.sh log {{role}}
+# Bring both dev VMs up (idempotent) and wait until both accept ssh -- the env `just itest` needs.
+vm-up:
+    # up returns immediately (qemu -daemonize), so both boot concurrently; then we wait on each.
+    nix/vm.sh up host
+    nix/vm.sh up world
+    nix/vm.sh ready host
+    nix/vm.sh ready world
 
 # Static build (CGO off -> no libc/ld dep), so the binaries run in the dev VM straight from the 9p
 # mount regardless of its nix userland. Native arch: the dev machine and the VM share the flake's
 # system, so no cross-compile is needed (and none of the amd64-only assumption an explicit GOARCH bakes in).
 vm_go := "CGO_ENABLED=0 go"
 
-# Build turnip + the integration test binary (fixtures embedded) into vm/. Visible in the VM at
-# /mnt/turnip/vm/ via the 9p mount, so `just itest` execs them in place -- no scp.
+# Build turnip + the integration test binary (fixtures embedded) into vm/, exec'd in place via 9p.
 [private]
 itest-build:
     {{vm_go}} build -o vm/turnip ./cmd/turnip
     {{vm_go}} test -c -o vm/it.test ./test/integration
 
-# Run the integration suite against the running dev VMs; args pass through (`just itest -test.run X`).
-# The suite runs on the host node (drives world over the LAN) via ssh reading the heredoc on stdin.
-itest *args: itest-build
+# Run the integration suite (boots both dev VMs first); args pass through (`just itest -test.run X`).
+itest *args: itest-build vm-up
     #!/usr/bin/env bash
     nix/ssh-vm.sh host dev <<'EOF'
-    sudo /mnt/turnip/vm/it.test -test.v -test.parallel 8 \
+    sudo /mnt/turnip/vm/it.test \
+        -test.v -test.parallel 8 \
         -turnip /mnt/turnip/vm/turnip \
-        -world dev@world -ssh-key /etc/turnip/ssh-key \
+        -world dev@world \
+        -ssh-key /etc/turnip/ssh-key \
         -image /etc/turnip/probe-image.tar.gz {{args}}
     EOF
