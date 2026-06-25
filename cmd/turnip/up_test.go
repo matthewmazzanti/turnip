@@ -355,10 +355,14 @@ func TestRouterSysctls(t *testing.T) {
 		"net.ipv4.conf.all.rp_filter":               "0", // per-interface value is authoritative
 		"net.ipv4.conf.all.accept_source_route":     "0", // drop SRR (router-mode default is TRUE)
 		"net.ipv4.conf.all.send_redirects":          "0", // no ICMP redirects from the router
+		"net.ipv4.conf.all.accept_redirects":        "0", // don't let a redirect rewrite our routes
+		"net.ipv4.conf.all.secure_redirects":        "0",
 		"net.ipv6.conf.all.disable_ipv6":            "1",
 		"net.ipv4.conf.default.rp_filter":           "1", // STRICT -- the anti-spoof pin, templated
 		"net.ipv4.conf.default.proxy_arp":           "1", // answer the gateway ARP, templated
 		"net.ipv4.conf.default.send_redirects":      "0",
+		"net.ipv4.conf.default.accept_redirects":    "0",
+		"net.ipv4.conf.default.secure_redirects":    "0",
 		"net.ipv4.conf.default.accept_source_route": "0",
 		"net.ipv6.conf.default.disable_ipv6":        "1",
 		"net.netfilter.nf_conntrack_tcp_loose":      "0", // out-of-state pkts -> ct invalid, not picked up

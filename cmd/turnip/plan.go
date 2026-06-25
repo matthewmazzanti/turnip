@@ -275,7 +275,8 @@ func ownsDefault(configuredDefault bool, ifaceCount int) bool {
 
 // routerSysctls is the fixed, ORDERED sysctl set for a router netns. Everything is pinned
 // explicitly rather than trusting inheritance -- a fresh IPv4 netns copies conf/{all,default} from
-// init_net's LIVE values, so a host override would otherwise leak in.
+// init_net's LIVE values, so a host override would otherwise leak in. The per-knob verdicts (and
+// the ones deliberately skipped) are documented in docs/SYSCTLS.md.
 //
 // The whole set is written in ONE pass during apply, BEFORE the gateway/veths are created (and
 // after the nft load, which registers the netns conntrack hooks that create /proc/sys/net/netfilter
@@ -288,11 +289,12 @@ func ownsDefault(configuredDefault bool, ifaceCount int) bool {
 //     router defaults (send_redirects / accept_source_route flip toward enabled); the pins follow;
 //   - conf.all (namespace-wide): rp_filter=0 so the per-interface value is authoritative (effective
 //     = max(all, if)); accept_source_route=0 (drop SRR; acceptance ANDs all+iface, so all=0 closes
-//     it); send_redirects=0; ipv6 off;
+//     it); send_redirects=0 (no ICMP redirects out); accept_redirects=0 + secure_redirects=0 (don't
+//     let a redirect rewrite the router's static /32 routes); ipv6 off;
 //   - conf.default: the TEMPLATE every new interface inherits at creation -- rp_filter=1 (STRICT,
 //     the anti-spoof pin paired with the /32 device route), proxy_arp=1 (answer the gateway ARP on
 //     each fabric veth; inert on the point-to-point uplink/dummy), send_redirects=0,
-//     accept_source_route=0, ipv6 off;
+//     accept_redirects=0, secure_redirects=0, accept_source_route=0, ipv6 off;
 //   - conntrack: tcp_loose=0 (no mid-stream pickup, so a bare out-of-state ACK/RST/FIN is `ct
 //     invalid` -> the forward chain's invalid drop, instead of a forwarded `ct new`; safe because
 //     the routed model is strictly symmetric), be_liberal=0 (out-of-WINDOW TCP stays invalid too).
@@ -303,11 +305,15 @@ func routerSysctls() []dp.Sysctl {
 		dp.Sys("net.ipv4.conf.all.rp_filter", "0"),
 		dp.Sys("net.ipv4.conf.all.accept_source_route", "0"),
 		dp.Sys("net.ipv4.conf.all.send_redirects", "0"),
+		dp.Sys("net.ipv4.conf.all.accept_redirects", "0"),
+		dp.Sys("net.ipv4.conf.all.secure_redirects", "0"),
 		dp.Sys("net.ipv6.conf.all.disable_ipv6", "1"),
 		// conf.default -- the template every interface is BORN with
 		dp.Sys("net.ipv4.conf.default.rp_filter", "1"),
 		dp.Sys("net.ipv4.conf.default.proxy_arp", "1"),
 		dp.Sys("net.ipv4.conf.default.send_redirects", "0"),
+		dp.Sys("net.ipv4.conf.default.accept_redirects", "0"),
+		dp.Sys("net.ipv4.conf.default.secure_redirects", "0"),
 		dp.Sys("net.ipv4.conf.default.accept_source_route", "0"),
 		dp.Sys("net.ipv6.conf.default.disable_ipv6", "1"),
 		// conntrack -- the netns hooks exist (nft loaded before this pass)
