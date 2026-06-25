@@ -17,6 +17,13 @@ import (
 
 // applyPlan pushes a fully-resolved Plan onto the freshly-bootstrapped Set: loopback up in
 // every netns, then the per-network routed fabric, then the per-container local setup.
+//
+// TODO: reevaluate the apply-phase ordering globally. applyNetwork now front-loads nft+sysctls
+// before its own gateway/veths (so each interface is born into a hardened, policy-loaded netns).
+// Consider lifting that to a GLOBAL staging across ALL networks/containers -- load every router's
+// nft+sysctls first, THEN create every interface (gateways, fabric veths, container links) -- so no
+// interface (or cross-netns link) ever exists before all policy is in place. Cleaner for
+// multi-network containers; mirrors the per-network ordering at the whole-plan level.
 func applyPlan(set *netns.Set, plan *Plan) error {
 	// loopback up in every netns (routers + containers); all fds are present post-Bootstrap.
 	for _, sp := range plan.Specs {
