@@ -53,20 +53,16 @@
           # The fixture configs (one turnip.json per topology), referenced by -fixtures.
           fixtures = ./test/integration/fixtures;
 
-          # The minimal python netns-probe OCI image: the payload for a REAL `podman run
-          # --network ns:<pin>` against a turnip netns (the operator path, vs the `turnip probe`
-          # shortcut the rest of the harness uses). `podman load`ed by the owner in TestPodmanRun.
-          # Shared builder with the host dev VM's richer toolbox image (nix/vm/probe-image.nix).
-          probeImage = import ./nix/vm/probe-image.nix { inherit pkgs; };
-
           # Every VM this repo builds (nix/vm/), grouped by usecase: vms.interactive.{host,world}
           # are the built dev VMs; vms.test.{host,world} are the hermetic-check role configs fed to
-          # runNixOSTest below. mkVM lives in nix/vm/default.nix, hence lib/nixpkgs/system threaded in.
+          # runNixOSTest below; vms.probeImage is the shared netns-probe OCI image (TestPodmanRun's
+          # -image payload, also baked into the dev host). mkVM lives in nix/vm/default.nix, hence
+          # lib/nixpkgs/system are threaded in.
           vms = import ./nix/vm { inherit pkgs turnip lib nixpkgs system; };
         in
         {
           packages = {
-            inherit turnip probeImage;
+            inherit turnip;
             default = turnip; # `nix build` -> the turnip binary
             host = vms.interactive.host; # `nix build .#host` -> result/bin/run-turnip-vm
             world = vms.interactive.world; # `nix build .#world` -> result/bin/run-turnip-world-vm
@@ -107,7 +103,7 @@
                   "${turnipTest}/bin/turnip-integration.test -test.v -test.parallel 8"
                   " -turnip ${turnip}/bin/turnip"
                   " -fixtures ${fixtures}"
-                  " -image ${probeImage}"  # the python3 OCI archive TestPodmanRun loads + runs
+                  " -image ${vms.probeImage}"  # the python3 OCI archive TestPodmanRun loads + runs
                   " -world root@world -ssh-key /etc/turnip/ssh-key 2>&1"))
             '';
           };

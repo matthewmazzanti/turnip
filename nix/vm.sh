@@ -27,8 +27,8 @@ state="$root/vm"
 cmd=${1:?usage: vm.sh <run|up|log|qmp|stop|reset|pid|fresh> <host|world> [arg]}
 role=${2:?role: host|world}
 case "$role" in
-  host)  port=2222; mac=52:54:00:00:50:10; lan="udp=127.0.0.1:52001,localaddr=127.0.0.1:52000" ;;
-  world) port=2223; mac=52:54:00:00:50:20; lan="udp=127.0.0.1:52000,localaddr=127.0.0.1:52001" ;;
+  host)  port=2222; mac=52:54:00:00:01:01; lan="udp=127.0.0.1:52001,localaddr=127.0.0.1:52000" ;;
+  world) port=2223; mac=52:54:00:00:01:02; lan="udp=127.0.0.1:52000,localaddr=127.0.0.1:52001" ;;
   *) echo "unknown role: $role (want host|world)" >&2; exit 1 ;;
 esac
 disk="$state/$role.qcow2"
