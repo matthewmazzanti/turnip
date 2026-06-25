@@ -7,14 +7,18 @@ forwards between them by destination IP, and an nftables flow matrix decides who
 talk to whom. The network's *model* (who exists, who may talk, what crosses the edge)
 is a declarative `turnip.json`; the mechanism builds the dataplane from it.
 
-> **Status: Go rewrite in progress (rootful).** The active implementation is
+> **Status: rootful; functional and integration-validated.** The implementation is
 > [`cmd/turnip`](cmd/turnip) (Go). It runs **rootful** — the host edge (uplinks,
 > container links) needs the init netns, so turnip runs as root and drops to the
 > rootless-podman owner to enter podman's namespaces. The kernel-interface
 > primitives (podman-userns bootstrap, netns fd collection + bind-mount persistence,
 > sysctl/nft/netlink over an fd) live in [`internal/netns`](internal/netns) +
-> [`internal/dataplane`](internal/dataplane), exercised by the hermetic integration
-> check (`nix flake check`). Design docs live in [`docs/`](docs).
+> [`internal/dataplane`](internal/dataplane). The hermetic two-node integration check
+> (`nix flake check`) exercises the full matrix — structure, internal flows, network
+> isolation, egress/ingress, and packet-crafting bad-actor checks (source spoofing,
+> out-of-state injection, ARP poisoning); see [`docs/TEST-PLAN.md`](docs/TEST-PLAN.md).
+> The live `podman run --network ns:` attach is the remaining gate (see
+> [`todo.md`](todo.md)). Design docs live in [`docs/`](docs).
 
 ## Why routed instead of a bridge
 
@@ -37,7 +41,8 @@ router netns:  fabric0  10.0.0.1/32     (dummy; the virtual gateway)
                |- vethR-zwave  route 10.0.0.11/32 dev vethR-zwave
                |- vethR-hass   route 10.0.0.12/32 dev vethR-hass
                |- vethR-proxy  route 10.0.0.13/32 dev vethR-proxy
-               ip_forward=1 ; per-veth proxy_arp=1, rp_filter=1 (strict)
+               ip_forward=1 ; conf.default: proxy_arp=1, rp_filter=1 (strict),
+                 redirects/source-route off — every veth born hardened
                ipv6 disabled ; nft table inet turnip (forward flow matrix)
 zwave  netns:  eth0 10.0.0.11/32  default via 10.0.0.1
 hass   netns:  eth0 10.0.0.12/32  default via 10.0.0.1
@@ -56,8 +61,8 @@ in `turnip.json` to change it.
 | `cmd/turnip/` | the CLI + orchestration (the imperative shell): config/env IO, the `buildPlan` lowering (config → `Plan`, `plan.go`), the `applyPlan` driver (`apply.go`), and `up`/`down` dispatch |
 | `internal/` | `config` (the declarative model + validation), `netns` (podman bootstrap, netns lifecycle, the SCM_RIGHTS fd bridge), `dataplane` (gateway/veth/route wiring + the nft flow matrix) |
 | `nix/` | the flake helpers (`nix/lib`) + the dev VMs (`host-vm.nix` / `world-vm.nix` / `base-vm.nix`) over the rootless-podman base (`turnip-host.nix`) |
-| `test/integration/` | the hermetic two-node dataplane check (`checks.integration`) |
-| `docs/` | design docs — `ARCHITECTURE.md` (the config/plan/apply layering), `CONFIG-SKETCH.md` (config model + deferred-feature specs) |
+| `test/integration/` | the hermetic two-node dataplane check (`checks.integration`) — L1–L4 + bad-actor scenarios |
+| `docs/` | design docs — `ARCHITECTURE.md` (config/plan/apply layering), `CONFIG-SKETCH.md` (config model), `TEST-PLAN.md` (the integration matrix), `SYSCTLS.md` (sysctl-hardening verdicts) |
 | `todo.md` | the open-work checklist |
 
 ## Usage
@@ -87,8 +92,8 @@ the Python tool did, so a fresh process is dropped inside podman's userns instea
 phase-1 child creates each netns there, **pins it with a bind-mount** (so `podman run
 --network ns:<path>` can attach later), and ships its fd back to the root parent over
 SCM_RIGHTS. The parent then drives the whole dataplane against those fds: sysctls via a
-`setns` episode, nft via the netns-bound netlink socket (`google/nftables` `WithNetNSFd`,
-no `nft` subprocess), and links/addrs/routes via `vishvananda/netlink`. The capability
+`setns` episode, nft via a forked `nft -j -f -` child wrapped in that same `setns` episode
+(so it inherits the router netns), and links/addrs/routes via `vishvananda/netlink`. The capability
 reasoning: init-root holds `CAP_NET_ADMIN` over the podman-userns-owned netns, so the
 parent can drive the dataplane against the collected fds.
 
