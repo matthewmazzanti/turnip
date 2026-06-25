@@ -40,4 +40,5 @@ itest *args:
         vm/turnip vm/it.test dev@localhost:/tmp/
     nix/ssh-vm.sh host dev 'sudo /tmp/it.test -test.v -test.parallel 8 \
         -turnip /tmp/turnip -fixtures /mnt/turnip/test/integration/fixtures \
-        -world dev@world -ssh-key /etc/turnip/ssh-key {{args}}'
+        -world dev@world -ssh-key /etc/turnip/ssh-key \
+        -image /etc/turnip/probe-image.tar.gz {{args}}'

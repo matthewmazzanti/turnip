@@ -103,7 +103,7 @@
                   "${turnipTest}/bin/turnip-integration.test -test.v -test.parallel 8"
                   " -turnip ${turnip}/bin/turnip"
                   " -fixtures ${fixtures}"
-                  " -image ${vms.probeImage}"  # the python3 OCI archive TestPodmanRun loads + runs
+                  " -image /etc/turnip/probe-image.tar.gz"  # the OCI archive TestPodmanRun loads + runs
                   " -world root@world -ssh-key /etc/turnip/ssh-key 2>&1"))
             '';
           };

@@ -24,9 +24,13 @@ let
     modules = [ "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix" roleModule ];
   }).config.system.build.vm;
 
-  # The python netns-probe OCI image, built once and shared by both the hermetic check (the flake
-  # passes vms.probeImage to TestPodmanRun via -image) and the host dev VM (loaded at boot below).
+  # The python netns-probe OCI image, built once (here, with the flake pkgs -- one store path) and
+  # shared by both host usecases. `probeImageEtc` bakes the archive at a stable path on every host
+  # node, so the check and the dev itest pass the identical `-image /etc/turnip/probe-image.tar.gz`
+  # to the on-demand loader (TestPodmanRun). Built in default.nix, not host-base, so it stays one
+  # store path: a plain module only sees its own node's pkgs, which would re-fragment the image.
   probeImage = import ./probe-image.nix { inherit pkgs; };
+  probeImageEtc = { environment.etc."turnip/probe-image.tar.gz".source = probeImage; };
 in
 {
   inherit probeImage;
@@ -34,11 +38,11 @@ in
   interactive = lib.mapAttrs (_: mkVM) {
     # The interactive HOST dev VM: the system under test. host-base brings rootless podman, the host
     # toolkit, and the modeled LAN (br-lan / 192.168.1.1); interactive.nix brings the dev substrate.
-    # On top: Go (build turnip from the 9p mount) and the podman-attach test image.
+    # On top: Go (build turnip from the 9p mount); the probe image comes from probeImageEtc.
     #   just host  (boots qemu; persists vm/host.qcow2; serial console, Ctrl-a x to quit)
     #   nix/ssh-vm.sh [dev|homelab] [cmd]   (host on :2222)
     host = { pkgs, ... }: {
-        imports = [ ./host-base.nix ./interactive.nix ];
+        imports = [ ./host-base.nix ./interactive.nix probeImageEtc ];
 
         networking.hostName = "turnip";
 
@@ -50,26 +54,6 @@ in
         virtualisation.forwardPorts = [
           { from = "host"; host.port = 2222; guest.port = 22; }
         ];
-
-        # Load the shared probe image (the same one TestPodmanRun uses) into homelab's rootless
-        # store at boot, and name it in the environment.
-        environment.sessionVariables.TURNIP_TEST_IMAGE = "${probeImage.imageName}:${probeImage.imageTag}";
-        systemd.services.turnip-test-image = {
-          description = "load the python probe OCI image into homelab's rootless podman";
-          wantedBy = [ "multi-user.target" ];
-          after = [ "user@1001.service" ];
-          wants = [ "user@1001.service" ];
-          serviceConfig = {
-            Type = "oneshot";
-            RemainAfterExit = true;
-          };
-          script = ''
-            until test -d /run/user/1001; do sleep 0.2; done
-            export PATH=/run/wrappers/bin:/run/current-system/sw/bin
-            runuser -u homelab -- env XDG_RUNTIME_DIR=/run/user/1001 HOME=/home/homelab PATH="$PATH" \
-              podman load -i ${probeImage}
-          '';
-        };
       };
 
     # The interactive WORLD dev VM: the external LAN peer for egress/ingress/veth-link exploration.
@@ -95,9 +79,9 @@ in
   # The hermetic-check role configs (checks.integration nodes) -- each just its role base.
   test = {
     # The system under test: host-base (rootless podman + the probe/inspection toolkit + the modeled
-    # LAN) + the turnip binary under test.
+    # LAN) + the probe image at /etc + the turnip binary under test.
     host = {
-      imports = [ ./host-base.nix ];
+      imports = [ ./host-base.nix probeImageEtc ];
       environment.systemPackages = [ turnip ];
     };
 
