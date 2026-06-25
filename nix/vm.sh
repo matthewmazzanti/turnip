@@ -80,12 +80,15 @@ case "$cmd" in
     echo "$role: booting detached -> $log (control: nix/vm.sh {log,stop,reset} $role)"
     ;;
   ready)
-    # poll ssh until the VM accepts a login (for scripted waits after `up`); reuse ssh-vm.sh
-    for _ in $(seq 1 40); do
-      if timeout 6 "$root/nix/ssh-vm.sh" "$role" dev true 2>/dev/null; then
-        echo "$role: ready"
+    # poll ssh until the VM accepts a login (for scripted waits after `up`); reuse ssh-vm.sh. Each
+    # attempt's ssh output is surfaced so a stuck boot / refused connection / auth failure is visible.
+    echo "$role: waiting for ssh login ..." >&2
+    for i in $(seq 1 40); do
+      if err=$(timeout 6 "$root/nix/ssh-vm.sh" "$role" dev true 2>&1); then
+        echo "$role: ready (after $i attempts)"
         exit 0
       fi
+      echo "$role: attempt $i/40 not ready: ${err:-(no output / timed out)}" >&2
       sleep 2
     done
     echo "$role: not ready after timeout" >&2

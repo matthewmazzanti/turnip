@@ -27,6 +27,12 @@ if [ "${1:-}" = host ] || [ "${1:-}" = world ]; then
 fi
 
 user=${1:-$default_user}
-exec ssh -i "$here/vm/testvm_key" -p "$port" \
+
+# The committed key can't carry 0600 through git (git only tracks the exec bit), and ssh refuses a
+# world-readable private key. Stage a private 0600 copy (per-user, stable path) and use that.
+key="${TMPDIR:-/tmp}/turnip-testvm_key.$UID"
+install -m600 "$here/vm/testvm_key" "$key"
+
+exec ssh -i "$key" -p "$port" \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   "$user@localhost" "${@:2}"
