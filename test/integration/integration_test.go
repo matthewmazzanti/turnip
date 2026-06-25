@@ -465,10 +465,16 @@ func TestL1Structure(t *testing.T) {
 	// NET-5: the router's anti-spoof sysctls -- forwarding on, strict per-veth rp_filter, ipv6 off.
 	for _, c := range []struct{ path, want, label string }{
 		{"/proc/sys/net/ipv4/ip_forward", "1", "NET-5 ip_forward"},
-		{"/proc/sys/net/ipv4/conf/vethR-zwave/rp_filter", "1", "NET-5 rp_filter strict"},
+		// conf.default is the TEMPLATE set before veth creation; the per-veth values below are
+		// INHERITED from it (no per-veth pinning), which is what makes new veths born-hardened.
+		{"/proc/sys/net/ipv4/conf/default/rp_filter", "1", "NET-5 conf.default rp_filter (template)"},
+		{"/proc/sys/net/ipv4/conf/default/proxy_arp", "1", "NET-5 conf.default proxy_arp (template)"},
+		{"/proc/sys/net/ipv4/conf/vethR-zwave/rp_filter", "1", "NET-5 veth rp_filter strict (inherited)"},
+		{"/proc/sys/net/ipv4/conf/vethR-zwave/proxy_arp", "1", "NET-5 veth proxy_arp (inherited)"},
+		{"/proc/sys/net/ipv4/conf/vethR-zwave/send_redirects", "0", "NET-5 veth send_redirects off (inherited)"},
+		{"/proc/sys/net/ipv4/conf/all/rp_filter", "0", "NET-5 conf.all rp_filter (per-if authoritative)"},
 		{"/proc/sys/net/ipv4/conf/all/accept_source_route", "0", "NET-5 source-route off"},
 		{"/proc/sys/net/ipv4/conf/all/send_redirects", "0", "NET-5 all send_redirects off"},
-		{"/proc/sys/net/ipv4/conf/vethR-zwave/send_redirects", "0", "NET-5 per-veth send_redirects off"},
 		{"/proc/sys/net/netfilter/nf_conntrack_tcp_loose", "0", "NET-5 ct tcp_loose off"},
 		{"/proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal", "0", "NET-5 ct be_liberal off"},
 		{"/proc/sys/net/ipv6/conf/all/disable_ipv6", "1", "NET-5 ipv6 disabled"},

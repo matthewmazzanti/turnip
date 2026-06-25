@@ -48,10 +48,29 @@ func applyNetwork(set *netns.Set, np NetworkPlan) error {
 	if !ok {
 		return fmt.Errorf("router netns %q missing from the bootstrap set", np.Name)
 	}
+
+	// Policy BEFORE interfaces, each in a setns episode (set.Enter -- /proc/sys has no netlink verb;
+	// the forked nft child inherits the netns). nft FIRST: it's name/IP-based (no interface need
+	// exist yet) and its ct-state rules register the netns conntrack hooks that create
+	// /proc/sys/net/netfilter -- so the conntrack sysctls below resolve. Then ONE sysctl pass:
+	// ip_forward (re-derives the router defaults the pins override), the conf.all globals, the
+	// conf.default TEMPLATE, then the conntrack knobs. Writing conf.default HERE, before the
+	// gateway/veths are created, is what makes every interface born hardened -- no per-veth pinning,
+	// and a future veth can't miss it. No traffic flows during apply, so the drop-policy ruleset
+	// being live before the veths exist is harmless.
+	if err := set.Enter(np.Router, func() error { return nftlib.Load(np.NFT) }); err != nil {
+		return fmt.Errorf("network %q nft: %w", np.Name, err)
+	}
+	if err := set.Enter(np.Router, func() error { return dp.WriteSysctls(np.Sysctls) }); err != nil {
+		return fmt.Errorf("network %q sysctls: %w", np.Name, err)
+	}
+	fmt.Printf("  router %s: nft fail-closed + hardened sysctls (conf.default baseline)\n", np.Name)
+
+	// now the interfaces -- each born into the hardened netns, inheriting conf.default.
 	if err := dp.CreateGateway(routerFd, np.Gateway); err != nil {
 		return fmt.Errorf("network %q: %w", np.Name, err)
 	}
-	fmt.Printf("  router %s: gateway %s/%d on %s\n", np.Name, np.Gateway.Addr, dp.HostPrefix, np.Gateway.IfName)
+	fmt.Printf("    gateway %s/%d on %s\n", np.Gateway.Addr, dp.HostPrefix, np.Gateway.IfName)
 
 	for _, ep := range np.Endpoints {
 		contFd, ok := set.FD(ep.Netns)
@@ -66,10 +85,9 @@ func applyNetwork(set *netns.Set, np NetworkPlan) error {
 			np.Gateway.Addr, defaultMark(ep.Endpoint.Default), ep.Endpoint.RouterIf)
 	}
 
-	// uplink (the host edge): the /31 veth + container routes (HostEdgeConnect), then the
-	// pre-built host sysctls + nat zone pushed in. All run in the init netns (the root parent
-	// is here) -- no set.Enter. Done before the router sysctls/nft so the uplink veth exists
-	// when they reference it (rp_filter + egress allows).
+	// uplink (the host edge): the /31 veth + container routes (HostEdgeConnect), then the pre-built
+	// host sysctls (init ip_forward) + nat zone. All run in the init netns (the root parent is here)
+	// -- no set.Enter. The router-side uplink veth is born into the already-hardened netns too.
 	if np.Uplink != nil {
 		u := np.Uplink
 		if err := dp.HostEdgeConnect(routerFd, u.Uplink, u.ContainerIPs); err != nil {
@@ -84,22 +102,6 @@ func applyNetwork(set *netns.Set, np NetworkPlan) error {
 		fmt.Printf("    uplink: %s <-> %s (%s/%d), host masquerade + %d route(s) + %d dnat\n",
 			u.Uplink.HostIf, u.Uplink.RouterIf, u.Uplink.HostIP, dp.LinkPrefix, len(u.ContainerIPs), len(u.DNATs))
 	}
-
-	// nft + sysctls: the pre-built artifacts, pushed last. Both act on the process netns
-	// (/proc/sys has no netlink verb; the forked nft child inherits the netns), so each runs
-	// inside a setns episode (set.Enter). NFT goes FIRST: its ct-state rules register the netns
-	// conntrack hooks, which is what creates /proc/sys/net/netfilter -- so the nf_conntrack_tcp_loose
-	// sysctl only exists afterward. Nothing in the load reads the sysctls and no traffic flows
-	// during apply, so the order is otherwise immaterial.
-	if err := set.Enter(np.Router, func() error { return nftlib.Load(np.NFT) }); err != nil {
-		return fmt.Errorf("network %q nft: %w", np.Name, err)
-	}
-	fmt.Printf("    nft: forward flow matrix + input lockdown\n")
-
-	if err := set.Enter(np.Router, func() error { return dp.WriteSysctls(np.Sysctls) }); err != nil {
-		return fmt.Errorf("network %q sysctls: %w", np.Name, err)
-	}
-	fmt.Printf("    sysctls: ip_forward + per-veth proxy_arp/rp_filter (strict) + redirects/source-route off + ct tcp_loose/be_liberal off + ipv6 off\n")
 	return nil
 }
 

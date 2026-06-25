@@ -77,7 +77,7 @@ became kernel state. Host-only.
 | NET-2 | gateway present | dummy `gw0` up, addr = gateway `/32`, in router netns | `dataplane.CreateGateway` |
 | NET-3 | routed veths | per-container veth pair; router side has `/32` device route to container IP; container has default route via gateway | `dataplane.Connect`, host32 route |
 | NET-4 | nft loaded | `inet turnip` table present in router netns; `forward` + `input` chains both policy `drop` | `dataplane.BuildNFT` |
-| NET-5 | router sysctls (ordered; `ip_forward` first) | `ip_forward=1`; `conf.all.{rp_filter=0, accept_source_route=0, send_redirects=0}`; per-veth `rp_filter=1` + `proxy_arp=1` + `send_redirects=0`; `nf_conntrack_tcp_{loose,be_liberal}=0`; ipv6 disabled | `plan.go:routerSysctls` |
+| NET-5 | router sysctls (ordered; `ip_forward` first; written before veths) | `ip_forward=1`; `conf.all.{rp_filter=0, accept_source_route=0, send_redirects=0}`; `conf.default.{rp_filter=1, proxy_arp=1, send_redirects=0, accept_source_route=0}` (the TEMPLATE every veth inherits at birth); `nf_conntrack_tcp_{loose,be_liberal}=0`; ipv6 disabled | `plan.go:routerSysctls` |
 | NET-6 | two networks isolate | two router netns, two distinct nft tables; no route between them | one router/netns per network |
 | NET-7 | network with uplink | `/31` uplink veth; router default route via uplink host end; host-edge `ip turnip_host_<net>` nat table with masquerade | `dataplane.HostEdgeConnect`, `BuildHostNFT` |
 | NET-8 | network without uplink | no uplink veth, no host-edge nat table, no default route in router | uplink branch skipped |
@@ -249,9 +249,17 @@ NET-1..5/7/8 fold into each fixture's post-bring-up structural batch. Start **fu
 7. **Pin everything explicitly; the sysctl set is an ORDERED list** (research-driven). A fresh IPv4
    netns inherits `conf/{all,default}` from init_net's *live* values, so a host override leaks in —
    we pin rather than trust inheritance. Added: `accept_source_route=0` (real gap — `ip_forward`
-   puts the netns in RFC1812 router mode where it defaults TRUE), `send_redirects=0` on `all`+each
-   veth (router-mode default TRUE; inert on /32 p2p but pinned), `be_liberal=0` (default, pinned to
-   reinforce `tcp_loose=0`). `ip_forward` is written FIRST because it re-derives the per-interface
-   router defaults the pins then override. Skipped: ARP knobs (conflict with `proxy_arp`; the §5
-   ARP test shows routing already neutralizes poisoning), global conntrack knobs (read-only outside
-   init_net).
+   puts the netns in RFC1812 router mode where it defaults TRUE), `send_redirects=0` (router-mode
+   default TRUE; inert on /32 p2p but pinned), `be_liberal=0` (default, pinned to reinforce
+   `tcp_loose=0`). `ip_forward` is written FIRST because it re-derives the per-interface router
+   defaults the pins then override. Skipped: ARP knobs (conflict with `proxy_arp`; the §5 ARP test
+   shows routing already neutralizes poisoning), global conntrack knobs (read-only outside init_net).
+8. **Per-interface hardening rides `conf.default`, applied before the veths exist** — so every
+   interface (gateway dummy, fabric veths, uplink veth) is BORN hardened (`rp_filter=1`,
+   `proxy_arp=1`, `send_redirects=0`) instead of pinned per-veth-name after creation. Closes a
+   latent gap: a future topology change that adds a veth can't forget to harden it. This let the
+   apply order collapse to a single sysctl pass: `nft` is name/IP-based (loads with no interfaces
+   yet) and registers the conntrack hooks (`/proc/sys/net/netfilter`), so the order is `nft` →
+   one `WriteSysctls` (incl. `conf.default` + conntrack) → gateway → veths. `routerSysctls` no
+   longer takes interface names. NET-5 asserts both the `conf.default` template and the inherited
+   per-veth values.
