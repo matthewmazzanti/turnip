@@ -77,7 +77,7 @@ became kernel state. Host-only.
 | NET-2 | gateway present | dummy `gw0` up, addr = gateway `/32`, in router netns | `dataplane.CreateGateway` |
 | NET-3 | routed veths | per-container veth pair; router side has `/32` device route to container IP; container has default route via gateway | `dataplane.Connect`, host32 route |
 | NET-4 | nft loaded | `inet turnip` table present in router netns; `forward` + `input` chains both policy `drop` | `dataplane.BuildNFT` |
-| NET-5 | router sysctls | `ip_forward=1`; `conf.all.rp_filter=0`; per-veth `rp_filter=1` + `proxy_arp=1`; ipv6 disabled | `plan.go:routerSysctls` |
+| NET-5 | router sysctls | `ip_forward=1`; `conf.all.rp_filter=0`; per-veth `rp_filter=1` + `proxy_arp=1`; `nf_conntrack_tcp_loose=0`; ipv6 disabled | `plan.go:routerSysctls` |
 | NET-6 | two networks isolate | two router netns, two distinct nft tables; no route between them | one router/netns per network |
 | NET-7 | network with uplink | `/31` uplink veth; router default route via uplink host end; host-edge `ip turnip_host_<net>` nat table with masquerade | `dataplane.HostEdgeConnect`, `BuildHostNFT` |
 | NET-8 | network without uplink | no uplink veth, no host-edge nat table, no default route in router | uplink branch skipped |
@@ -236,6 +236,13 @@ NET-1..5/7/8 fold into each fixture's post-bring-up structural batch. Start **fu
 1. **Probe mechanism** — fd-exec (`__probe`) for §3/§5; real `podman run` only for §6. Risk to
    prove first: a rootful `__probe` entering the rootless-podman-owned netns (step 1 of bootstrap).
 2. **Masquerade observer** — `socat` peer-addr echo on world (§4 EG-2 note); `conntrack -L` optional.
-3. **Crafting toolchain** — scapy (attack) + socat/curl (benign).
+3. **Crafting toolchain** — stdlib `socket`+`struct` raw sends (spoofed saddr, bare ACK; no scapy
+   dep) for the attacks; `socat`/python connect for the benign side.
 4. **Organization** — by fixture (Appendix B), black-box first.
 5. **Ingress return route** — free on the shared LAN; ingress isn't masqueraded (§4 IN note).
+6. **Out-of-state drop needs `nf_conntrack_tcp_loose=0`** (BAD-4). The forward chain's `ct invalid
+   → drop` is dead under the kernel default (loose=1 *picks up* a bare ACK as `ct new` and forwards
+   it on allowed ports). `routerSysctls` sets loose=0 so out-of-state packets become `ct invalid`;
+   safe because the routed model is strictly symmetric (no asymmetric path where conntrack misses
+   the SYN). This forced apply to load nft *before* sysctls: the ct-state rules register the netns
+   conntrack hooks that create `/proc/sys/net/netfilter` (where the loose knob lives).

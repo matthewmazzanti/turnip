@@ -330,15 +330,16 @@ func TestRouterSysctls(t *testing.T) {
 	got := routerSysctls([]string{"vethR-a", "vethR-b"}, "vethR-up")
 
 	want := map[string]string{
-		"net.ipv4.ip_forward":                "1",
-		"net.ipv4.conf.all.rp_filter":        "0", // per-veth values are authoritative
-		"net.ipv6.conf.all.disable_ipv6":     "1",
-		"net.ipv6.conf.default.disable_ipv6": "1",
-		"net.ipv4.conf.vethR-a.proxy_arp":    "1",
-		"net.ipv4.conf.vethR-a.rp_filter":    "1",
-		"net.ipv4.conf.vethR-b.proxy_arp":    "1",
-		"net.ipv4.conf.vethR-b.rp_filter":    "1",
-		"net.ipv4.conf.vethR-up.rp_filter":   "1",
+		"net.ipv4.ip_forward":                  "1",
+		"net.ipv4.conf.all.rp_filter":          "0", // per-veth values are authoritative
+		"net.netfilter.nf_conntrack_tcp_loose": "0", // out-of-state pkts -> ct invalid, not picked up
+		"net.ipv6.conf.all.disable_ipv6":       "1",
+		"net.ipv6.conf.default.disable_ipv6":   "1",
+		"net.ipv4.conf.vethR-a.proxy_arp":      "1",
+		"net.ipv4.conf.vethR-a.rp_filter":      "1",
+		"net.ipv4.conf.vethR-b.proxy_arp":      "1",
+		"net.ipv4.conf.vethR-b.rp_filter":      "1",
+		"net.ipv4.conf.vethR-up.rp_filter":     "1",
 	}
 	if len(got) != len(want) {
 		t.Errorf("got %d keys, want %d:\n%v", len(got), len(want), got)

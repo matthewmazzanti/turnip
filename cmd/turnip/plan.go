@@ -282,6 +282,12 @@ func ownsDefault(configuredDefault bool, ifaceCount int) bool {
 //   - ip_forward on (we route);
 //   - all.rp_filter=0 so the per-veth values are authoritative (the kernel uses
 //     max(conf.all, conf.<if>), and a fresh netns may not default all to 0);
+//   - nf_conntrack_tcp_loose=0 so conntrack does NOT pick up mid-stream connections: a bare
+//     out-of-state ACK/RST/FIN becomes `ct invalid` (-> the forward chain's invalid drop) instead
+//     of a forwarded `ct new`. This makes "every new connection begins with a SYN in the allowed
+//     direction" real. Safe here because the routed model is strictly symmetric (each container's
+//     traffic crosses its one router, and a fresh netns has no connection to pick up) -- the loose
+//     default only matters for asymmetric paths where conntrack misses the SYN;
 //   - ipv6 disabled router-wide (the routed model has no L2 path between containers, so
 //     killing v6 on the router severs inter-container v6);
 //   - then per fabric veth: proxy_arp=1 (answer the gateway ARP / a future uplink) and
@@ -294,10 +300,11 @@ func ownsDefault(configuredDefault bool, ifaceCount int) bool {
 // (not the uplink) and is dropped (the anti-spoof pin).
 func routerSysctls(routerIfs []string, uplinkRouterIf string) map[string]string {
 	s := map[string]string{
-		"net.ipv4.ip_forward":                "1",
-		"net.ipv4.conf.all.rp_filter":        "0",
-		"net.ipv6.conf.all.disable_ipv6":     "1",
-		"net.ipv6.conf.default.disable_ipv6": "1",
+		"net.ipv4.ip_forward":                  "1",
+		"net.ipv4.conf.all.rp_filter":          "0",
+		"net.netfilter.nf_conntrack_tcp_loose": "0",
+		"net.ipv6.conf.all.disable_ipv6":       "1",
+		"net.ipv6.conf.default.disable_ipv6":   "1",
 	}
 	for _, rif := range routerIfs {
 		s["net.ipv4.conf."+rif+".proxy_arp"] = "1"

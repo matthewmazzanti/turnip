@@ -199,19 +199,29 @@ func (h *H) pings(t *testing.T, src, ip string) int {
 	return code
 }
 
-// rpfDrops reads the strict-rp_filter drop counter (IPReversePathFilter) in a router netns. The
-// delta across a spoofed burst is the count the kernel dropped on reverse-path failure.
-func (h *H) rpfDrops(t *testing.T, router string) int {
+// counterIn runs a bare-int-printing counter script (rpfCounter / ctInvalidCounter) in a router
+// netns and parses the result. The delta across a crafted burst is the count the kernel dropped.
+func (h *H) counterIn(t *testing.T, router, script, what string) int {
 	t.Helper()
-	out, code := h.probe(t, router, "python3", "-c", rpfCounter)
+	out, code := h.probe(t, router, "python3", "-c", script)
 	if code != 0 {
-		t.Fatalf("read rp_filter counter in %s: code=%d\n%s", router, code, out)
+		t.Fatalf("read %s counter in %s: code=%d\n%s", what, router, code, out)
 	}
 	n, err := strconv.Atoi(strings.TrimSpace(out))
 	if err != nil {
-		t.Fatalf("parse rp_filter counter %q: %v", out, err)
+		t.Fatalf("parse %s counter %q: %v", what, out, err)
 	}
 	return n
+}
+
+// rpfDrops reads the strict-rp_filter drop counter (IPReversePathFilter); ctInvalid reads the
+// conntrack out-of-state (invalid) counter. Both are netns-scoped -- read them in a router netns.
+func (h *H) rpfDrops(t *testing.T, router string) int {
+	return h.counterIn(t, router, rpfCounter, "rp_filter")
+}
+
+func (h *H) ctInvalid(t *testing.T, router string) int {
+	return h.counterIn(t, router, ctInvalidCounter, "ct-invalid")
 }
 
 // recvPeer connects to ip:port and prints the source address the SERVER reports seeing. Run
@@ -266,6 +276,34 @@ for _ in range(n):
     s.sendto(h + icmp, (dst, 0))
 `
 
+// ackSend crafts n bare TCP ACK segments (no SYN, no connection) from src to dst:dport on a raw
+// IPPROTO_RAW socket inside the source netns. With conntrack tcp_loose off on the router, such an
+// out-of-state packet is `ct invalid` -> dropped by the forward chain, even toward an ALLOWED
+// (proto,dport). argv: src dst dport n. stdlib-only.
+const ackSend = `
+import socket, struct, sys
+def cks(b):
+    if len(b) % 2: b += b"\x00"
+    s = sum(struct.unpack("!%dH" % (len(b)//2), b)); s = (s >> 16) + (s & 0xffff); s += s >> 16
+    return (~s) & 0xffff
+src, dst, dport, n = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+sport, seq, ackn = 40000, 12345, 67890
+def seg():
+    off, flags, win = 5 << 4, 0x10, 8192  # ACK only, no SYN
+    h = struct.pack("!HHIIBBHHH", sport, dport, seq, ackn, off, flags, win, 0, 0)
+    pseudo = socket.inet_aton(src) + socket.inet_aton(dst) + struct.pack("!BBH", 0, 6, len(h))
+    return struct.pack("!HHIIBBHHH", sport, dport, seq, ackn, off, flags, win, cks(pseudo + h), 0)
+for _ in range(n):
+    seg_b = seg(); tot = 20 + len(seg_b)
+    h = struct.pack("!BBHHHBBH4s4s", 0x45, 0, tot, 0, 0, 64, 6, 0,
+                    socket.inet_aton(src), socket.inet_aton(dst))
+    h = struct.pack("!BBHHHBBH4s4s", 0x45, 0, tot, 0, 0, 64, 6, cks(h),
+                    socket.inet_aton(src), socket.inet_aton(dst))
+    s.sendto(h + seg_b, (dst, 0))
+`
+
 // rpfCounter prints the netns-scoped IPReversePathFilter counter (strict rp_filter drops) from
 // /proc/net/netstat as a bare integer. Read in the router netns it counts forged-saddr drops.
 const rpfCounter = `
@@ -279,6 +317,15 @@ for i in range(0, len(lines) - 1, 2):
     if want in keys:
         val = int(vals[keys.index(want)]); break
 sys.stdout.write(str(val))
+`
+
+// ctInvalidCounter prints the netns-scoped conntrack "invalid" total (summed across the per-CPU
+// rows of /proc/net/stat/nf_conntrack, whose first line labels the columns) as a bare integer.
+const ctInvalidCounter = `
+import sys
+L = open("/proc/net/stat/nf_conntrack").read().splitlines()
+i = L[0].split().index("invalid")
+sys.stdout.write(str(sum(int(r.split()[i], 16) for r in L[1:])))
 `
 
 // worldIPv4 resolves the world node's test-LAN IPv4 (via the host's /etc/hosts), so a container
@@ -400,6 +447,7 @@ func TestL1Structure(t *testing.T) {
 	for _, c := range []struct{ path, want, label string }{
 		{"/proc/sys/net/ipv4/ip_forward", "1", "NET-5 ip_forward"},
 		{"/proc/sys/net/ipv4/conf/vethR-zwave/rp_filter", "1", "NET-5 rp_filter strict"},
+		{"/proc/sys/net/netfilter/nf_conntrack_tcp_loose", "0", "NET-5 ct tcp_loose off"},
 		{"/proc/sys/net/ipv6/conf/all/disable_ipv6", "1", "NET-5 ipv6 disabled"},
 	} {
 		out, _ := h.probe(t, "router:lan", "cat", c.path)
@@ -648,5 +696,34 @@ func TestBADLateralSpoof(t *testing.T) {
 
 	if got := h.rpfDrops(t, "router:lan") - before; got != burst {
 		t.Errorf("BAD-2: rp_filter dropped %d of %d victim-spoofed packets, want all (before=%d)", got, burst, before)
+	}
+}
+
+// TestBADOutOfState is fixture bad's stateful-firewall invariant (§5 BAD-4, host-only): an
+// out-of-state TCP ACK (no SYN, no connection) is dropped EVEN toward an allowed (proto,dport).
+// adv has a real flow to victim:8080, but a bare ACK at that very port is `ct invalid` -- conntrack
+// tcp_loose is off (routerSysctls), so it is NOT picked up as a mid-stream connection -- and the
+// forward chain's invalid rule drops it before the flow vmap. Without tcp_loose=0 the kernel
+// default would silently adopt the ACK as `ct new` and forward it; this test pins that hardening.
+//
+// Targets the ALLOWED port deliberately: a denied port would also drop (policy), so it could not
+// isolate the ct-invalid path. Asserted on the exact conntrack-invalid counter delta. Separate
+// top-level test on a fresh fixture (netns-global counter, never concurrent with other senders).
+func TestBADOutOfState(t *testing.T) {
+	h := newH()
+	h.up(t, "bad.json")
+	t.Cleanup(func() { h.down(t) })
+
+	const burst = 5
+	before := h.ctInvalid(t, "router:lan")
+
+	// adv sends bare ACKs at victim's ALLOWED port 8080 -- out-of-state, so still dropped.
+	out, code := h.probe(t, "adv", "python3", "-c", ackSend, "10.0.0.11", "10.0.0.12", "8080", strconv.Itoa(burst))
+	if code != 0 {
+		t.Fatalf("BAD-4: ack send failed (code %d):\n%s", code, out)
+	}
+
+	if got := h.ctInvalid(t, "router:lan") - before; got != burst {
+		t.Errorf("BAD-4: conntrack marked %d of %d out-of-state ACKs invalid, want all (before=%d)", got, burst, before)
 	}
 }

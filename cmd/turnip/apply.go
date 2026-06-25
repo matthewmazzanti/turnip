@@ -85,18 +85,21 @@ func applyNetwork(set *netns.Set, np NetworkPlan) error {
 			u.Uplink.HostIf, u.Uplink.RouterIf, u.Uplink.HostIP, dp.LinkPrefix, len(u.ContainerIPs), len(u.DNATs))
 	}
 
-	// sysctls + nft: the pre-built artifacts, pushed last. Both act on the process netns
+	// nft + sysctls: the pre-built artifacts, pushed last. Both act on the process netns
 	// (/proc/sys has no netlink verb; the forked nft child inherits the netns), so each runs
-	// inside a setns episode (set.Enter).
-	if err := set.Enter(np.Router, func() error { return dp.WriteSysctls(np.Sysctls) }); err != nil {
-		return fmt.Errorf("network %q sysctls: %w", np.Name, err)
-	}
-	fmt.Printf("    sysctls: ip_forward + per-veth proxy_arp/rp_filter (strict) + ipv6 off\n")
-
+	// inside a setns episode (set.Enter). NFT goes FIRST: its ct-state rules register the netns
+	// conntrack hooks, which is what creates /proc/sys/net/netfilter -- so the nf_conntrack_tcp_loose
+	// sysctl only exists afterward. Nothing in the load reads the sysctls and no traffic flows
+	// during apply, so the order is otherwise immaterial.
 	if err := set.Enter(np.Router, func() error { return nftlib.Load(np.NFT) }); err != nil {
 		return fmt.Errorf("network %q nft: %w", np.Name, err)
 	}
 	fmt.Printf("    nft: forward flow matrix + input lockdown\n")
+
+	if err := set.Enter(np.Router, func() error { return dp.WriteSysctls(np.Sysctls) }); err != nil {
+		return fmt.Errorf("network %q sysctls: %w", np.Name, err)
+	}
+	fmt.Printf("    sysctls: ip_forward + per-veth proxy_arp/rp_filter (strict) + ct tcp_loose off + ipv6 off\n")
 	return nil
 }
 
