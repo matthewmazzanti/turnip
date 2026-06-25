@@ -30,12 +30,25 @@ reset role:
 vmlog role:
     nix/vm.sh log {{role}}
 
-# Run the integration suite against the running dev VMs (host drives world over the LAN). Build the
-# binaries into vm/ (fixtures embedded in it.test); they're reached in the VM via the 9p mount at
-# /mnt/turnip/vm/ (no scp). Extra args pass through, e.g. `just itest -test.run TestL3Egress`.
-itest *args:
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o vm/turnip ./cmd/turnip
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c -o vm/it.test ./test/integration
-    nix/ssh-vm.sh host dev 'sudo /mnt/turnip/vm/it.test -test.v -test.parallel 8 \
-        -turnip /mnt/turnip/vm/turnip -world dev@world -ssh-key /etc/turnip/ssh-key \
-        -image /etc/turnip/probe-image.tar.gz {{args}}'
+# Static build (CGO off -> no libc/ld dep), so the binaries run in the dev VM straight from the 9p
+# mount regardless of its nix userland. Native arch: the dev machine and the VM share the flake's
+# system, so no cross-compile is needed (and none of the amd64-only assumption an explicit GOARCH bakes in).
+vm_go := "CGO_ENABLED=0 go"
+
+# Build turnip + the integration test binary (fixtures embedded) into vm/. Visible in the VM at
+# /mnt/turnip/vm/ via the 9p mount, so `just itest` execs them in place -- no scp.
+[private]
+itest-build:
+    {{vm_go}} build -o vm/turnip ./cmd/turnip
+    {{vm_go}} test -c -o vm/it.test ./test/integration
+
+# Run the integration suite against the running dev VMs; args pass through (`just itest -test.run X`).
+# The suite runs on the host node (drives world over the LAN) via ssh reading the heredoc on stdin.
+itest *args: itest-build
+    #!/usr/bin/env bash
+    nix/ssh-vm.sh host dev <<'EOF'
+    sudo /mnt/turnip/vm/it.test -test.v -test.parallel 8 \
+        -turnip /mnt/turnip/vm/turnip \
+        -world dev@world -ssh-key /etc/turnip/ssh-key \
+        -image /etc/turnip/probe-image.tar.gz {{args}}
+    EOF
