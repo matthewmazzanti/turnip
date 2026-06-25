@@ -189,6 +189,13 @@ a finding, not an expected-fail.
 Black-box. Real `turnip up`, real `podman run --network ns:`, real `turnip down`. This is the
 todo.md end-to-end item. Mostly host-only; the ingress/egress variant needs world.
 
+**Landed: E2E-2/E2E-3** as `TestPodmanRun` (POD-1/POD-2/POD-3) — a real container, run as the
+rootless owner from a nix-built python image (the flake's `probeImage`, passed via `-image`), does
+the full operator attach: `--network ns:` to join zwave's pinned netns **plus** `-v <hosts>:/etc/hosts`
+to bind the generated hosts file. It reaches hass by IP (POD-1) and by NAME (POD-2, proving the host
+bind resolves the flow peer), and the wrong port drops (POD-3) — governed by the L1 flow matrix
+exactly as the `turnip probe` shortcut is. The rest of §6 remains.
+
 | ID | Scenario | Assert | Enforced by |
 |----|----------|--------|-------------|
 | E2E-1 | `turnip up` realistic multi-net config | exit 0; all netns/veths/nft/sysctls present (re-uses §2 asserts) | full apply path |

@@ -73,10 +73,22 @@
           peerEcho = pkgs.writeShellScript "peer-echo" ''
             exec ${pkgs.socat}/bin/socat TCP-LISTEN:8443,reuseaddr,fork SYSTEM:'printf "%s" "$SOCAT_PEERADDR"'
           '';
+
+          # A minimal OCI image carrying just python3 -- the payload for a REAL `podman run
+          # --network ns:<pin>` against a turnip netns (the operator path, vs the `turnip probe`
+          # shortcut the rest of the harness uses). python3Minimal has socket+sys, which is all the
+          # connect probe needs; PATH is set so the container can invoke `python3` by name. Built
+          # with nix (no registry pull -> hermetic); `podman load`ed by the owner in TestPodmanRun.
+          probeImage = pkgs.dockerTools.buildLayeredImage {
+            name = "turnip-probe";
+            tag = "latest";
+            contents = [ pkgs.python3Minimal ];
+            config.Env = [ "PATH=${pkgs.python3Minimal}/bin" ];
+          };
         in
         {
           packages = {
-            inherit turnip;
+            inherit turnip probeImage;
             default = turnip; # `nix build` -> the turnip binary
             host = hostVM.config.system.build.vm; # `nix build .#host` -> result/bin/run-turnip-vm
             world = worldVM.config.system.build.vm; # `nix build .#world` -> run-turnip-world-vm
@@ -136,6 +148,7 @@
                   "${turnipTest}/bin/turnip-integration.test -test.v -test.parallel 8"
                   " -turnip ${turnip}/bin/turnip"
                   " -fixtures ${fixtures}"
+                  " -image ${probeImage}"  # the python3 OCI archive TestPodmanRun loads + runs
                   " -world root@world -ssh-key /root/id 2>&1"))
             '';
           };

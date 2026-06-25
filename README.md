@@ -17,8 +17,10 @@ is a declarative `turnip.json`; the mechanism builds the dataplane from it.
 > (`nix flake check`) exercises the full matrix — structure, internal flows, network
 > isolation, egress/ingress, and packet-crafting bad-actor checks (source spoofing,
 > out-of-state injection, ARP poisoning); see [`docs/TEST-PLAN.md`](docs/TEST-PLAN.md).
-> The live `podman run --network ns:` attach is the remaining gate (see
-> [`todo.md`](todo.md)). Design docs live in [`docs/`](docs).
+> A real `podman run --network ns:` attach is covered by `TestPodmanRun` (a fresh
+> container joining a pinned netns, governed by the same flow matrix); the egress/ingress
+> operator variants remain (see [`todo.md`](todo.md)). Design docs live in
+> [`docs/`](docs).
 
 ## Why routed instead of a bridge
 

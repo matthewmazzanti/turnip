@@ -30,11 +30,18 @@ var (
 	fixturesDir = flag.String("fixtures", ".", "directory holding the *.json fixtures")
 	worldAddr   = flag.String("world", "", "ssh target for the world peer (user@host); empty => world tests skip")
 	sshKey      = flag.String("ssh-key", "", "ssh identity file for the world target")
+	imageArch   = flag.String("image", "", "OCI image archive (podman-loadable) for the real `podman run` test; empty => TestPodmanRun skips")
 )
 
 // stateDir is where turnip pins netns for the homelab owner (uid 1001) -- the fixtures all use
-// runtime.user=homelab, so this is fixed.
-const stateDir = "/run/user/1001/turnip"
+// runtime.user=homelab, so this is fixed. The owner* constants are the same rootless owner from
+// the host node's perspective, used to drive its podman for the real `podman run` test.
+const (
+	stateDir        = "/run/user/1001/turnip"
+	ownerUser       = "homelab"
+	ownerHome       = "/home/homelab"
+	ownerRuntimeDir = "/run/user/1001"
+)
 
 // Connect-probe verdict codes (see connectTCP / connectUDP), plus an unreached sentinel for the
 // want* helpers meaning "blocked by any mechanism" (got != reached).
@@ -140,6 +147,61 @@ func (h *H) probe(t *testing.T, target string, cmd ...string) (string, int) {
 	out, code, err := h.host.Run(argv...)
 	if err != nil {
 		t.Fatalf("probe %s %v: %v\n%s", target, cmd, err, out)
+	}
+	return out, code
+}
+
+// --- the operator path: real podman run -----------------------------------
+
+// ownerPodman runs a podman command as the rootless owner (homelab) from the host node, the way
+// an operator would: `runuser -u homelab -- env HOME=.. XDG_RUNTIME_DIR=.. podman <args>`. runuser
+// execs the argv DIRECTLY (no shell re-split), so a python `-c` script rides through unquoted;
+// HOME is set explicitly because podman's graphroot lives under it and runuser keeps root's env.
+func (h *H) ownerPodman(args ...string) (string, int, error) {
+	argv := append([]string{
+		"runuser", "-u", ownerUser, "--",
+		"env", "HOME=" + ownerHome, "XDG_RUNTIME_DIR=" + ownerRuntimeDir,
+		"podman",
+	}, args...)
+	return h.host.Run(argv...)
+}
+
+// loadImage `podman load`s the nix-built OCI archive (-image) into the owner's store and returns
+// the loaded ref, parsed from the "Loaded image: <ref>" line. Idempotent across tests (a re-load
+// is a no-op), so the caller needn't guard it.
+func (h *H) loadImage(t *testing.T) string {
+	t.Helper()
+	out, code, err := h.ownerPodman("load", "-i", *imageArch)
+	if err != nil || code != 0 {
+		t.Fatalf("podman load %s: code=%d err=%v\n%s", *imageArch, code, err, out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "Loaded image") {
+			f := strings.Fields(line)
+			return f[len(f)-1]
+		}
+	}
+	t.Fatalf("podman load: no 'Loaded image' line in:\n%s", out)
+	return ""
+}
+
+// runAttached does the full documented operator attach as the owner: `podman run --rm --network
+// ns:<nsPath> -v <hostsPath>:/etc/hosts:ro <ref> <cmd...>`. Beyond joining the turnip-pinned netns
+// it bind-mounts the container's GENERATED /etc/hosts (the "host bind" -- turnip writes it chowned
+// to the owner so podman mounts it cleanly), so the container resolves itself and its flow peers by
+// name. Returns combined output + the container's exit code (== the entrypoint's, so a connect
+// probe's verdict propagates through).
+func (h *H) runAttached(t *testing.T, ref, nsPath, hostsPath string, cmd ...string) (string, int) {
+	t.Helper()
+	args := append([]string{
+		"run", "--rm",
+		"--network", "ns:" + nsPath,
+		"-v", hostsPath + ":/etc/hosts:ro", // the generated hosts file (CONFIG-SKETCH / README)
+		ref,
+	}, cmd...)
+	out, code, err := h.ownerPodman(args...)
+	if err != nil {
+		t.Fatalf("podman run %v: %v\n%s", cmd, err, out)
 	}
 	return out, code
 }
@@ -549,6 +611,40 @@ func TestL1Gateway(t *testing.T) {
 			t.Parallel()
 			c.run(t)
 		})
+	}
+}
+
+// TestPodmanRun is the operator path (TEST-PLAN §1, black-box): a REAL `podman run --network
+// ns:<pin> -v <hosts>:/etc/hosts` against a turnip netns, vs the `turnip probe` (podman unshare
+// nsenter) shortcut the rest of the harness uses. It proves the pinned netns is attachable by a
+// fresh container, the generated hosts file mounts so the container resolves its flow peer by
+// NAME, and the flow matrix governs that container exactly as it governs the probe. Reuses L1's
+// single allowed flow (zwave->hass:8080). Skips when -image is unset (the python3 OCI archive
+// built by the flake's probeImage).
+func TestPodmanRun(t *testing.T) {
+	if *imageArch == "" {
+		t.Skip("no -image configured")
+	}
+	h := newH()
+	h.up(t, "l1.json")
+	t.Cleanup(func() { h.down(t) })
+
+	ref := h.loadImage(t)
+	zwaveNS := stateDir + "/containers/zwave/netns"
+	zwaveHosts := stateDir + "/containers/zwave/hosts"
+
+	// POD-1: a real container in zwave's netns reaches hass (by IP) over the one allowed flow.
+	if out, code := h.runAttached(t, ref, zwaveNS, zwaveHosts, "python3", "-c", connectTCP, "10.0.0.12", "8080"); code != reached {
+		t.Errorf("POD-1: podman run zwave->10.0.0.12:8080 = %s, want reached\n%s", verdict(code), out)
+	}
+	// POD-2: the host bind works -- the container resolves the peer by NAME (hass -> 10.0.0.12 via
+	// the bind-mounted /etc/hosts) and the same allowed flow reaches.
+	if out, code := h.runAttached(t, ref, zwaveNS, zwaveHosts, "python3", "-c", connectTCP, "hass", "8080"); code != reached {
+		t.Errorf("POD-2: podman run zwave->hass(by name):8080 = %s, want reached\n%s", verdict(code), out)
+	}
+	// POD-3: the flow matrix still governs the real container -- the wrong port drops.
+	if out, code := h.runAttached(t, ref, zwaveNS, zwaveHosts, "python3", "-c", connectTCP, "hass", "9090"); code != denied {
+		t.Errorf("POD-3: podman run zwave->hass:9090 = %s, want denied\n%s", verdict(code), out)
 	}
 }
 
