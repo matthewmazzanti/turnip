@@ -623,3 +623,30 @@ func TestBADSpoofedSource(t *testing.T) {
 		t.Errorf("BAD-1: rp_filter dropped %d of %d forged-saddr packets, want all (before=%d)", got, burst, before)
 	}
 }
+
+// TestBADLateralSpoof is fixture bad's lateral-spoof invariant (§5 BAD-2, host-only): adv forges
+// victim's OWNED address (10.0.0.12) -- the case that distinguishes STRICT rp_filter from loose.
+// The forged saddr does route (to victim's /32), so loose mode would accept it; strict requires
+// the reverse path to leave the SAME veth the packet arrived on, and 10.0.0.12 routes via
+// vethR-victim, not adv's ingress veth -> drop. Same exact-counter assertion as BAD-1.
+//
+// Separate top-level test (so it never runs concurrently with BAD-1) on a fresh bad fixture, so
+// the netns-global IPReversePathFilter counter is its own to bracket.
+func TestBADLateralSpoof(t *testing.T) {
+	h := newH()
+	h.up(t, "bad.json")
+	t.Cleanup(func() { h.down(t) })
+
+	const burst = 5
+	before := h.rpfDrops(t, "router:lan")
+
+	// adv impersonates victim (10.0.0.12) -> the gateway. Routable saddr, wrong ingress veth.
+	out, code := h.probe(t, "adv", "python3", "-c", spoofSend, "10.0.0.12", "10.0.0.1", strconv.Itoa(burst))
+	if code != 0 {
+		t.Fatalf("BAD-2: spoof send failed (code %d):\n%s", code, out)
+	}
+
+	if got := h.rpfDrops(t, "router:lan") - before; got != burst {
+		t.Errorf("BAD-2: rp_filter dropped %d of %d victim-spoofed packets, want all (before=%d)", got, burst, before)
+	}
+}
