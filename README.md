@@ -106,21 +106,23 @@ Each builds on the one before; `turnipService` takes a prebuilt `package` *or* a
 `newuidmap`/`newgidmap` wrappers line up) — but **not** `ip`: turnip does all
 link/addr/route work over netlink syscalls.
 
-`nix/demo/homelab.nix` is a single-file worked example — the README's hass homelab
-(zwave → hass → proxy, hass on a host-LAN veth link) deployed as turnip + three
-[quadlet-nix](https://github.com/SEIAROTg/quadlet-nix) containers, baked into a
-bootable VM:
+`nix/demo/homelab.nix` is a self-contained, single-file worked example — a homelab
+edge (`proxy → hass → zwave`, with `hass` on a host-LAN veth link) deployed as a
+turnip fabric plus three [quadlet-nix](https://github.com/SEIAROTg/quadlet-nix)
+containers attached to its netns, baked into a bootable VM:
 
 ```sh
 nix run .#demo        # boots the VM on the serial console (autologin: demo/demo)
 turnip-demo           # the guided tour, once you're in
 ```
 
-The tour pokes the live fabric (via `turnip probe <ctr> -- <cmd>`) to show the two
-things plain podman can't express: **directional, default-deny flow control**
-(zwave → hass is allowed, zwave → proxy is dropped) and a **real host-LAN link**
-(hass holds a `192.168.1.x` address on the host bridge; zwave can't reach the LAN at
-all).
+The tour pokes the live fabric (via `turnip probe <ctr> -- <cmd>`) to show what plain
+podman can't express: **directional, default-deny flow control** (`proxy → hass`,
+`proxy → zwave`, `hass → zwave` are allowed; `zwave` initiates nothing, and the
+reverse of every flow is dropped), a **flow-scoped `/etc/hosts`** bind-mounted into
+each container, and a **real host-LAN link** (`hass` holds `192.168.1.50` on the VM's
+bridge and reaches the LAN; `zwave` can't). The VM is one bridged interface — a
+primary IP for ssh/control plus two LAN secondaries the link reaches.
 
 ## Mechanism
 

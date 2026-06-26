@@ -68,7 +68,7 @@ ${bold}turnip demo${rst} -- a routed L3 podman fabric, deployed from Nix.
 
     proxy (10.0.0.13) ─tcp/443─> hass (10.0.0.12) ─tcp/443─> zwave (10.0.0.11)
         └──────────────────tcp/443──────────────────────────────^   hass also:
-                                                                     veth link ─> br-lan ${bold}192.168.1.50/24${rst}
+                                                                     veth link ─> br0 ${bold}192.168.1.50/24${rst}
 
 Three podman containers (quadlet-nix units) attach to turnip netns. Flows are ${bold}directional${rst}
 and ${bold}default-deny${rst}: proxy reaches hass + zwave, hass reaches zwave, and zwave initiates
@@ -115,16 +115,17 @@ fi
 pause
 
 section "4. A real host-LAN link (the L2 escape)"
-echo "hass has a second interface: a veth into the host bridge br-lan. So it holds a real LAN IP"
-echo "and reaches the host directly -- outside every router's policy."
+echo "hass has a second interface: a veth into the VM bridge br0. So it holds a real LAN IP and"
+echo "reaches the bridge's two LAN addresses directly -- outside every router's policy."
 echo
 show hass ip -br addr
 echo
-reach yes "hass  -> host 192.168.1.1 (has link)"  hass  192.168.1.1
-reach no  "zwave -> host 192.168.1.1 (no link)"   zwave 192.168.1.1
+reach yes "hass  -> 192.168.1.1 (LAN, has link)"  hass  192.168.1.1
+reach yes "hass  -> 192.168.1.2 (LAN, has link)"  hass  192.168.1.2
+reach no  "zwave -> 192.168.1.1 (no link)"        zwave 192.168.1.1
 echo
 echo "${ylw}podman can't do this:${rst} a rootless podman container can't be handed a routable address on"
-echo "the host's LAN segment; turnip's veth link bridges it straight onto br-lan."
+echo "the host's LAN segment; turnip's veth link bridges it straight onto br0."
 pause
 
 section "5. Routed, not bridged (no shared L2)"
