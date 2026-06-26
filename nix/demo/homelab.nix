@@ -15,13 +15,11 @@
 #   * hass additionally hangs a veth into the VM's bridge br0, so it holds a real LAN address
 #     (192.168.1.50) and reaches the bridge's LAN IPs directly -- something rootless podman can't give.
 #
-# Networking is ONE interface: the qemu user-mode NIC (eth0) enslaved to a bridge (br0). br0 carries a
-# PRIMARY ip (10.0.2.15 -- the qemu guest address, so the :2224->22 hostfwd reaches ssh/control) and
-# TWO SECONDARY ips (192.168.1.1, 192.168.1.2 -- the LAN segment hass's link joins). hass reaches both.
-#
-# Self-contained: this file inlines the small substrate the demo needs (rootless podman owned by
-# `homelab`, a minimal container image loaded at boot, the nft/ip toolkit), rather than reusing the
-# 2-VM test harness's host-base. turnipPkg/turnipLib are threaded in via specialArgs (see flake.nix).
+# This file is deliberately self-contained. To keep the focus on the interesting part -- the turnip,
+# quadlet-nix, and networkd setup, in the module body at the bottom -- the uninteresting substrate
+# (rootless podman, the boot image load, the toolkit, the console/ssh access, VM sizing) is lifted
+# into an inline `base` module in the `let` and pulled in via `imports`. turnipPkg/turnipLib are
+# threaded in via specialArgs (see flake.nix).
 { pkgs, lib, config, turnipPkg, turnipLib, ... }:
 let
   uid = 1001;
@@ -31,8 +29,8 @@ let
 
   # A minimal, registry-free container image: python3 only (the listener + the by-name connect). The
   # tour's in-netns inspection uses HOST tools via `turnip probe`, not the image, so nothing else is
-  # needed. Built once, loaded into homelab's rootless store at boot (turnip-demo-image, below), and
-  # referenced by tag with pull=never -- so the demo is fully offline.
+  # needed. Built once, loaded into homelab's rootless store at boot (by `base`), referenced by tag
+  # with pull=never -- so the demo is fully offline.
   demoImage = pkgs.dockerTools.buildLayeredImage {
     name = "turnip-demo-img";
     tag = "latest";
@@ -140,55 +138,110 @@ let
     runtimeInputs = [ pkgs.python3 pkgs.iproute2 pkgs.iputils pkgs.nftables ];
     text = builtins.readFile ./tour.sh;
   };
-in
-{
-  system.stateVersion = "25.05";
-  networking.hostName = "turnip-demo";
-  networking.firewall.enable = false; # don't let the host firewall interfere with turnip's netns/nft
 
-  # --- the substrate: rootless podman owned by homelab + the demo image -----------------------
-  # linger => /run/user/1001 + the pause process exist with no login; autoSubUidGidRange => the
-  # subuid/subgid range podman maps. uid pinned so state paths (/run/user/1001/turnip/...) are stable.
-  virtualisation.podman.enable = true;
-  users.users.${owner} = {
-    isNormalUser = true;
-    uid = uid;
-    linger = true;
-    autoSubUidGidRange = true;
-    password = owner; # console-debug convenience; the demo logs in as `demo`
-  };
+  # --- base: the uninteresting substrate, inline so the file stays self-contained --------------
+  #
+  # Everything here is plumbing the demo needs but isn't ABOUT: rootless podman + its owner, the boot
+  # image load, the host-side toolkit, the console/ssh access, and VM sizing. It's an inline module
+  # (closes over the `let` above, takes pkgs from module args) pulled in via `imports`, so the body
+  # below can be just the turnip + quadlet + networkd setup.
+  base = { pkgs, ... }: {
+    system.stateVersion = "25.05";
+    networking.hostName = "turnip-demo";
+    networking.firewall.enable = false; # don't let the host firewall interfere with turnip's netns/nft
 
-  # Load the demo image into homelab's rootless store at boot (you can't `podman run` a tar, and
-  # pull=never needs it present). Done where homelab's user session is up, not from a probe context.
-  systemd.services.turnip-demo-image = {
-    description = "load the demo container image into homelab's rootless podman";
-    wantedBy = [ "multi-user.target" ];
-    after = [ "user@${toString uid}.service" ];
-    wants = [ "user@${toString uid}.service" ];
-    serviceConfig = {
-      Type = "oneshot";
-      RemainAfterExit = true;
+    # Rootless podman owned by homelab: linger => /run/user/1001 + the pause process exist with no
+    # login; autoSubUidGidRange => the subuid/subgid range podman maps; uid pinned so state paths
+    # (/run/user/1001/turnip/...) are stable.
+    virtualisation.podman.enable = true;
+    users.users.${owner} = {
+      isNormalUser = true;
+      uid = uid;
+      linger = true;
+      autoSubUidGidRange = true;
+      password = owner; # console-debug convenience; the demo logs in as `demo`
     };
-    script = ''
-      until test -d /run/user/${toString uid}; do sleep 0.2; done
-      export PATH=/run/wrappers/bin:/run/current-system/sw/bin
-      runuser -u ${owner} -- \
-        env XDG_RUNTIME_DIR=/run/user/${toString uid} HOME=/home/${owner} PATH="$PATH" \
-          podman load -i ${demoImage}
+
+    # Load the demo image into homelab's rootless store at boot (you can't `podman run` a tar, and
+    # pull=never needs it present). Done where homelab's user session is up.
+    systemd.services.turnip-demo-image = {
+      description = "load the demo container image into homelab's rootless podman";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "user@${toString uid}.service" ];
+      wants = [ "user@${toString uid}.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        until test -d /run/user/${toString uid}; do sleep 0.2; done
+        export PATH=/run/wrappers/bin:/run/current-system/sw/bin
+        runuser -u ${owner} -- \
+          env XDG_RUNTIME_DIR=/run/user/${toString uid} HOME=/home/${owner} PATH="$PATH" \
+            podman load -i ${demoImage}
+      '';
+    };
+
+    # The host-side toolkit `turnip probe` execs inside a netns (the binary itself bakes nft+podman).
+    environment.systemPackages = [
+      pkgs.nftables # nft -- inspect the live flow matrix
+      pkgs.iproute2 # ip -- inspect links/routes
+      pkgs.iputils # ping -- link reachability checks
+      pkgs.python3 # the in-netns connect probes
+      pkgs.tcpdump # show the routed fabric has no inter-container ARP
+    ];
+
+    # Console-friendly: admin `demo` user (autologin, passwordless sudo), a banner, and ssh on a
+    # forwarded port (host :2224 -> guest 22) so the demo is drivable over ssh too. The committed dev
+    # key authorizes `demo`. graphics=false so `nix run .#demo` lands on the serial console.
+    users.users.demo = {
+      isNormalUser = true;
+      extraGroups = [ "wheel" ];
+      password = "demo";
+      openssh.authorizedKeys.keyFiles = [ ../vm/testvm_key.pub ];
+    };
+    security.sudo.wheelNeedsPassword = false;
+    services.getty.autologinUser = "demo";
+    services.openssh.enable = true;
+    virtualisation.forwardPorts = [{ from = "host"; host.port = 2224; guest.port = 22; }];
+    virtualisation = {
+      graphics = false;
+      memorySize = 2048;
+      cores = 2;
+      diskSize = 8192; # room for podman images
+    };
+    users.motd = ''
+
+      ===========================================================================
+        turnip demo -- a routed podman fabric (zwave / hass / proxy) on this host.
+
+        Run the guided tour:    turnip-demo
+        Poke it by hand:        sudo turnip probe <container> -- <cmd...>
+                                sudo turnip probe router:lan -- nft list table inet turnip
+      ===========================================================================
     '';
   };
+in
+{
+  imports = [ base ];
 
-  # --- layer 3: the turnip up/down service (built from the attrset) ---------------------------
+  # ===========================================================================================
+  # The focus: turnip + quadlet-nix + networkd. (Everything else is in `base`, above.)
+  # ===========================================================================================
+
+  # --- turnip: lower the model to an up/down service (layer 3 of nix/lib/turnip.nix) ----------
   # requiresUserSession wires the real ordering: after homelab's user@1001 session + a wait on
-  # /run/user/1001 (the netns are created inside homelab's podman userns). A partial path (.turnip)
-  # so it coexists with the turnip-demo-image service above.
+  # /run/user/1001 (the netns are created inside homelab's podman userns).
   systemd.services.turnip = (turnipLib.turnipService {
     package = turnipBin;
     name = "turnip";
     requiresUserSession = uid;
   }).systemd.services.turnip;
 
-  # --- the containers (quadlet-nix), attached to turnip's netns -------------------------------
+  # `turnip` (config baked) + the guided tour, on PATH.
+  environment.systemPackages = [ turnipBin turnipDemo ];
+
+  # --- quadlet-nix: the three containers, each attached to its turnip netns --------------------
   # zwave + hass are flow TARGETS, so they listen on :443; proxy only initiates, so it just idles.
   virtualisation.quadlet.containers = {
     zwave = mkContainer "zwave" listen443;
@@ -196,7 +249,7 @@ in
     proxy = mkContainer "proxy" sleepForever;
   };
 
-  # --- networking: ONE interface, a bridge with one primary + two secondary IPs ----------------
+  # --- networkd: ONE interface, a bridge with one primary + two secondary IPs ------------------
   # The qemu user-mode NIC (eth0) is enslaved to br0; br0 is the only L3 interface. PRIMARY 10.0.2.15
   # is the qemu guest address, so the :2224->22 hostfwd reaches ssh/control. The two SECONDARY
   # 192.168.1.x are the LAN segment hass's veth link joins -- hass reaches both. Static => no DHCP
@@ -221,52 +274,5 @@ in
     ];
     networkConfig.ConfigureWithoutCarrier = true;
     linkConfig.RequiredForOnline = "degraded";
-  };
-
-  # --- the demo surface -----------------------------------------------------------------------
-  environment.systemPackages = [
-    turnipBin # `turnip` -> the wrapped binary (config baked)
-    turnipDemo # `turnip-demo` -> the guided tour
-    pkgs.nftables # `nft` -- turnip drives nftables; the tour inspects the live matrix
-    pkgs.iproute2 # ip -- inspect links/routes in the probes
-    pkgs.iputils # ping -- the link reachability checks
-    pkgs.python3 # the tour's in-netns connect probes (run host-side via `turnip probe`)
-    pkgs.tcpdump # show the routed fabric has no inter-container ARP (vs a podman bridge)
-  ];
-
-  # A console-friendly demo VM: admin `demo` user, autologin, and a banner pointing at the tour.
-  users.users.demo = {
-    isNormalUser = true;
-    extraGroups = [ "wheel" ];
-    password = "demo";
-    openssh.authorizedKeys.keyFiles = [ ../vm/testvm_key.pub ];
-  };
-  security.sudo.wheelNeedsPassword = false;
-  services.getty.autologinUser = "demo";
-  users.motd = ''
-
-    ===========================================================================
-      turnip demo -- a routed podman fabric (zwave / hass / proxy) on this host.
-
-      Run the guided tour:    turnip-demo
-      Poke it by hand:        sudo turnip probe <container> -- <cmd...>
-                              sudo turnip probe router:lan -- nft list table inet turnip
-    ===========================================================================
-  '';
-
-  # ssh on a forwarded port (host :2224 -> guest 22), so you can drive the demo over ssh as well as
-  # the serial console. The committed dev key authorizes `demo` (above).
-  services.openssh.enable = true;
-  virtualisation.forwardPorts = [
-    { from = "host"; host.port = 2224; guest.port = 22; }
-  ];
-
-  # Self-contained single-VM sizing (no 9p, no dev tooling -- this is a standalone example).
-  # graphics=false so `nix run .#demo` drops you straight onto the serial console.
-  virtualisation = {
-    graphics = false;
-    memorySize = 2048;
-    cores = 2;
-    diskSize = 8192; # room for podman images
   };
 }
