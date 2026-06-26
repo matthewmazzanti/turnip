@@ -58,11 +58,15 @@ let
         hass = { ip = "10.0.0.12"; interface = "eth0"; default = true; };
         proxy = { ip = "10.0.0.13"; interface = "eth0"; default = true; };
       };
-      # Hub-and-spoke, hass as the hub. Directional: each row is one-way (the return rides conntrack).
+      # The real homelab policy. proxy (the ingress reverse-proxy) reaches the hub and the device
+      # controller; the hub reaches the device controller; the device controller (zwave) initiates
+      # NOTHING -- a compromised IoT device is contained. Directional: each row is one-way (the return
+      # rides conntrack), so e.g. zwave->hass is NOT implied by hass->zwave.
       flows = [
-        { type = "internal"; from = "zwave"; to = "hass"; proto = "tcp"; port = 443; }
-        { type = "internal"; from = "hass"; to = "proxy"; proto = "tcp"; port = 443; }
-        # NOTE: there is deliberately NO zwave->proxy flow -- default-deny drops it. That's the demo.
+        { type = "internal"; from = "proxy"; to = "hass"; proto = "tcp"; port = 443; }
+        { type = "internal"; from = "proxy"; to = "zwave"; proto = "tcp"; port = 443; }
+        { type = "internal"; from = "hass"; to = "zwave"; proto = "tcp"; port = 443; }
+        # NOTE: nothing flows TO proxy and zwave initiates nothing -- default-deny drops the rest.
       ];
     };
   };
@@ -92,6 +96,11 @@ let
       inherit image;
       pull = "never";
       networks = [ (netnsOf name) ];
+      # Bind-mount turnip's generated /etc/hosts (written by `up`, under the state dir) over the
+      # container's, so each container resolves exactly the peers its flows allow (the body is
+      # directional -- only this container's flow targets). turnip writes it before the container
+      # starts (ordered after turnip.service). ro: it's a generated artifact.
+      volumes = [ "${stateDir}/containers/${name}/hosts:/etc/hosts:ro" ];
       exec = [ "python3" "-u" "-c" pyArgs ];
     };
     unitConfig = {
@@ -114,9 +123,13 @@ let
     podman = config.virtualisation.podman.package;
   };
 
-  # The guided tour (see ./demo-script.nix). Knows the topology + addresses; wraps `turnip probe`.
-  turnipDemo = import ./demo-script.nix {
-    inherit pkgs lib turnipBin;
+  # The guided tour: the script body lives in ./tour.sh (an independent, shellcheck-clean file);
+  # here we just wrap it into a `turnip-demo` command with its inspection tools on PATH. It drives
+  # the live fabric through `sudo turnip ...` (turnipBin is installed as `turnip`, below).
+  turnipDemo = pkgs.writeShellApplication {
+    name = "turnip-demo";
+    runtimeInputs = [ pkgs.python3 pkgs.iproute2 pkgs.iputils pkgs.nftables ];
+    text = builtins.readFile ./tour.sh;
   };
 in
 {
@@ -136,10 +149,11 @@ in
   }).systemd.services;
 
   # --- the containers (quadlet-nix), attached to turnip's netns -------------------------------
+  # zwave + hass are flow TARGETS, so they listen on :443; proxy only initiates, so it just idles.
   virtualisation.quadlet.containers = {
-    zwave = mkContainer "zwave" sleepForever;
+    zwave = mkContainer "zwave" listen443;
     hass = mkContainer "hass" listen443;
-    proxy = mkContainer "proxy" listen443;
+    proxy = mkContainer "proxy" sleepForever;
   };
 
   # --- the demo surface -----------------------------------------------------------------------
