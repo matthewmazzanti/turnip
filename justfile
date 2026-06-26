@@ -6,7 +6,7 @@
 default:
     @just --list
 
-# Delegate to nix/vm.sh: `just vm <cmd> <role>` (run|up|ready|log|qmp|snap|stop|reset|pid|fresh).
+# Delegate to nix/vm.sh: `just vm <cmd> <role>` (run|up|ready|ssh|log|qmp|snap|down|reset|pid|fresh).
 vm *args:
     nix/vm.sh {{args}}
 
@@ -32,9 +32,9 @@ up:
     nix/vm.sh ready host
     nix/vm.sh ready world
 
-stop:
-    nix/vm.sh stop host
-    nix/vm.sh stop world
+down:
+    nix/vm.sh down host
+    nix/vm.sh down world
 
 # Quick Go pass (gofmt + vet + unit tests), excluding the integration suite (which needs the dev VMs).
 precommit:
@@ -54,9 +54,11 @@ itest-build:
     {{vm_go}} test -c -o vm/it.test ./test/integration
 
 # Run the integration suite (boots both dev VMs first); args pass through (`just itest -test.run X`).
+# TODO: `{{args}}` is unquoted (bare word-split). Switch to `set lists` + per-element `quote(args)`
+# once nixpkgs ships just >= 1.54 (the flake pins 1.51; `set lists` landed in 1.54) and re-pin.
 itest *args: itest-build up
     #!/usr/bin/env bash
-    nix/ssh-vm.sh host dev <<'EOF'
+    nix/vm.sh ssh host dev <<'EOF'
     sudo /mnt/turnip/vm/it.test \
         -test.v -test.parallel 8 \
         -turnip /mnt/turnip/vm/turnip \

@@ -1,16 +1,34 @@
-# host-base.nix -- the shared base for both HOST variants (interactive.host + test.host): "a host
-# that can run turnip" plus its LAN edge. Rootless podman owned by `homelab` (loginnable), the
-# nft/ip toolkit turnip drives, the baked /etc/turnip/ssh-key, and the modeled LAN -- eth1 enslaved
-# to a bridge (br-lan) carrying 192.168.1.1, mirroring the runNixOSTest VLAN (host .1 / world .2) so
-# the hermetic check and the dev VM run identical network config. It also pre-loads the probe image
-# (below). The interactive host grows from this base via ./interactive.nix (9p, mgmt NIC, dev user)
-# + the go toolchain.
+# host-base.nix -- the shared base for both HOST variants (interactive.host +
+# test.host): "a host that can run turnip" plus its LAN edge. Rootless podman
+# owned by `homelab` (loginnable), the nft/ip toolkit turnip drives, the baked
+# /etc/turnip/ssh-key, and the modeled LAN -- eth1 enslaved to a bridge (br-lan)
+# carrying 192.168.1.1, mirroring the runNixOSTest VLAN (host .1 / world .2) so
+# the hermetic check and the dev VM run identical network config. It also
+# pre-loads the probe image (below). The interactive host grows from this base
+# via ./interactive.nix (9p, mgmt NIC, dev user) + the go toolchain.
 { pkgs, lib, ... }:
 let
-  # The python netns-probe OCI image (python3 + netns/diagnostic CLIs), loaded into homelab's
-  # rootless store at boot (below). Referenced by TAG, so the per-node store path doesn't matter --
+  # The python netns-probe OCI image -- registry-free (no pull, hermetic), built
+  # once and shared by both consumers:
+  #   - the hermetic check (flake.nix): `podman load`ed + run by TestPodmanRun,
+  #     which execs `python3` for a REAL `podman run --network ns:<pin>` connect
+  #     probe against a turnip netns.
+  #   - the host dev VM (interactive.host): loaded into homelab's rootless store
+  #     at boot (below) for manual container poking.
+  # Carries python3 (socket+sys -- all the connect probe needs) + the
+  # netns/diagnostic CLIs; PATH is set so the container can invoke tools by
+  # name. Referenced by TAG, so the per-node store path doesn't matter --
   # TestPodmanRun runs `localhost/turnip-probe:latest`, never a tar.
-  probeImage = import ./probe-image.nix { inherit pkgs; };
+  probeTools = pkgs.buildEnv {
+    name = "turnip-probe-tools";
+    paths = [ pkgs.python3Minimal pkgs.iproute2 pkgs.iputils pkgs.nftables ];
+  };
+  probeImage = pkgs.dockerTools.buildLayeredImage {
+    name = "turnip-probe";
+    tag = "latest";
+    contents = [ probeTools ];
+    config.Env = [ "PATH=${probeTools}/bin" ];
+  };
 in
 {
   system.stateVersion = "25.05";
@@ -22,7 +40,7 @@ in
   # /run/user/<uid> + the pause process exist with no active login; autoSubUidGidRange
   # => the subuid/subgid range podman maps. uid is pinned so state paths
   # (/run/user/1001/turnip/...) are deterministic. Login creds so homelab is reachable on both the
-  # dev host (ssh-vm.sh homelab) and the check host (driverInteractive debugging).
+  # dev host (vm.sh ssh host homelab) and the check host (driverInteractive debugging).
   virtualisation.podman.enable = true;
   users.users.homelab = {
     isNormalUser = true;

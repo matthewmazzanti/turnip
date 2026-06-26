@@ -62,7 +62,7 @@ in `turnip.json` to change it.
 |------|------|
 | `cmd/turnip/` | the CLI + orchestration (the imperative shell): config/env IO, the `buildPlan` lowering (config → `Plan`, `plan.go`), the `applyPlan` driver (`apply.go`), and `up`/`down` dispatch |
 | `internal/` | `config` (the declarative model + validation), `netns` (podman bootstrap, netns lifecycle, the SCM_RIGHTS fd bridge), `dataplane` (gateway/veth/route wiring + the nft flow matrix) |
-| `nix/` | the flake helpers (`nix/lib`) + every VM (`nix/vm/`): `default.nix` groups them as `interactive.{host,world}` (dev VMs) and `test.{host,world}` (check nodes), each role growing from one base (`host-base.nix` / `world-base.nix`) plus the interactive carve-outs (`interactive.nix`); shared `probe-image.nix` |
+| `nix/` | the flake helpers (`nix/lib`) + every VM (`nix/vm/`): `default.nix` groups them as `interactive.{host,world}` (dev VMs) and `test.{host,world}` (check nodes), each role growing from one base (`host-base.nix` / `world-base.nix`) plus the interactive carve-outs (`interactive.nix`); the probe OCI image is defined in `host-base.nix` |
 | `test/integration/` | the hermetic two-node dataplane check (`checks.integration`) — L1–L4 + bad-actor scenarios |
 | `docs/` | design docs — `ARCHITECTURE.md` (config/plan/apply layering), `CONFIG-SKETCH.md` (config model), `TEST-PLAN.md` (the integration matrix), `SYSCTLS.md` (sysctl-hardening verdicts) |
 | `todo.md` | the open-work checklist |

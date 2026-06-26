@@ -17,7 +17,7 @@
 #
 #   import ./nix/vm { inherit pkgs turnip lib nixpkgs system; }
 #     -> { interactive = { host; world; }; test = { host; world; }; }
-{ pkgs, turnip, lib, nixpkgs, system }:
+{ turnip, lib, nixpkgs, system, ... }:
 let
   # Wrap an inline role module with the qemu-vm machinery into a runnable image
   # (`result/bin/run-*-vm`). The role module pulls its base + carve-outs in via `imports`.
@@ -32,7 +32,7 @@ in
     # toolkit, the modeled LAN (br-lan / 192.168.1.1), and the boot-loaded probe image; interactive.nix
     # brings the dev substrate. On top: just Go (build turnip from the 9p mount).
     #   just host  (boots qemu; persists vm/host.qcow2; serial console, Ctrl-a x to quit)
-    #   nix/ssh-vm.sh [dev|homelab] [cmd]   (host on :2222)
+    #   nix/vm.sh ssh host [dev|homelab] [cmd]   (host on :2222)
     host = { pkgs, ... }: {
         imports = [ ./host-base.nix ./interactive.nix ];
 
@@ -53,7 +53,7 @@ in
     # socat, and the static LAN (192.168.1.2); interactive.nix brings the dev
     # substrate. On top: the netns/diagnostic CLIs for poking the LAN.
     #   just world  (boots qemu; persists vm/world.qcow2; serial console)
-    #   nix/ssh-vm.sh world [dev] [cmd]   (world on :2223)
+    #   nix/vm.sh ssh world [dev] [cmd]   (world on :2223)
     world = { pkgs, ... }: {
       imports = [ ./world-base.nix ./interactive.nix ];
 

@@ -7,10 +7,11 @@
 #   nix/vm.sh run    host|world     foreground interactive boot (serial console; Ctrl-a x to quit)
 #   nix/vm.sh up     host|world     headless detached boot (console -> vm/<role>.log; QMP -> vm/<role>.sock)
 #   nix/vm.sh ready  host|world     poll ssh until the VM accepts a login (compose with up to boot+wait)
+#   nix/vm.sh ssh host|world [user] [cmd...]   ssh in over the host-forwarded port (interactive or one-shot)
 #   nix/vm.sh log    host|world [n] tail the console log (default 40 lines)
 #   nix/vm.sh qmp   host|world '<cmd>'    one qmp-shell command (e.g. query-status)
 #   nix/vm.sh snap  host|world save|restore <name>   qcow2 internal snapshot (checkpoint/rollback)
-#   nix/vm.sh stop  host|world      graceful ACPI powerdown
+#   nix/vm.sh down  host|world      graceful ACPI powerdown
 #   nix/vm.sh reset host|world      reboot (QMP system_reset)
 #   nix/vm.sh pid   host|world      the qemu pid (by disk), or empty
 #   nix/vm.sh fresh host|world      delete the disk (next boot is a clean slate)
@@ -25,7 +26,7 @@ set -euo pipefail
 root=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
 state="$root/vm"
 
-cmd=${1:?usage: vm.sh <run|up|ready|log|qmp|snap|stop|reset|pid|fresh> <host|world> [arg]}
+cmd=${1:?usage: vm.sh <run|up|ready|ssh|log|qmp|snap|down|reset|pid|fresh> <host|world> [arg]}
 role=${2:?role: host|world}
 shift 2 # drop cmd + role; any remaining "$@" belong to the command (log lines, snap name, ...)
 case "$role" in
@@ -62,7 +63,7 @@ case "$cmd" in
     # foreground interactive boot -- idempotent: refuse if one's already live (don't share a qcow2).
     # -serial mon:stdio puts the serial console + monitor on the terminal (Ctrl-a c monitor, x quit).
     if running; then
-      echo "$role: already running -- connect with 'nix/ssh-vm.sh $role', or 'nix/vm.sh stop $role' first" >&2
+      echo "$role: already running -- connect with 'nix/vm.sh ssh $role', or 'nix/vm.sh down $role' first" >&2
       exit 1
     fi
     QEMU_OPTS="$qopts -display none -serial mon:stdio" NIX_DISK_IMAGE="$disk" exec "$(runbin)"
@@ -77,14 +78,15 @@ case "$cmd" in
     rm -f "$sock"
     QEMU_OPTS="$qopts -qmp unix:$sock,server,nowait -display none -serial file:$log -monitor none -daemonize" \
       NIX_DISK_IMAGE="$disk" "$(runbin)"
-    echo "$role: booting detached -> $log (control: nix/vm.sh {log,stop,reset} $role)"
+    echo "$role: booting detached -> $log (control: nix/vm.sh {log,down,reset} $role)"
     ;;
   ready)
-    # poll ssh until the VM accepts a login (for scripted waits after `up`); reuse ssh-vm.sh. Each
-    # attempt's ssh output is surfaced so a stuck boot / refused connection / auth failure is visible.
+    # poll ssh until the VM accepts a login (for scripted waits after `up`); reuse our own ssh.
+    # Each attempt's ssh output is surfaced so a stuck boot / refused connection / auth failure is
+    # visible. `timeout 6` bounds a connect/banner hang (the `true` itself is instant once in).
     echo "$role: waiting for ssh login ..." >&2
     for i in $(seq 1 40); do
-      if err=$(timeout 6 "$root/nix/ssh-vm.sh" "$role" dev true 2>&1); then
+      if err=$(timeout 6 "$root/nix/vm.sh" ssh "$role" dev true 2>&1); then
         echo "$role: ready (after $i attempts)"
         exit 0
       fi
@@ -93,6 +95,28 @@ case "$cmd" in
     done
     echo "$role: not ready after timeout" >&2
     exit 1
+    ;;
+  ssh)
+    # ssh into the VM over its host-forwarded port (host :2222 / world :2223 -- set by
+    # virtualisation.forwardPorts in nix/vm/default.nix, NOT by us). An optional leading user token
+    # picks the login (host -> homelab the rootless run user, world -> dev the admin); a command
+    # after it runs one-shot instead of opening an interactive shell. Host-key checking is off: a
+    # fresh disk (vm.sh fresh) regenerates the VM key, which would otherwise trip known_hosts.
+    #   nix/vm.sh ssh host                  # host, log in as homelab
+    #   nix/vm.sh ssh host dev turnip up    # host, run a command as dev
+    #   nix/vm.sh ssh world dev ip -br a    # world peer, run a command as dev
+    case "$role" in
+      host)  port=2222; default_user=homelab ;;
+      world) port=2223; default_user=dev ;;
+    esac
+    user=${1:-$default_user}
+    # The committed key can't carry 0600 through git (git tracks only the exec bit) and ssh refuses a
+    # world-readable private key -- so stage a private 0600 copy at a stable per-user path and use it.
+    key="${TMPDIR:-/tmp}/turnip-testvm_key.$UID"
+    install -m600 "$root/nix/vm/testvm_key" "$key"
+    exec ssh -i "$key" -p "$port" \
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      "$user@localhost" "${@:2}"
     ;;
   log)
     tail -n "${1:-40}" "$log"
@@ -120,7 +144,7 @@ case "$cmd" in
         ;;
     esac
     ;;
-  stop)
+  down)
     qmp 'system_powerdown'
     echo "$role: ACPI powerdown sent"
     ;;
@@ -133,7 +157,7 @@ case "$cmd" in
     echo "$role: disk removed ($disk)"
     ;;
   *)
-    echo "unknown cmd: $cmd (want run|up|ready|log|qmp|snap|stop|reset|pid|fresh)" >&2
+    echo "unknown cmd: $cmd (want run|up|ready|ssh|log|qmp|snap|down|reset|pid|fresh)" >&2
     exit 1
     ;;
 esac
