@@ -1,7 +1,7 @@
 # nix/demo/homelab.nix -- the single-file turnip demo: a self-contained, bootable NixOS VM that
-# deploys a routed turnip fabric and three podman containers (quadlet-nix) onto it, then hands you
-# tooling to SEE the two things turnip does that plain podman can't -- directional L3 flow control and
-# a real host-LAN link.
+# deploys a routed turnip fabric and three podman containers (quadlet-nix) onto it. You poke the live
+# containers with `podman exec` to SEE the two things turnip does that plain podman can't -- directional
+# L3 flow control and a real host-LAN link.
 #
 # The worked example is a homelab edge:
 #
@@ -11,15 +11,15 @@
 #
 #   * flows are DIRECTIONAL + default-deny: proxy->hass, proxy->zwave, hass->zwave are allowed;
 #     zwave initiates NOTHING (a contained device). podman networks are all-or-nothing per network --
-#     they can't express this.
+#     they can't express this. Each container runs an HTTP server answering "hello from <name>", so an
+#     allowed hop returns that banner and a denied one times out.
 #   * hass additionally hangs a veth into the VM's bridge br0, so it holds a real LAN address
 #     (192.168.1.50) and reaches the bridge's LAN IPs directly -- something rootless podman can't give.
 #
 # This file is deliberately self-contained. To keep the focus on the interesting part -- the turnip,
 # quadlet-nix, and networkd setup, in the module body at the bottom -- the uninteresting substrate
-# (rootless podman, the boot image load, the toolkit, the console/ssh access, VM sizing) is lifted
-# into an inline `base` module in the `let` and pulled in via `imports`. turnipPkg/turnipLib are
-# threaded in via specialArgs (see flake.nix).
+# (rootless podman, console/ssh access, VM sizing) is lifted into an inline `base` module in the `let`
+# and pulled in via `imports`. turnipPkg/turnipLib are threaded in via specialArgs (see flake.nix).
 { pkgs, lib, config, turnipPkg, turnipLib, ... }:
 let
   uid = 1001;
@@ -27,11 +27,21 @@ let
   stateDir = "/run/user/${toString uid}/turnip";
   netnsOf = name: "ns:${stateDir}/containers/${name}/netns";
 
-  # A standard OCI image, pulled straight from a registry -- no nix-built image and no boot-time
-  # `podman load`. podman pulls it on first container start (so the VM needs egress -- see br0 below)
-  # and caches it in homelab's store. python:3-alpine is small and ships python3 (the listener needs
-  # only `socket`); musl reads /etc/hosts, so the bind-mounted peer names still resolve.
-  image = "docker.io/library/python:3-alpine";
+  # A standard OCI image, pulled straight from a registry -- no nix-built image, no boot-time `podman
+  # load`. podman pulls it on first container start (so the VM needs egress -- see br0 below) and caches
+  # it in homelab's store. netshoot is the swiss-army netadmin image: it ships python3 (for the server
+  # below) plus curl/ip/ping (what the tour execs into the containers); musl reads /etc/hosts, so the
+  # bind-mounted peer names still resolve.
+  image = "docker.io/nicolaka/netshoot:latest";
+
+  # The HTTP server each container runs: answer every request with "hello from <name>". A single
+  # python expression (the type()/lambda trick keeps it one -c arg); single-quoted + chr(10) so it
+  # needs no shell escaping through quadlet's Exec=. Container root holds CAP_NET_BIND_SERVICE => :443.
+  helloServer = name:
+    "import http.server as h; n='${name}'; "
+    + "H=type('H',(h.BaseHTTPRequestHandler,),{'do_GET':lambda s:("
+    + "s.send_response(200),s.end_headers(),s.wfile.write(('hello from '+n+chr(10)).encode()))}); "
+    + "h.HTTPServer(('0.0.0.0',443),H).serve_forever()";
 
   # --- the turnip MODEL (authored as Nix; toJSON'd by turnipLib) --------------------------------
   #
@@ -71,25 +81,11 @@ let
     };
   };
 
-  # --- the listeners the containers run -------------------------------------------------------
-  #
-  # A trivial accept-and-close TCP server on :443 (uses only `socket`, so python3Minimal suffices).
-  # A connect probe to an ALLOWED peer completes the handshake; a DENIED one is dropped at the router
-  # and times out. Container root holds CAP_NET_BIND_SERVICE, so binding :443 is fine.
-  listen443 = lib.concatStringsSep "; " [
-    "import socket"
-    "s=socket.socket()"
-    "s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)"
-    ''s.bind(("0.0.0.0",443))''
-    "s.listen(16)"
-    "[c.close() for c in iter(lambda: s.accept()[0], None)]"
-  ];
-  sleepForever = "import time; time.sleep(10**9)";
-
-  # One quadlet container attached to its turnip netns. rootlessConfig.uid runs it as homelab (the
-  # netns owner) under system systemd; we hand-wire the rootless env (XDG_RUNTIME_DIR/HOME) since
-  # that mode doesn't set it. Ordered after turnip `up` (the netns must exist) + the image load.
-  mkContainer = name: pyArgs: {
+  # One quadlet container attached to its turnip netns, running the hello server. rootlessConfig.uid
+  # runs it as homelab (the netns owner) under system systemd -- no env hand-wiring needed: systemd
+  # sets HOME from User=, and rootless podman falls back to /run/user/1001 for XDG_RUNTIME_DIR (it
+  # exists via linger). Ordered after turnip `up` (the netns + the generated hosts file must exist).
+  mkContainer = name: {
     autoStart = true;
     rootlessConfig.uid = uid;
     containerConfig = {
@@ -98,46 +94,30 @@ let
       networks = [ (netnsOf name) ];
       # Bind-mount turnip's generated /etc/hosts (written by `up`, under the state dir) over the
       # container's, so each container resolves exactly the peers its flows allow (the body is
-      # directional -- only this container's flow targets). turnip writes it before the container
-      # starts (ordered after turnip.service). ro: it's a generated artifact.
+      # directional -- only this container's flow targets). ro: it's a generated artifact.
       volumes = [ "${stateDir}/containers/${name}/hosts:/etc/hosts:ro" ];
-      exec = [ "python3" "-u" "-c" pyArgs ];
+      exec = [ "python3" "-c" (helloServer name) ];
     };
     unitConfig = {
       After = [ "turnip.service" ];
       Requires = [ "turnip.service" ];
     };
-    serviceConfig.Environment = [
-      "XDG_RUNTIME_DIR=/run/user/${toString uid}"
-      "HOME=/home/${owner}"
-    ];
   };
 
-  # The wrapped turnip binary (layer 2: attrset -> toJSON -> --config baked). Installed as `turnip`
-  # so `sudo turnip up|down|probe ...` from the console all use the demo's model. podman is the
-  # SYSTEM package so the rootless newuidmap/newgidmap wrappers line up.
-  turnipBin = turnipLib.turnipWithConfig {
-    config = turnipConfig;
-    name = "turnip";
-    turnip = turnipPkg;
-    podman = config.virtualisation.podman.package;
-  };
-
-  # The guided tour: the script body lives in ./tour.sh (an independent, shellcheck-clean file);
-  # here we just wrap it into a `turnip-demo` command with its inspection tools on PATH. It drives
-  # the live fabric through `sudo turnip ...` (turnipBin is installed as `turnip`, below).
+  # The guided tour: the script body lives in ./tour.sh (an independent, shellcheck-clean file). It
+  # runs as homelab and pokes the live containers with plain `podman exec` (no turnip CLI involved).
   turnipDemo = pkgs.writeShellApplication {
     name = "turnip-demo";
-    runtimeInputs = [ pkgs.python3 pkgs.iproute2 pkgs.iputils pkgs.nftables ];
+    runtimeInputs = [ config.virtualisation.podman.package pkgs.coreutils ];
     text = builtins.readFile ./tour.sh;
   };
 
   # --- base: the uninteresting substrate, inline so the file stays self-contained --------------
   #
-  # Everything here is plumbing the demo needs but isn't ABOUT: rootless podman + its owner, the boot
-  # image load, the host-side toolkit, the console/ssh access, and VM sizing. It's an inline module
-  # (closes over the `let` above, takes pkgs from module args) pulled in via `imports`, so the body
-  # below can be just the turnip + quadlet + networkd setup.
+  # Everything here is plumbing the demo needs but isn't ABOUT: rootless podman + its owner, console
+  # autologin + ssh, DNS for the image pull, VM sizing. It's an inline module (closes over the `let`
+  # above, takes pkgs from module args) pulled in via `imports`, so the body below can be just the
+  # turnip + quadlet + networkd setup.
   base = { pkgs, ... }: {
     system.stateVersion = "25.05";
     networking.hostName = "turnip-demo";
@@ -145,47 +125,32 @@ let
 
     # Rootless podman owned by homelab: linger => /run/user/1001 + the pause process exist with no
     # login; autoSubUidGidRange => the subuid/subgid range podman maps; uid pinned so state paths
-    # (/run/user/1001/turnip/...) are stable.
+    # (/run/user/1001/turnip/...) are stable. The demo runs AS homelab (autologin + the dev key over
+    # ssh) so `podman exec` into the containers needs no sudo.
     virtualisation.podman.enable = true;
     users.users.${owner} = {
       isNormalUser = true;
       uid = uid;
       linger = true;
       autoSubUidGidRange = true;
-      password = owner; # console-debug convenience; the demo logs in as `demo`
+      password = owner;
+      openssh.authorizedKeys.keyFiles = [ ../vm/testvm_key.pub ];
     };
+    services.getty.autologinUser = owner;
+    services.openssh.enable = true;
 
     # DNS, so rootless podman can resolve the registry to pull the image. resolved picks up the DNS
     # server br0's DHCP lease hands out (slirp's proxy); /etc/resolv.conf -> the resolved stub.
     services.resolved.enable = true;
 
-    # The host-side toolkit `turnip probe` execs inside a netns (the binary itself bakes nft+podman).
-    environment.systemPackages = [
-      pkgs.nftables # nft -- inspect the live flow matrix
-      pkgs.iproute2 # ip -- inspect links/routes
-      pkgs.iputils # ping -- link reachability checks
-      pkgs.python3 # the in-netns connect probes
-      pkgs.tcpdump # show the routed fabric has no inter-container ARP
-    ];
-
-    # Console-friendly: admin `demo` user (autologin, passwordless sudo), a banner, and ssh on a
-    # forwarded port (host :2224 -> guest 22) so the demo is drivable over ssh too. The committed dev
-    # key authorizes `demo`. graphics=false so `nix run .#demo` lands on the serial console.
-    users.users.demo = {
-      isNormalUser = true;
-      extraGroups = [ "wheel" ];
-      password = "demo";
-      openssh.authorizedKeys.keyFiles = [ ../vm/testvm_key.pub ];
-    };
-    security.sudo.wheelNeedsPassword = false;
-    services.getty.autologinUser = "demo";
-    services.openssh.enable = true;
+    # ssh on a forwarded port (host :2224 -> guest 22). graphics=false so `nix run .#demo` lands on
+    # the serial console.
     virtualisation.forwardPorts = [{ from = "host"; host.port = 2224; guest.port = 22; }];
     virtualisation = {
       graphics = false;
       memorySize = 2048;
       cores = 2;
-      diskSize = 8192; # room for podman images
+      diskSize = 8192; # room for the netshoot image
     };
     users.motd = ''
 
@@ -193,8 +158,8 @@ let
         turnip demo -- a routed podman fabric (zwave / hass / proxy) on this host.
 
         Run the guided tour:    turnip-demo
-        Poke it by hand:        sudo turnip probe <container> -- <cmd...>
-                                sudo turnip probe router:lan -- nft list table inet turnip
+        Poke it by hand:        podman exec <container> curl http://<peer>:443
+                                podman exec <container> ip -br addr
       ===========================================================================
     '';
   };
@@ -206,31 +171,50 @@ in
   # The focus: turnip + quadlet-nix + networkd. (Everything else is in `base`, above.)
   # ===========================================================================================
 
-  # --- turnip: lower the model to an up/down service (layer 3 of nix/lib/turnip.nix) ----------
-  # requiresUserSession wires the real ordering: after homelab's user@1001 session + a wait on
-  # /run/user/1001 (the netns are created inside homelab's podman userns).
-  systemd.services.turnip = (turnipLib.turnipService {
-    package = turnipBin;
-    name = "turnip";
-    requiresUserSession = uid;
-  }).systemd.services.turnip;
+  # --- turnip: the up/down service, inlined ---------------------------------------------------
+  # The model is baked into a `turnip` binary (turnipWithConfig) scoped to THIS service -- it isn't on
+  # anyone's PATH; the demo is poked via `podman exec`, not a turnip CLI. The netns are created inside
+  # homelab's podman userns, so order after that user session + wait for /run/user/1001 to appear.
+  systemd.services.turnip =
+    let
+      turnipBin = turnipLib.turnipWithConfig {
+        config = turnipConfig;
+        turnip = turnipPkg;
+        podman = config.virtualisation.podman.package;
+      };
+      exe = lib.getExe turnipBin;
+    in
+    {
+      description = "turnip routed container network";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network.target" "podman.service" "user@${toString uid}.service" ];
+      wants = [ "user@${toString uid}.service" ];
+      path = [ pkgs.nftables config.virtualisation.podman.package ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStartPre = "${pkgs.bash}/bin/bash -c 'until test -d /run/user/${toString uid}; do sleep 0.2; done'";
+        ExecStart = "${exe} up";
+        ExecStop = "${exe} down";
+      };
+    };
 
-  # `turnip` (config baked) + the guided tour, on PATH.
-  environment.systemPackages = [ turnipBin turnipDemo ];
+  # The guided tour, on PATH (run as homelab). No turnip CLI is installed.
+  environment.systemPackages = [ turnipDemo ];
 
   # --- quadlet-nix: the three containers, each attached to its turnip netns --------------------
-  # zwave + hass are flow TARGETS, so they listen on :443; proxy only initiates, so it just idles.
+  # All three run the same hello server; the flow matrix decides who can actually reach whom.
   virtualisation.quadlet.containers = {
-    zwave = mkContainer "zwave" listen443;
-    hass = mkContainer "hass" listen443;
-    proxy = mkContainer "proxy" sleepForever;
+    zwave = mkContainer "zwave";
+    hass = mkContainer "hass";
+    proxy = mkContainer "proxy";
   };
 
   # --- networkd: ONE interface, a bridge with one primary + two secondary IPs ------------------
   # The qemu user-mode NIC (eth0) is enslaved to br0; br0 is the only L3 interface. The PRIMARY comes
-  # from DHCP -- slirp hands out 10.0.2.15 (the :2224->22 hostfwd target, so ssh/control works) plus a
-  # default route + DNS, which the containers need to PULL their image. The two SECONDARY 192.168.1.x
-  # are the LAN segment hass's veth link joins -- hass reaches both. RequiredForOnline=routable holds
+  # from DHCP -- slirp hands out 10.0.2.15 (the :2224->22 hostfwd target, so ssh works) plus a default
+  # route + DNS, which the containers need to PULL their image. The two SECONDARY 192.168.1.x are the
+  # LAN segment hass's veth link joins -- hass reaches both. RequiredForOnline=routable holds
   # network-online.target (hence the container pulls) until egress is actually up.
   networking.useNetworkd = true;
   networking.useDHCP = false;

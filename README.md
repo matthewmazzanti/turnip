@@ -112,16 +112,18 @@ turnip fabric plus three [quadlet-nix](https://github.com/SEIAROTg/quadlet-nix)
 containers attached to its netns, baked into a bootable VM:
 
 ```sh
-nix run .#demo        # boots the VM on the serial console (autologin: demo/demo)
+nix run .#demo        # boots the VM on the serial console (autologin: homelab)
 turnip-demo           # the guided tour, once you're in
 ```
 
-The tour pokes the live fabric (via `turnip probe <ctr> -- <cmd>`) to show what plain
+The containers are stock `netshoot` images running a tiny HTTP server that answers
+`hello from <name>`; the tour pokes them with `podman exec … curl` to show what plain
 podman can't express: **directional, default-deny flow control** (`proxy → hass`,
-`proxy → zwave`, `hass → zwave` are allowed; `zwave` initiates nothing, and the
-reverse of every flow is dropped), a **flow-scoped `/etc/hosts`** bind-mounted into
-each container, and a **real host-LAN link** (`hass` holds `192.168.1.50` on the VM's
-bridge and reaches the LAN; `zwave` can't). The VM is one bridged interface — a
+`proxy → zwave`, `hass → zwave` are allowed and return the peer's banner; `zwave`
+initiates nothing, and the reverse of every flow is dropped), a **flow-scoped
+`/etc/hosts`** bind-mounted into each container (so the curls resolve peers by name),
+and a **real host-LAN link** (`hass` holds `192.168.1.50` on the VM's bridge and
+reaches the host on the LAN; `zwave` can't). The VM is one bridged interface — a
 primary IP for ssh/control plus two LAN secondaries the link reaches.
 
 ## Mechanism
