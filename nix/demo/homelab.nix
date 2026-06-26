@@ -27,18 +27,11 @@ let
   stateDir = "/run/user/${toString uid}/turnip";
   netnsOf = name: "ns:${stateDir}/containers/${name}/netns";
 
-  # A minimal, registry-free container image: python3 only (the listener + the by-name connect). The
-  # tour's in-netns inspection uses HOST tools via `turnip probe`, not the image, so nothing else is
-  # needed. Built once, loaded into homelab's rootless store at boot (by `base`), referenced by tag
-  # with pull=never -- so the demo is fully offline.
-  demoImage = pkgs.dockerTools.buildLayeredImage {
-    name = "turnip-demo-img";
-    tag = "latest";
-    contents = [ pkgs.python3Minimal ];
-    config.Env = [ "PATH=${pkgs.python3Minimal}/bin" ];
-  };
-  image = "localhost/turnip-demo-img:latest";
-  imageUnit = "turnip-demo-image.service";
+  # A standard OCI image, pulled straight from a registry -- no nix-built image and no boot-time
+  # `podman load`. podman pulls it on first container start (so the VM needs egress -- see br0 below)
+  # and caches it in homelab's store. python:3-alpine is small and ships python3 (the listener needs
+  # only `socket`); musl reads /etc/hosts, so the bind-mounted peer names still resolve.
+  image = "docker.io/library/python:3-alpine";
 
   # --- the turnip MODEL (authored as Nix; toJSON'd by turnipLib) --------------------------------
   #
@@ -101,7 +94,7 @@ let
     rootlessConfig.uid = uid;
     containerConfig = {
       inherit image;
-      pull = "never";
+      pull = "missing"; # pull once on first start, then use the cached copy
       networks = [ (netnsOf name) ];
       # Bind-mount turnip's generated /etc/hosts (written by `up`, under the state dir) over the
       # container's, so each container resolves exactly the peers its flows allow (the body is
@@ -111,8 +104,8 @@ let
       exec = [ "python3" "-u" "-c" pyArgs ];
     };
     unitConfig = {
-      After = [ "turnip.service" imageUnit ];
-      Requires = [ "turnip.service" imageUnit ];
+      After = [ "turnip.service" ];
+      Requires = [ "turnip.service" ];
     };
     serviceConfig.Environment = [
       "XDG_RUNTIME_DIR=/run/user/${toString uid}"
@@ -162,25 +155,9 @@ let
       password = owner; # console-debug convenience; the demo logs in as `demo`
     };
 
-    # Load the demo image into homelab's rootless store at boot (you can't `podman run` a tar, and
-    # pull=never needs it present). Done where homelab's user session is up.
-    systemd.services.turnip-demo-image = {
-      description = "load the demo container image into homelab's rootless podman";
-      wantedBy = [ "multi-user.target" ];
-      after = [ "user@${toString uid}.service" ];
-      wants = [ "user@${toString uid}.service" ];
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-      };
-      script = ''
-        until test -d /run/user/${toString uid}; do sleep 0.2; done
-        export PATH=/run/wrappers/bin:/run/current-system/sw/bin
-        runuser -u ${owner} -- \
-          env XDG_RUNTIME_DIR=/run/user/${toString uid} HOME=/home/${owner} PATH="$PATH" \
-            podman load -i ${demoImage}
-      '';
-    };
+    # DNS, so rootless podman can resolve the registry to pull the image. resolved picks up the DNS
+    # server br0's DHCP lease hands out (slirp's proxy); /etc/resolv.conf -> the resolved stub.
+    services.resolved.enable = true;
 
     # The host-side toolkit `turnip probe` execs inside a netns (the binary itself bakes nft+podman).
     environment.systemPackages = [
@@ -250,10 +227,11 @@ in
   };
 
   # --- networkd: ONE interface, a bridge with one primary + two secondary IPs ------------------
-  # The qemu user-mode NIC (eth0) is enslaved to br0; br0 is the only L3 interface. PRIMARY 10.0.2.15
-  # is the qemu guest address, so the :2224->22 hostfwd reaches ssh/control. The two SECONDARY
-  # 192.168.1.x are the LAN segment hass's veth link joins -- hass reaches both. Static => no DHCP
-  # timing, and br0 (RequiredForOnline=degraded) satisfies wait-online as soon as it has an address.
+  # The qemu user-mode NIC (eth0) is enslaved to br0; br0 is the only L3 interface. The PRIMARY comes
+  # from DHCP -- slirp hands out 10.0.2.15 (the :2224->22 hostfwd target, so ssh/control works) plus a
+  # default route + DNS, which the containers need to PULL their image. The two SECONDARY 192.168.1.x
+  # are the LAN segment hass's veth link joins -- hass reaches both. RequiredForOnline=routable holds
+  # network-online.target (hence the container pulls) until egress is actually up.
   networking.useNetworkd = true;
   networking.useDHCP = false;
   systemd.network.netdevs."20-br0".netdevConfig = {
@@ -267,12 +245,12 @@ in
   };
   systemd.network.networks."22-br0" = {
     matchConfig.Name = "br0";
+    networkConfig.DHCP = "yes"; # PRIMARY 10.0.2.15 + default route + DNS, from slirp
     address = [
-      "10.0.2.15/24" # PRIMARY: control/ssh (qemu user-net guest address; the hostfwd target)
       "192.168.1.1/24" # SECONDARY: a LAN device hass can reach
       "192.168.1.2/24" # SECONDARY: a second LAN device
     ];
     networkConfig.ConfigureWithoutCarrier = true;
-    linkConfig.RequiredForOnline = "degraded";
+    linkConfig.RequiredForOnline = "routable";
   };
 }
