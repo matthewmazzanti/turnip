@@ -5,8 +5,8 @@
 #
 # The worked example is a homelab edge:
 #
-#     proxy (10.0.0.13) --tcp/443--> hass (10.0.0.12) --tcp/443--> zwave (10.0.0.11)
-#         \------------------------ tcp/443 -----------------------/      hass also:
+#     proxy (10.0.0.13) --tcp/80--> hass (10.0.0.12) --tcp/80--> zwave (10.0.0.11)
+#         \----------------------- tcp/80 ------------------------/      hass also:
 #                                                                         veth link --> br0 (the LAN)
 #
 #   * flows are DIRECTIONAL + default-deny: proxy->hass, proxy->zwave, hass->zwave are allowed;
@@ -22,8 +22,10 @@
 # first in the `let` and pulled in via `imports`. turnipPkg/turnipLib come via specialArgs (flake.nix).
 { pkgs, lib, config, turnipPkg, turnipLib, ... }:
 let
-  uid = 1001;
   owner = "homelab";
+  # NixOS exposes every user's resolved uid in the module system, so look it up from the user `base`
+  # defines below -- the literal 1001 then lives in exactly one place (the user definition).
+  uid = config.users.users.${owner}.uid;
 
   # --- base: the uninteresting substrate, inline so the file stays self-contained --------------
   #
@@ -43,7 +45,7 @@ let
     virtualisation.podman.enable = true;
     users.users.${owner} = {
       isNormalUser = true;
-      uid = uid;
+      uid = 1001; # the single source of truth; the `uid` let-binding looks this up
       linger = true;
       autoSubUidGidRange = true;
       password = owner;
@@ -71,7 +73,7 @@ let
         turnip demo -- a routed podman fabric (zwave / hass / proxy) on this host.
 
         Run the guided tour:    turnip-demo
-        Poke it by hand:        podman exec <container> curl http://<peer>:443
+        Poke it by hand:        podman exec <container> curl http://<peer>   (plain HTTP, :80)
                                 podman exec <container> ip -br addr
       ===========================================================================
     '';
@@ -152,9 +154,9 @@ in
             # NOTHING -- a compromised IoT device is contained. Directional: each row is one-way (the return
             # rides conntrack), so e.g. zwave->hass is NOT implied by hass->zwave.
             flows = [
-              { type = "internal"; from = "proxy"; to = "hass"; proto = "tcp"; port = 443; }
-              { type = "internal"; from = "proxy"; to = "zwave"; proto = "tcp"; port = 443; }
-              { type = "internal"; from = "hass"; to = "zwave"; proto = "tcp"; port = 443; }
+              { type = "internal"; from = "proxy"; to = "hass"; proto = "tcp"; port = 80; }
+              { type = "internal"; from = "proxy"; to = "zwave"; proto = "tcp"; port = 80; }
+              { type = "internal"; from = "hass"; to = "zwave"; proto = "tcp"; port = 80; }
               # NOTE: nothing flows TO proxy and zwave initiates nothing -- default-deny drops the rest.
             ];
           };
@@ -177,67 +179,37 @@ in
     };
 
   # --- quadlet-nix: the three containers, each attached to its turnip netns --------------------
-  # Spelled out per container (rather than a helper) to keep the quadlet-nix
-  # surface visible. They're identical bar the name: each runs the hello server,
-  # mounts turnip's generated /etc/hosts, runs rootless as homelab
-  # (rootlessConfig.uid), and orders after turnip `up` (the netns + hosts file
-  # must exist first). The flow matrix -- not the containers -- decides who can
-  # actually reach whom.
+  # They're identical bar the name, so a local `mkContainer` builds each: run the hello server on a
+  # netshoot image, bind-mount turnip's generated /etc/hosts, run rootless as homelab
+  # (rootlessConfig.uid), and order after turnip `up` (the netns + hosts file must exist first). The
+  # flow matrix -- not the containers -- decides who can actually reach whom.
   virtualisation.quadlet.containers = let
-    stateDir = "/run/user/${toString uid}/turnip";
-    netnsOf = name: "ns:${stateDir}/containers/${name}/netns";
-    image = "docker.io/nicolaka/netshoot:latest";
-    # The hello server (./server.py), bind-mounted in and run as `python3 /srv/server.py <name>` --
-    # so the name is argv[1], with no Nix templating into the source and no -c escaping.
-    serverMount = "${./server.py}:/srv/server.py:ro";
+    # turnip pins each container's runtime state under /run/user/<uid>/turnip/containers/<name>; its
+    # netns + generated hosts file live there. Resolve that dir once, then the netns ref + hosts mount.
+    containerDir = name: "/run/user/${toString uid}/turnip/containers/${name}";
+
+    # (autoStart defaults to true -- the generated service is wantedBy multi-user.target.)
+    mkContainer = name: {
+      rootlessConfig.uid = uid;
+      containerConfig = {
+        image = "docker.io/nicolaka/netshoot:latest";
+        pull = "missing";
+        networks = [ "ns:${containerDir name}/netns" ];
+        volumes = [
+          "${containerDir name}/hosts:/etc/hosts:ro"
+          "${./server.py}:/srv/server.py:ro"
+        ];
+        exec = [ "python3" "/srv/server.py" name ];
+      };
+      unitConfig = {
+        After = [ "turnip.service" ];
+        Requires = [ "turnip.service" ];
+      };
+    };
   in {
-    zwave = {
-      autoStart = true;
-      rootlessConfig.uid = uid;
-      containerConfig = {
-        inherit image;
-        pull = "missing";
-        networks = [ (netnsOf "zwave") ];
-        volumes = [ "${stateDir}/containers/zwave/hosts:/etc/hosts:ro" serverMount ];
-        exec = [ "python3" "/srv/server.py" "zwave" ];
-      };
-      unitConfig = {
-        After = [ "turnip.service" ];
-        Requires = [ "turnip.service" ];
-      };
-    };
-
-    hass = {
-      autoStart = true;
-      rootlessConfig.uid = uid;
-      containerConfig = {
-        inherit image;
-        pull = "missing";
-        networks = [ (netnsOf "hass") ];
-        volumes = [ "${stateDir}/containers/hass/hosts:/etc/hosts:ro" serverMount ];
-        exec = [ "python3" "/srv/server.py" "hass" ];
-      };
-      unitConfig = {
-        After = [ "turnip.service" ];
-        Requires = [ "turnip.service" ];
-      };
-    };
-
-    proxy = {
-      autoStart = true;
-      rootlessConfig.uid = uid;
-      containerConfig = {
-        inherit image;
-        pull = "missing";
-        networks = [ (netnsOf "proxy") ];
-        volumes = [ "${stateDir}/containers/proxy/hosts:/etc/hosts:ro" serverMount ];
-        exec = [ "python3" "/srv/server.py" "proxy" ];
-      };
-      unitConfig = {
-        After = [ "turnip.service" ];
-        Requires = [ "turnip.service" ];
-      };
-    };
+    zwave = mkContainer "zwave";
+    hass = mkContainer "hass";
+    proxy = mkContainer "proxy";
   };
 
   # The guided tour, on PATH (run as homelab). No turnip CLI is installed.

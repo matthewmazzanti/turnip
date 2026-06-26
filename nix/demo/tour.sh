@@ -22,9 +22,10 @@ show() {
   podman exec "$ctr" "$@" || true
 }
 
-# fetch <ctr> <peer> : curl the peer's HTTP server from inside <ctr> (by NAME, via the mounted
-# /etc/hosts). Prints the body (the peer's "hello from <peer>") on success, nothing on a drop/timeout.
-fetch() { podman exec "$1" curl -s --max-time 3 "http://$2:443/" 2>/dev/null; }
+# fetch <ctr> <peer> : curl the peer's plain-HTTP server (port 80) from inside <ctr> (by NAME, via
+# the mounted /etc/hosts). Prints the body (the peer's "hello from <peer>") on success, nothing on a
+# drop/timeout.
+fetch() { podman exec "$1" curl -s --max-time 3 "http://$2/" 2>/dev/null; }
 
 # expect <allow|deny> <label> <ctr> <peer>
 expect() {
@@ -59,12 +60,12 @@ cat <<EOF
 
 ${bold}turnip demo${rst} -- a routed L3 podman fabric, deployed from Nix.
 
-    proxy (10.0.0.13) ─tcp/443─> hass (10.0.0.12) ─tcp/443─> zwave (10.0.0.11)
-        └──────────────────tcp/443──────────────────────────────^   hass also:
-                                                                     veth link ─> br0 ${bold}192.168.1.50/24${rst}
+    proxy (10.0.0.13) ─tcp/80─> hass (10.0.0.12) ─tcp/80─> zwave (10.0.0.11)
+        └─────────────────tcp/80────────────────────────────^   hass also:
+                                                                 veth link ─> br0 ${bold}192.168.1.50/24${rst}
 
-Three netshoot containers (quadlet-nix units) attach to turnip netns; each runs an HTTP server
-answering ${bold}"hello from <name>"${rst}. We poke them with \`podman exec ... curl\`. Flows are
+Three netshoot containers (quadlet-nix units) attach to turnip netns; each runs a plain-HTTP
+server (port 80, no TLS) answering ${bold}"hello from <name>"${rst}. We poke them with \`podman exec ... curl\`. Flows are
 ${bold}directional${rst} + ${bold}default-deny${rst}: proxy->hass, proxy->zwave, hass->zwave are allowed; zwave
 initiates nothing. hass also has a real LAN address. Plain podman can express ${ylw}neither${rst}.
 EOF
@@ -114,5 +115,5 @@ echo "There is no shared broadcast domain, so no inter-container ARP to spoof."
 echo
 show zwave ip route
 echo
-printf '%sDone.%s Poke it by hand:  podman exec <container> curl http://<peer>:443\n' "$bold" "$rst"
+printf '%sDone.%s Poke it by hand:  podman exec <container> curl http://<peer>\n' "$bold" "$rst"
 printf '       containers: zwave hass proxy\n'
