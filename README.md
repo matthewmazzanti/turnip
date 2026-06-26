@@ -63,6 +63,8 @@ in `turnip.json` to change it.
 | `cmd/turnip/` | the CLI + orchestration (the imperative shell): config/env IO, the `buildPlan` lowering (config → `Plan`, `plan.go`), the `applyPlan` driver (`apply.go`), and `up`/`down` dispatch |
 | `internal/` | `config` (the declarative model + validation), `netns` (podman bootstrap, netns lifecycle, the SCM_RIGHTS fd bridge), `dataplane` (gateway/veth/route wiring + the nft flow matrix) |
 | `nix/` | the flake helpers (`nix/lib`) + every VM (`nix/vm/`): `default.nix` groups them as `interactive.{host,world}` (dev VMs) and `test.{host,world}` (check nodes), each role growing from one base (`host-base.nix` / `world-base.nix`) plus the interactive carve-outs (`interactive.nix`); the probe OCI image is defined in `host-base.nix` |
+| `nix/lib/turnip.nix` | the layered "wrap turnip for Nix" helpers — `turnipWithConfigFile` (bake a config file), `turnipWithConfig` (a Nix attrset → `toJSON`), `turnipService` (a systemd up/down unit). Exposed as `lib.<system>` |
+| `nix/demo/` | the single-file worked example (`homelab.nix`): a bootable VM that deploys a turnip fabric + three [quadlet-nix](https://github.com/SEIAROTg/quadlet-nix) containers and a `turnip-demo` guided tour. `nix run .#demo` |
 | `test/integration/` | the hermetic two-node dataplane check (`checks.integration`) — L1–L4 + bad-actor scenarios |
 | `docs/` | design docs — `ARCHITECTURE.md` (config/plan/apply layering), `CONFIG-SKETCH.md` (config model), `TEST-PLAN.md` (the integration matrix), `SYSCTLS.md` (sysctl-hardening verdicts) |
 | `todo.md` | the open-work checklist |
@@ -85,6 +87,40 @@ ns:<state_dir>/containers/<name>/netns`) with its generated hosts file bind-moun
 to `/etc/hosts`. Each router netns owns its gateway, veths, routes, sysctls, and nft
 table, so removing it is a complete teardown — no per-element deletes; `up` is
 `down` + build (clean slate every time).
+
+## From Nix — the layered helpers + the demo
+
+`nix/lib/turnip.nix` wraps turnip for Nix in three composable layers (exposed as
+`lib.<system>`):
+
+```nix
+turnipWithConfigFile { configFile = ./turnip.json; }   # wrap the binary around a config file
+turnipWithConfig     { config = { runtime.user = "homelab"; /* … */ }; }  # a Nix attrset → toJSON
+turnipService        { config = { /* … */ }; requiresUserSession = 1001; }  # a systemd up/down unit
+```
+
+Each builds on the one before; `turnipService` takes a prebuilt `package` *or* a
+`config`/`configFile` and emits a `systemd.services.<name>` fragment (`Type=oneshot`,
+`up` on start, `down` on stop). It bakes the binaries turnip execs — `nft` and
+`podman` (both injectable; pass `config.virtualisation.podman.package` so the rootless
+`newuidmap`/`newgidmap` wrappers line up) — but **not** `ip`: turnip does all
+link/addr/route work over netlink syscalls.
+
+`nix/demo/homelab.nix` is a single-file worked example — the README's hass homelab
+(zwave → hass → proxy, hass on a host-LAN veth link) deployed as turnip + three
+[quadlet-nix](https://github.com/SEIAROTg/quadlet-nix) containers, baked into a
+bootable VM:
+
+```sh
+nix run .#demo        # boots the VM on the serial console (autologin: demo/demo)
+turnip-demo           # the guided tour, once you're in
+```
+
+The tour pokes the live fabric (via `turnip probe <ctr> -- <cmd>`) to show the two
+things plain podman can't express: **directional, default-deny flow control**
+(zwave → hass is allowed, zwave → proxy is dropped) and a **real host-LAN link**
+(hass holds a `192.168.1.x` address on the host bridge; zwave can't reach the LAN at
+all).
 
 ## Mechanism
 

@@ -6,8 +6,11 @@
 #   inherit (turnipLib) mkOutputs;
 #
 # Components:
-#   mkOutputs -- describe one system's flake outputs once; transpose to the schema. (./outputs.nix)
-#                Takes its own `systems` arg at the call site.
+#   mkOutputs    -- describe one system's flake outputs once; transpose to the schema. (./outputs.nix)
+#                   Takes its own `systems` arg at the call site.
+#   mkTurnipLib  -- the layered "wrap turnip for Nix" helpers (turnipWithConfigFile /
+#                   turnipWithConfig / turnipService). Per-system (needs pkgs + the turnip pkg), so
+#                   it's constructed inside perSystem. (./turnip.nix)
 { inputs }:
 let
   nixpkgs = inputs.nixpkgs;
@@ -15,4 +18,5 @@ let
 in
 {
   mkOutputs = import ./outputs.nix { inherit lib nixpkgs; };
+  mkTurnipLib = { pkgs, turnip }: import ./turnip.nix { inherit pkgs turnip; };
 }

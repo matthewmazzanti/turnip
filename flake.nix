@@ -3,6 +3,11 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
+    # quadlet-nix: declarative podman quadlet units in Nix. Used by the demo (nix/demo) to deploy
+    # the three containers onto turnip's netns. It's a pure module flake (no inputs of its own --
+    # the NixOS module reads pkgs from our config), so there's nothing to make `follows` our nixpkgs.
+    quadlet-nix.url = "github:SEIAROTg/quadlet-nix";
   };
 
   # Outputs rebuilt on ./nix/lib (mkOutputs): the turnip binary, the dev VM, and the Go
@@ -11,10 +16,10 @@
     let
       lib = nixpkgs.lib;
 
-      # turnip's in-repo lib (./nix/lib): mkOutputs -- one system's outputs, transposed
-      # into the flake schema.
+      # turnip's in-repo lib (./nix/lib): mkOutputs (transpose one system's outputs into the flake
+      # schema) + mkTurnipLib (the layered "wrap turnip" helpers, built per-system below).
       turnipLib = import ./nix/lib { inherit inputs; };
-      inherit (turnipLib) mkOutputs;
+      inherit (turnipLib) mkOutputs mkTurnipLib;
     in
     mkOutputs {
       systems = [ "x86_64-linux" "aarch64-linux" ];
@@ -55,6 +60,28 @@
           # runNixOSTest below. (The probe image TestPodmanRun runs is built + boot-loaded by
           # host-base.) mkVM lives in nix/vm/default.nix, hence lib/nixpkgs/system are threaded in.
           vms = import ./nix/vm { inherit pkgs turnip lib nixpkgs system; };
+
+          # The layered "wrap turnip for Nix" helpers (turnipWithConfigFile / turnipWithConfig /
+          # turnipService), bound to this system's pkgs + turnip. Exposed as lib.<system> and
+          # consumed by the demo.
+          turnipHelpers = mkTurnipLib { inherit pkgs turnip; };
+
+          # The single-file demo: a bootable VM that deploys a turnip fabric + three quadlet-nix
+          # containers onto it (nix/demo/homelab.nix). `nix run .#demo` boots it on the serial
+          # console; the baked `turnip-demo` runs the guided tour. quadlet-nix's NixOS module +
+          # turnip pkg/helpers are threaded in via specialArgs.
+          demoVM = (lib.nixosSystem {
+            inherit system;
+            specialArgs = {
+              turnipPkg = turnip;
+              turnipLib = turnipHelpers;
+            };
+            modules = [
+              "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"
+              inputs.quadlet-nix.nixosModules.quadlet
+              ./nix/demo/homelab.nix
+            ];
+          }).config.system.build.vm;
         in
         {
           packages = {
@@ -62,7 +89,13 @@
             default = turnip; # `nix build` -> the turnip binary
             host = vms.interactive.host; # `nix build .#host` -> result/bin/run-turnip-vm
             world = vms.interactive.world; # `nix build .#world` -> result/bin/run-turnip-world-vm
+            demo = demoVM; # `nix run .#demo` -> boots the worked quadlet-nix + turnip example
           };
+
+          # The layered turnip helpers, per system: lib.<system>.{turnipWithConfigFile,
+          # turnipWithConfig,turnipService}. Wrap turnip around a config file, a Nix attrset, or
+          # into a systemd service. (Non-derivation outputs, so they live under lib, not packages.)
+          lib = turnipHelpers;
 
           # Hermetic two-node integration check: `nix flake check` (or `nix build
           # .#checks.<sys>.integration`). host runs turnip + the harness; world is a dumb SSH

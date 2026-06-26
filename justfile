@@ -16,6 +16,12 @@ host:
 world:
     nix/vm.sh run world
 
+# Boot the worked quadlet-nix + turnip example VM (nix/demo). Serial console; the demo user logs in
+# automatically -- run `turnip-demo` for the guided tour. Ctrl-a x to quit. Disk persists in
+# vm/demo.qcow2 (gitignored, like the other VMs).
+demo:
+    NIX_DISK_IMAGE=vm/demo.qcow2 nix run .#demo
+
 # Boot on a fresh disk (clean slate), interactively.
 host-fresh:
     nix/vm.sh fresh host
@@ -33,8 +39,8 @@ up:
     nix/vm.sh ready world
 
 down:
-    nix/vm.sh down host
-    nix/vm.sh down world
+    nix/vm.sh down host || true
+    nix/vm.sh down world || true
 
 # Quick Go pass (gofmt + vet + unit tests), excluding the integration suite (which needs the dev VMs).
 precommit:
