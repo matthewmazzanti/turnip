@@ -32,6 +32,12 @@ vm-up:
     nix/vm.sh ready host
     nix/vm.sh ready world
 
+# Quick Go pass (gofmt + vet + unit tests), excluding the integration suite (which needs the dev VMs).
+precommit:
+    gofmt -w cmd internal
+    go vet ./cmd/... ./internal/...
+    go test ./cmd/... ./internal/...
+
 # Static build (CGO off -> no libc/ld dep), so the binaries run in the dev VM straight from the 9p
 # mount regardless of its nix userland. Native arch: the dev machine and the VM share the flake's
 # system, so no cross-compile is needed (and none of the amd64-only assumption an explicit GOARCH bakes in).

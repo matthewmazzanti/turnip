@@ -35,8 +35,8 @@ type NetworkPlan struct {
 	Name      string
 	Router    string // the router netns key, "router:<name>"
 	Gateway   dp.Gateway
-	Endpoints []EndpointPlan    // routed veths, sorted by container
-	Uplink    *UplinkPlan       // nil = no host edge
+	Endpoints []EndpointPlan // routed veths, sorted by container
+	Uplink    *UplinkPlan    // nil = no host edge
 	Sysctls   []dp.Sysctl    // the router netns sysctls, in apply order (built from the veth/uplink ifnames)
 	NFT       nftlib.Ruleset // the forward flow matrix + edge allows + input lockdown
 }
@@ -55,7 +55,7 @@ type EndpointPlan struct {
 // (The router-side nft edge allows the uplink implies are folded into NetworkPlan.NFT.)
 type UplinkPlan struct {
 	Uplink       dp.Uplink
-	ContainerIPs []netip.Addr      // container /32s to route via the uplink (init netns)
+	ContainerIPs []netip.Addr   // container /32s to route via the uplink (init netns)
 	DNATs        []dp.DNAT      // ingress host_port -> container:port (kept for reference/logs)
 	HostSysctls  []dp.Sysctl    // init-netns sysctls (ip_forward)
 	HostNFT      nftlib.Ruleset // the `ip turnip_host_<net>` nat zone (masquerade + DNAT)
