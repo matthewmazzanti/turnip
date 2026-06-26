@@ -25,12 +25,16 @@ world-fresh:
     nix/vm.sh run world
 
 # Bring both dev VMs up (idempotent) and wait until both accept ssh -- the env `just itest` needs.
-vm-up:
+up:
     # up returns immediately (qemu -daemonize), so both boot concurrently; then we wait on each.
     nix/vm.sh up host
     nix/vm.sh up world
     nix/vm.sh ready host
     nix/vm.sh ready world
+
+stop:
+    nix/vm.sh stop host
+    nix/vm.sh stop world
 
 # Quick Go pass (gofmt + vet + unit tests), excluding the integration suite (which needs the dev VMs).
 precommit:
@@ -50,7 +54,7 @@ itest-build:
     {{vm_go}} test -c -o vm/it.test ./test/integration
 
 # Run the integration suite (boots both dev VMs first); args pass through (`just itest -test.run X`).
-itest *args: itest-build vm-up
+itest *args: itest-build up
     #!/usr/bin/env bash
     nix/ssh-vm.sh host dev <<'EOF'
     sudo /mnt/turnip/vm/it.test \
@@ -58,5 +62,5 @@ itest *args: itest-build vm-up
         -turnip /mnt/turnip/vm/turnip \
         -world dev@world \
         -ssh-key /etc/turnip/ssh-key \
-        -image /etc/turnip/probe-image.tar.gz {{args}}
+        -image localhost/turnip-probe:latest {{args}}
     EOF

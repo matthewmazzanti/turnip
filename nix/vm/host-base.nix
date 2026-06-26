@@ -2,9 +2,16 @@
 # that can run turnip" plus its LAN edge. Rootless podman owned by `homelab` (loginnable), the
 # nft/ip toolkit turnip drives, the baked /etc/turnip/ssh-key, and the modeled LAN -- eth1 enslaved
 # to a bridge (br-lan) carrying 192.168.1.1, mirroring the runNixOSTest VLAN (host .1 / world .2) so
-# the hermetic check and the dev VM run identical network config. The interactive host grows from
-# this base via ./interactive.nix (9p, mgmt NIC, dev user) + a few carve-outs (go, the test image).
+# the hermetic check and the dev VM run identical network config. It also pre-loads the probe image
+# (below). The interactive host grows from this base via ./interactive.nix (9p, mgmt NIC, dev user)
+# + the go toolchain.
 { pkgs, lib, ... }:
+let
+  # The python netns-probe OCI image (python3 + netns/diagnostic CLIs), loaded into homelab's
+  # rootless store at boot (below). Referenced by TAG, so the per-node store path doesn't matter --
+  # TestPodmanRun runs `localhost/turnip-probe:latest`, never a tar.
+  probeImage = import ./probe-image.nix { inherit pkgs; };
+in
 {
   system.stateVersion = "25.05";
 
@@ -42,6 +49,29 @@
   environment.etc."turnip/ssh-key" = {
     source = ./testvm_key;
     mode = "0600";
+  };
+
+  # Pre-load the probe image into homelab's rootless store at boot, so it's a ready NAMED image for
+  # the operator-path test (`podman run` the name -- you can't `podman run` a tar). Loaded at boot,
+  # where homelab's user session is up, rather than from the test's sudo/ssh context. The test
+  # (TestPodmanRun) assumes it's loaded and runs the tag passed as -image (TURNIP_TEST_IMAGE).
+  environment.sessionVariables.TURNIP_TEST_IMAGE = "localhost/${probeImage.imageName}:${probeImage.imageTag}";
+  systemd.services.turnip-test-image = {
+    description = "load the python probe OCI image into homelab's rootless podman";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "user@1001.service" ];
+    wants = [ "user@1001.service" ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+    script = ''
+      until test -d /run/user/1001; do sleep 0.2; done
+      export PATH=/run/wrappers/bin:/run/current-system/sw/bin
+      runuser -u homelab -- \
+        env XDG_RUNTIME_DIR=/run/user/1001 HOME=/home/homelab PATH="$PATH" \
+          podman load -i ${probeImage}
+    '';
   };
 
   # The LAN edge. eth1 (the qemu mcast NIC in the dev VM / the runNixOSTest VLAN NIC in the check)

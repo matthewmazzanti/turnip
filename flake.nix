@@ -52,9 +52,8 @@
 
           # Every VM this repo builds (nix/vm/), grouped by usecase: vms.interactive.{host,world}
           # are the built dev VMs; vms.test.{host,world} are the hermetic-check role configs fed to
-          # runNixOSTest below; vms.probeImage is the shared netns-probe OCI image (TestPodmanRun's
-          # -image payload, also baked into the dev host). mkVM lives in nix/vm/default.nix, hence
-          # lib/nixpkgs/system are threaded in.
+          # runNixOSTest below. (The probe image TestPodmanRun runs is built + boot-loaded by
+          # host-base.) mkVM lives in nix/vm/default.nix, hence lib/nixpkgs/system are threaded in.
           vms = import ./nix/vm { inherit pkgs turnip lib nixpkgs system; };
         in
         {
@@ -87,6 +86,9 @@
               host.wait_until_succeeds(
                   "su homelab -c 'XDG_RUNTIME_DIR=/run/user/1001 podman info >/dev/null'",
                   timeout=120)
+              # the probe image is loaded into homelab's store at boot (host-base); TestPodmanRun
+              # assumes it's present and runs the tag, so wait for that oneshot to finish.
+              host.wait_for_unit("turnip-test-image.service")
 
               # host -> world SSH via the baked-in key (base-vm: /etc/turnip/ssh-key; world
               # authorizes its pubkey) -- no manual key staging.
@@ -99,7 +101,7 @@
               print(host.succeed(
                   "${turnipTest}/bin/turnip-integration.test -test.v -test.parallel 8"
                   " -turnip ${turnip}/bin/turnip"
-                  " -image /etc/turnip/probe-image.tar.gz"  # the OCI archive TestPodmanRun loads + runs
+                  " -image localhost/turnip-probe:latest"  # the tag the boot service pre-loaded
                   " -world root@world -ssh-key /etc/turnip/ssh-key 2>&1"))
             '';
           };

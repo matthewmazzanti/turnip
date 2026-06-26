@@ -31,7 +31,7 @@ var (
 	turnipBin = flag.String("turnip", "turnip", "path to the turnip binary")
 	worldAddr = flag.String("world", "", "ssh target for the world peer (user@host); empty => world tests skip")
 	sshKey    = flag.String("ssh-key", "", "ssh identity file for the world target")
-	imageArch = flag.String("image", "", "OCI image archive (podman-loadable) for the real `podman run` test; empty => TestPodmanRun skips")
+	imageRef  = flag.String("image", "", "ref/tag of the pre-loaded probe image for the real `podman run` test; empty => TestPodmanRun skips")
 )
 
 // The fixture configs are embedded into the test binary (`go test -c`), so the harness is
@@ -181,25 +181,6 @@ func (h *H) ownerPodman(args ...string) (string, int, error) {
 		"podman",
 	}, args...)
 	return h.host.Run(argv...)
-}
-
-// loadImage `podman load`s the nix-built OCI archive (-image) into the owner's store and returns
-// the loaded ref, parsed from the "Loaded image: <ref>" line. Idempotent across tests (a re-load
-// is a no-op), so the caller needn't guard it.
-func (h *H) loadImage(t *testing.T) string {
-	t.Helper()
-	out, code, err := h.ownerPodman("load", "-i", *imageArch)
-	if err != nil || code != 0 {
-		t.Fatalf("podman load %s: code=%d err=%v\n%s", *imageArch, code, err, out)
-	}
-	for _, line := range strings.Split(out, "\n") {
-		if strings.Contains(line, "Loaded image") {
-			f := strings.Fields(line)
-			return f[len(f)-1]
-		}
-	}
-	t.Fatalf("podman load: no 'Loaded image' line in:\n%s", out)
-	return ""
 }
 
 // runAttached does the full documented operator attach as the owner: `podman run --rm --network
@@ -636,17 +617,19 @@ func TestL1Gateway(t *testing.T) {
 // nsenter) shortcut the rest of the harness uses. It proves the pinned netns is attachable by a
 // fresh container, the generated hosts file mounts so the container resolves its flow peer by
 // NAME, and the flow matrix governs that container exactly as it governs the probe. Reuses L1's
-// single allowed flow (zwave->hass:8080). Skips when -image is unset (the python3 OCI archive
-// built by the flake's probeImage).
+// single allowed flow (zwave->hass:8080). Skips when -image is unset; -image is the tag of the
+// probe image the host pre-loads at boot (the turnip-test-image service).
 func TestPodmanRun(t *testing.T) {
-	if *imageArch == "" {
+	if *imageRef == "" {
 		t.Skip("no -image configured")
 	}
 	h := newH()
 	h.up(t, "l1.json")
 	t.Cleanup(func() { h.down(t) })
 
-	ref := h.loadImage(t)
+	// -image is the tag of an already-loaded image (the host loads it at boot; you can't `podman
+	// run` a tar). We assume it's present and run it directly.
+	ref := *imageRef
 	zwaveNS := stateDir + "/containers/zwave/netns"
 	zwaveHosts := stateDir + "/containers/zwave/hosts"
 

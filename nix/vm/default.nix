@@ -1,20 +1,22 @@
-# nix/vm/default.nix -- every VM this repo builds, grouped by usecase. Two usecases, two roles each.
-# Each role has ONE base (host-base / world-base) shared by both its usecases; the interactive
-# variant grows from that same base plus ./interactive.nix (the dev carve-outs: 9p, mgmt NIC, dev
-# user, qemu sizing) and a couple of role-specific extras.
+# nix/vm/default.nix -- every VM this repo builds, grouped by usecase. Two
+# usecases, two roles each. Each role has ONE base (host-base / world-base)
+# shared by both its usecases; the interactive variant grows from that same base
+# plus ./interactive.nix (the dev carve-outs: 9p, mgmt NIC, dev user, qemu
+# sizing) and a couple of role-specific extras.
 #
 #   test.host        = host-base  + { turnip }
 #   test.world       = world-base
-#   interactive.host = host-base  + interactive + { go, :2222, test image }
+#   interactive.host = host-base  + interactive + { go, :2222 }
 #   interactive.world= world-base + interactive + { :2223, dev tooling }
 #
 # The bases mirror the runNixOSTest LAN (host 192.168.1.1 / world 192.168.1.2), so the hermetic
-# check and the dev VMs run identical network config. mkVM wraps an interactive role module with the
-# qemu-vm machinery into a runnable image; the test roles are fed to runNixOSTest, which supplies its
-# own VM machinery. The roles close over the turnip package + pkgs from this scope.
+# check and the dev VMs run identical network config; host-base also pre-loads the probe image (so
+# both host nodes have it). mkVM wraps an interactive role module with the qemu-vm machinery into a
+# runnable image; the test roles are fed to runNixOSTest, which supplies its own VM machinery. The
+# roles close over the turnip package + pkgs from this scope.
 #
 #   import ./nix/vm { inherit pkgs turnip lib nixpkgs system; }
-#     -> { probeImage; interactive = { host; world; }; test = { host; world; }; }
+#     -> { interactive = { host; world; }; test = { host; world; }; }
 { pkgs, turnip, lib, nixpkgs, system }:
 let
   # Wrap an inline role module with the qemu-vm machinery into a runnable image
@@ -23,26 +25,16 @@ let
     inherit system;
     modules = [ "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix" roleModule ];
   }).config.system.build.vm;
-
-  # The python netns-probe OCI image, built once (here, with the flake pkgs -- one store path) and
-  # shared by both host usecases. `probeImageEtc` bakes the archive at a stable path on every host
-  # node, so the check and the dev itest pass the identical `-image /etc/turnip/probe-image.tar.gz`
-  # to the on-demand loader (TestPodmanRun). Built in default.nix, not host-base, so it stays one
-  # store path: a plain module only sees its own node's pkgs, which would re-fragment the image.
-  probeImage = import ./probe-image.nix { inherit pkgs; };
-  probeImageEtc = { environment.etc."turnip/probe-image.tar.gz".source = probeImage; };
 in
 {
-  inherit probeImage;
-
   interactive = lib.mapAttrs (_: mkVM) {
     # The interactive HOST dev VM: the system under test. host-base brings rootless podman, the host
-    # toolkit, and the modeled LAN (br-lan / 192.168.1.1); interactive.nix brings the dev substrate.
-    # On top: Go (build turnip from the 9p mount); the probe image comes from probeImageEtc.
+    # toolkit, the modeled LAN (br-lan / 192.168.1.1), and the boot-loaded probe image; interactive.nix
+    # brings the dev substrate. On top: just Go (build turnip from the 9p mount).
     #   just host  (boots qemu; persists vm/host.qcow2; serial console, Ctrl-a x to quit)
     #   nix/ssh-vm.sh [dev|homelab] [cmd]   (host on :2222)
     host = { pkgs, ... }: {
-        imports = [ ./host-base.nix ./interactive.nix probeImageEtc ];
+        imports = [ ./host-base.nix ./interactive.nix ];
 
         networking.hostName = "turnip";
 
@@ -56,9 +48,10 @@ in
         ];
       };
 
-    # The interactive WORLD dev VM: the external LAN peer for egress/ingress/veth-link exploration.
-    # world-base brings peer-echo, sshd, socat, and the static LAN (192.168.1.2); interactive.nix
-    # brings the dev substrate. On top: the netns/diagnostic CLIs for poking the LAN.
+    # The interactive WORLD dev VM: the external LAN peer for
+    # egress/ingress/veth-link exploration. world-base brings peer-echo, sshd,
+    # socat, and the static LAN (192.168.1.2); interactive.nix brings the dev
+    # substrate. On top: the netns/diagnostic CLIs for poking the LAN.
     #   just world  (boots qemu; persists vm/world.qcow2; serial console)
     #   nix/ssh-vm.sh world [dev] [cmd]   (world on :2223)
     world = { pkgs, ... }: {
@@ -76,16 +69,18 @@ in
     };
   };
 
-  # The hermetic-check role configs (checks.integration nodes) -- each just its role base.
+  # The hermetic-check role configs (checks.integration nodes) -- each just its
+  # role base.
   test = {
     # The system under test: host-base (rootless podman + the probe/inspection toolkit + the modeled
-    # LAN) + the probe image at /etc + the turnip binary under test.
+    # LAN + the boot-loaded probe image) + the turnip binary under test.
     host = {
-      imports = [ ./host-base.nix probeImageEtc ];
+      imports = [ ./host-base.nix ];
       environment.systemPackages = [ turnip ];
     };
 
-    # The external peer: world-base (peer-echo + sshd + socat + the static LAN). No extras.
+    # The external peer: world-base (peer-echo + sshd + socat + the static LAN).
+    # No extras.
     world = {
       imports = [ ./world-base.nix ];
     };
