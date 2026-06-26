@@ -7,10 +7,10 @@
 #                               file (the lowest layer; bakes --config + the runtime deps).
 #   2. turnipWithConfig      -- wrap turnip around a Nix ATTRSET: builtins.toJSON -> a
 #                               generated turnip.json -> layer 1.
-#   3. turnipService         -- a `systemd.services.<name>` FRAGMENT that runs `up` on start
-#                               and `down` on stop. Resolves its binary from a passed-in
-#                               `package` (e.g. a layer 1/2 wrapper, or any bin) OR builds one
-#                               from `config`/`configFile`.
+#   3. turnipService         -- build the up/down service UNIT (the value for
+#                               `systemd.services.<name>`) from a turnip package + a model attrset +
+#                               a podman package. Returns just the unit; the caller adds the
+#                               deployment-specific user-session ordering.
 #
 # What gets baked, and why (see the binaries turnip actually execs):
 #   - nft     -- turnip forks `nft -j -f -` (internal/nftlib). It has a NixOS fallback search,
@@ -63,55 +63,41 @@ rec {
       configFile = pkgs.writeText "${name}.json" (builtins.toJSON config);
     };
 
-  # Layer 3: a systemd-service fragment driving up/down. Give it a prebuilt `package` (a layer 1/2
-  # wrapper or any bin exposing `<name> up|down`), or a `config` attrset / `configFile` to build one.
+  # Layer 3: build the turnip up/down SERVICE UNIT -- the value for `systemd.services.<name>` -- from
+  # a turnip package, a model (a Nix attrset, toJSON'd via layer 2), and a podman package (so the
+  # rootless newuidmap/newgidmap wrappers line up). nft is on the unit's PATH (turnip forks it) and
+  # defaults to pkgs.nftables.
   #
-  # turnip is rootful AND must run after the rootless-podman owner's user session exists (the netns
-  # are created inside that user's podman userns). `requiresUserSession = <uid>` wires that real
-  # ordering: after user@<uid>.service + an ExecStartPre that waits for /run/user/<uid>.
+  # Returns JUST the unit. It sets the ordering any turnip deployment wants (network.target,
+  # podman.service) but NOT the rootless owner's `user@<uid>.service` -- this generic function can't
+  # know the uid -- so the caller merges that in (the netns are created inside that user's podman
+  # userns). E.g.:
+  #
+  #   systemd.services.turnip = lib.mkMerge [
+  #     (turnipLib.turnipService { turnip = pkg; podman = config.virtualisation.podman.package;
+  #                                config = { runtime.user = "homelab"; /* ... */ }; })
+  #     { after = [ "user@1001.service" ]; wants = [ "user@1001.service" ]; }
+  #   ];
   turnipService =
-    { package ? null
-    , config ? null
-    , configFile ? null
-    , name ? "turnip"
+    { config
     , turnip ? defaultTurnip
-    , nft ? pkgs.nftables
     , podman ? pkgs.podman
-    , requiresUserSession ? null # uid of the rootless-podman owner, or null
-    , after ? [ ]
-    , wants ? [ ]
-    , path ? [ ]
-    , extraServiceConfig ? { }
+    , nft ? pkgs.nftables
     }:
     let
-      bin =
-        if package != null then package
-        else if config != null then turnipWithConfig { inherit config name turnip nft podman; }
-        else if configFile != null then turnipWithConfigFile { inherit configFile name turnip nft podman; }
-        else throw "turnipService: pass one of `package`, `config`, or `configFile`";
-
-      userUnit = "user@${toString requiresUserSession}.service";
-      sessionOrdering = requiresUserSession != null;
+      bin = turnipWithConfig { inherit config turnip nft podman; };
+      exe = pkgs.lib.getExe bin;
     in
     {
-      systemd.services.${name} = {
-        description = "turnip routed container network (${name})";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "network.target" "podman.service" ]
-          ++ pkgs.lib.optional sessionOrdering userUnit
-          ++ after;
-        wants = pkgs.lib.optional sessionOrdering userUnit ++ wants;
-        path = [ nft podman ] ++ path;
-        serviceConfig = {
-          Type = "oneshot";
-          RemainAfterExit = true;
-          # Wait for the owner's user session (XDG_RUNTIME_DIR) so `podman unshare` has a userns to
-          # enter -- the same gate the integration harness uses before `turnip up`.
-          ExecStartPre = pkgs.lib.optional sessionOrdering
-            "${pkgs.bash}/bin/bash -c 'until test -d /run/user/${toString requiresUserSession}; do sleep 0.2; done'";
-          ExecStart = "${bin}/bin/${name} up";
-          ExecStop = "${bin}/bin/${name} down";
-        } // extraServiceConfig;
+      description = "turnip routed container network";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network.target" "podman.service" ];
+      path = [ nft podman ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${exe} up";
+        ExecStop = "${exe} down";
       };
     };
 }
