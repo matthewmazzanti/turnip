@@ -24,8 +24,6 @@
 let
   uid = 1001;
   owner = "homelab";
-  stateDir = "/run/user/${toString uid}/turnip";
-  netnsOf = name: "ns:${stateDir}/containers/${name}/netns";
 
   # --- base: the uninteresting substrate, inline so the file stays self-contained --------------
   #
@@ -79,66 +77,6 @@ let
     '';
   };
 
-  # A standard OCI image, pulled straight from a registry -- no nix-built image, no boot-time `podman
-  # load`. podman pulls it on first container start (so the VM needs egress -- see br0 below) and caches
-  # it in homelab's store. netshoot is the swiss-army netadmin image: it ships python3 (for the server
-  # below) plus curl/ip (what the tour execs into the containers); musl reads /etc/hosts, so the
-  # bind-mounted peer names still resolve.
-  image = "docker.io/nicolaka/netshoot:latest";
-
-  # The HTTP server each container runs: answer every request with "hello from <name>". A single
-  # python expression (the type()/lambda trick keeps it one -c arg); single-quoted + chr(10) so it
-  # needs no shell escaping through quadlet's Exec=. Container root holds CAP_NET_BIND_SERVICE => :443.
-  helloServer = name:
-    "import http.server as h; n='${name}'; "
-    + "H=type('H',(h.BaseHTTPRequestHandler,),{'do_GET':lambda s:("
-    + "s.send_response(200),s.end_headers(),s.wfile.write(('hello from '+n+chr(10)).encode()))}); "
-    + "h.HTTPServer(('0.0.0.0',443),H).serve_forever()";
-
-  # The turnip MODEL, authored as Nix (turnipWithConfig toJSON's it in the service below). A single
-  # routed network `lan`. Every container needs default=true so it can reach a peer's /32 via the
-  # gateway (a /32 fabric has no on-link peers -- traffic to a sibling goes up to the router). hass
-  # owns its default on eth0 (so it reaches zwave over the fabric); its br0 link is a second,
-  # NON-default interface (the LAN is reached by the link's connected /24, no default needed).
-  turnipConfig = {
-    runtime.user = owner;
-    containers = {
-      zwave = { };
-      hass.links = [
-        # The L2 escape: a veth from hass's netns into the VM bridge br0, giving hass a real LAN IP.
-        # Outside every router's nft policy -- a deliberate trust grant (see docs/CONFIG-SKETCH.md).
-        { type = "veth"; bridge = "br0"; name = "eth2"; address = "192.168.1.50/24"; }
-      ];
-      proxy = { };
-    };
-    networks.lan = {
-      gateway = "10.0.0.1";
-      gateway_if = "fabric0";
-      attach = {
-        zwave = { ip = "10.0.0.11"; interface = "eth0"; default = true; };
-        hass = { ip = "10.0.0.12"; interface = "eth0"; default = true; };
-        proxy = { ip = "10.0.0.13"; interface = "eth0"; default = true; };
-      };
-      # The real homelab policy. proxy (the ingress reverse-proxy) reaches the hub and the device
-      # controller; the hub reaches the device controller; the device controller (zwave) initiates
-      # NOTHING -- a compromised IoT device is contained. Directional: each row is one-way (the return
-      # rides conntrack), so e.g. zwave->hass is NOT implied by hass->zwave.
-      flows = [
-        { type = "internal"; from = "proxy"; to = "hass"; proto = "tcp"; port = 443; }
-        { type = "internal"; from = "proxy"; to = "zwave"; proto = "tcp"; port = 443; }
-        { type = "internal"; from = "hass"; to = "zwave"; proto = "tcp"; port = 443; }
-        # NOTE: nothing flows TO proxy and zwave initiates nothing -- default-deny drops the rest.
-      ];
-    };
-  };
-
-  # The guided tour: the script body lives in ./tour.sh (an independent, shellcheck-clean file). It
-  # runs as homelab and pokes the live containers with plain `podman exec` (no turnip CLI involved).
-  turnipDemo = pkgs.writeShellApplication {
-    name = "turnip-demo";
-    runtimeInputs = [ config.virtualisation.podman.package pkgs.coreutils ];
-    text = builtins.readFile ./tour.sh;
-  };
 in
 {
   imports = [ base ];
@@ -182,10 +120,45 @@ in
   # exists -- user-runtime-dir@1001 is ordered before user@1001).
   systemd.services.turnip =
     let
+      # The turnip MODEL, authored as Nix (turnipWithConfig toJSON's it in the service below). A single
+      # routed network `lan`. Every container needs default=true so it can reach a peer's /32 via the
+      # gateway (a /32 fabric has no on-link peers -- traffic to a sibling goes up to the router). hass
+      # owns its default on eth0 (so it reaches zwave over the fabric); its br0 link is a second,
+      # NON-default interface (the LAN is reached by the link's connected /24, no default needed).
       turnipBin = turnipLib.turnipWithConfig {
-        config = turnipConfig;
         turnip = turnipPkg;
         podman = config.virtualisation.podman.package;
+        config = {
+          runtime.user = owner;
+          containers = {
+            zwave = { };
+            hass.links = [
+              # The L2 escape: a veth from hass's netns into the VM bridge br0, giving hass a real LAN IP.
+              # Outside every router's nft policy -- a deliberate trust grant (see docs/CONFIG-SKETCH.md).
+              { type = "veth"; bridge = "br0"; name = "eth2"; address = "192.168.1.50/24"; }
+            ];
+            proxy = { };
+          };
+          networks.lan = {
+            gateway = "10.0.0.1";
+            gateway_if = "fabric0";
+            attach = {
+              zwave = { ip = "10.0.0.11"; interface = "eth0"; default = true; };
+              hass = { ip = "10.0.0.12"; interface = "eth0"; default = true; };
+              proxy = { ip = "10.0.0.13"; interface = "eth0"; default = true; };
+            };
+            # The real homelab policy. proxy (the ingress reverse-proxy) reaches the hub and the device
+            # controller; the hub reaches the device controller; the device controller (zwave) initiates
+            # NOTHING -- a compromised IoT device is contained. Directional: each row is one-way (the return
+            # rides conntrack), so e.g. zwave->hass is NOT implied by hass->zwave.
+            flows = [
+              { type = "internal"; from = "proxy"; to = "hass"; proto = "tcp"; port = 443; }
+              { type = "internal"; from = "proxy"; to = "zwave"; proto = "tcp"; port = 443; }
+              { type = "internal"; from = "hass"; to = "zwave"; proto = "tcp"; port = 443; }
+              # NOTE: nothing flows TO proxy and zwave initiates nothing -- default-deny drops the rest.
+            ];
+          };
+        };
       };
       exe = lib.getExe turnipBin;
     in
@@ -204,11 +177,20 @@ in
     };
 
   # --- quadlet-nix: the three containers, each attached to its turnip netns --------------------
-  # Spelled out per container (rather than a helper) to keep the quadlet-nix surface visible. They're
-  # identical bar the name: each runs the hello server, mounts turnip's generated /etc/hosts, runs
-  # rootless as homelab (rootlessConfig.uid), and orders after turnip `up` (the netns + hosts file
-  # must exist first). The flow matrix -- not the containers -- decides who can actually reach whom.
-  virtualisation.quadlet.containers = {
+  # Spelled out per container (rather than a helper) to keep the quadlet-nix
+  # surface visible. They're identical bar the name: each runs the hello server,
+  # mounts turnip's generated /etc/hosts, runs rootless as homelab
+  # (rootlessConfig.uid), and orders after turnip `up` (the netns + hosts file
+  # must exist first). The flow matrix -- not the containers -- decides who can
+  # actually reach whom.
+  virtualisation.quadlet.containers = let
+    stateDir = "/run/user/${toString uid}/turnip";
+    netnsOf = name: "ns:${stateDir}/containers/${name}/netns";
+    image = "docker.io/nicolaka/netshoot:latest";
+    # The hello server (./server.py), bind-mounted in and run as `python3 /srv/server.py <name>` --
+    # so the name is argv[1], with no Nix templating into the source and no -c escaping.
+    serverMount = "${./server.py}:/srv/server.py:ro";
+  in {
     zwave = {
       autoStart = true;
       rootlessConfig.uid = uid;
@@ -216,8 +198,8 @@ in
         inherit image;
         pull = "missing";
         networks = [ (netnsOf "zwave") ];
-        volumes = [ "${stateDir}/containers/zwave/hosts:/etc/hosts:ro" ];
-        exec = [ "python3" "-c" (helloServer "zwave") ];
+        volumes = [ "${stateDir}/containers/zwave/hosts:/etc/hosts:ro" serverMount ];
+        exec = [ "python3" "/srv/server.py" "zwave" ];
       };
       unitConfig = {
         After = [ "turnip.service" ];
@@ -232,8 +214,8 @@ in
         inherit image;
         pull = "missing";
         networks = [ (netnsOf "hass") ];
-        volumes = [ "${stateDir}/containers/hass/hosts:/etc/hosts:ro" ];
-        exec = [ "python3" "-c" (helloServer "hass") ];
+        volumes = [ "${stateDir}/containers/hass/hosts:/etc/hosts:ro" serverMount ];
+        exec = [ "python3" "/srv/server.py" "hass" ];
       };
       unitConfig = {
         After = [ "turnip.service" ];
@@ -248,8 +230,8 @@ in
         inherit image;
         pull = "missing";
         networks = [ (netnsOf "proxy") ];
-        volumes = [ "${stateDir}/containers/proxy/hosts:/etc/hosts:ro" ];
-        exec = [ "python3" "-c" (helloServer "proxy") ];
+        volumes = [ "${stateDir}/containers/proxy/hosts:/etc/hosts:ro" serverMount ];
+        exec = [ "python3" "/srv/server.py" "proxy" ];
       };
       unitConfig = {
         After = [ "turnip.service" ];
@@ -259,5 +241,14 @@ in
   };
 
   # The guided tour, on PATH (run as homelab). No turnip CLI is installed.
-  environment.systemPackages = [ turnipDemo ];
+  environment.systemPackages = let
+    # The guided tour: the script body lives in ./tour.sh (an independent,
+    # shellcheck-clean file). It runs as homelab and pokes the live containers
+    # with plain `podman exec` (no turnip CLI involved).
+    turnipDemo = pkgs.writeShellApplication {
+      name = "turnip-demo";
+      runtimeInputs = [ config.virtualisation.podman.package pkgs.coreutils ];
+      text = builtins.readFile ./tour.sh;
+    };
+  in [ turnipDemo ];
 }
