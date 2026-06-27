@@ -9,8 +9,8 @@
 #                               generated turnip.json -> layer 1.
 #   3. turnipService         -- build the up/down service UNIT (the value for
 #                               `systemd.services.<name>`) from a turnip package + a model attrset +
-#                               a podman package. Returns just the unit; the caller adds the
-#                               deployment-specific user-session ordering.
+#                               a podman package + the owner's uid. Returns just the unit, including
+#                               the ordering after the owner's /run/user/<uid> tmpfs.
 #
 # What gets baked, and why (see the binaries turnip actually execs):
 #   - nft     -- turnip forks `nft -j -f -` (internal/nftlib). It has a NixOS fallback search,
@@ -64,22 +64,22 @@ rec {
     };
 
   # Layer 3: build the turnip up/down SERVICE UNIT -- the value for `systemd.services.<name>` -- from
-  # a turnip package, a model (a Nix attrset, toJSON'd via layer 2), and a podman package (so the
-  # rootless newuidmap/newgidmap wrappers line up). nft is on the unit's PATH (turnip forks it) and
-  # defaults to pkgs.nftables.
+  # a turnip package, a model (a Nix attrset, toJSON'd via layer 2), a podman package (so the rootless
+  # newuidmap/newgidmap wrappers line up), and the rootless owner's `uid`. nft is on the unit's PATH
+  # (turnip forks it) and defaults to pkgs.nftables.
   #
-  # Returns JUST the unit. It sets the ordering any turnip deployment wants (network.target,
-  # podman.service) but NOT the rootless owner's `user@<uid>.service` -- this generic function can't
-  # know the uid -- so the caller merges that in (the netns are created inside that user's podman
-  # userns). E.g.:
+  # The `uid` is a hard requirement: turnip pins its netns + state under /run/user/<uid> and podman
+  # uses it as XDG_RUNTIME_DIR, and that path is logind's per-user tmpfs (`user-runtime-dir@<uid>`).
+  # If turnip ran before that tmpfs is mounted it would either miss the dir or get its writes shadowed
+  # by the later mount -- so the unit orders after it. Returns just the unit:
   #
-  #   systemd.services.turnip = lib.mkMerge [
-  #     (turnipLib.turnipService { turnip = pkg; podman = config.virtualisation.podman.package;
-  #                                config = { runtime.user = "homelab"; /* ... */ }; })
-  #     { after = [ "user@1001.service" ]; wants = [ "user@1001.service" ]; }
-  #   ];
+  #   systemd.services.turnip = turnipLib.turnipService {
+  #     turnip = pkg; podman = config.virtualisation.podman.package; uid = 1001;
+  #     config = { runtime.user = "homelab"; /* ... */ };
+  #   };
   turnipService =
     { config
+    , uid
     , turnip ? defaultTurnip
     , podman ? pkgs.podman
     , nft ? pkgs.nftables
@@ -87,11 +87,17 @@ rec {
     let
       bin = turnipWithConfig { inherit config turnip nft podman; };
       exe = pkgs.lib.getExe bin;
+      # The owner's user session. We really only need the /run/user/<uid> tmpfs, created by
+      # `user-runtime-dir@<uid>.service`; `user@<uid>.service` is `After` it, so this covers it (and is
+      # the variant that's been VM-tested). Drop to `user-runtime-dir@<uid>.service` to depend on
+      # strictly the dir.
+      userSession = "user@${toString uid}.service";
     in
     {
       description = "turnip routed container network";
       wantedBy = [ "multi-user.target" ];
-      after = [ "network.target" "podman.service" ];
+      after = [ "network.target" "podman.service" userSession ];
+      wants = [ userSession ];
       path = [ nft podman ];
       serviceConfig = {
         Type = "oneshot";
