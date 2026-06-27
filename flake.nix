@@ -40,7 +40,7 @@
           # The compiled integration test binary (`go test -c`): the harness driver run on the
           # host node by checks.integration. Reuses turnip's src + vendoring; the test package is
           # stdlib-only, so no new module deps (vendorHash unchanged).
-          turnipTest = turnip.overrideAttrs (_: {
+          turnipTest = turnip.overrideAttrs (old: {
             pname = "turnip-integration-test";
             doCheck = false;
             buildPhase = ''
@@ -53,6 +53,8 @@
               install -Dm755 turnip-integration.test $out/bin/turnip-integration.test
               runHook postInstall
             '';
+            # so `lib.getExe turnipTest` resolves to the test binary, not the inherited `turnip`.
+            meta = old.meta // { mainProgram = "turnip-integration.test"; };
           });
 
           # Every VM this repo builds (nix/vm/), grouped by usecase: vms.interactive.{host,world}
@@ -132,8 +134,8 @@
               # -test.parallel overrides the GOMAXPROCS default so the timeout-bound flow subtests
               # actually overlap (the work is subprocess-wait-bound, so a few vCPUs suffice).
               print(host.succeed(
-                  "${turnipTest}/bin/turnip-integration.test -test.v -test.parallel 8"
-                  " -turnip ${turnip}/bin/turnip"
+                  "${lib.getExe turnipTest} -test.v -test.parallel 8"
+                  " -turnip ${lib.getExe turnip}"
                   " -image localhost/turnip-probe:latest"  # the tag the boot service pre-loaded
                   " -world root@world -ssh-key /etc/turnip/ssh-key 2>&1"))
             '';
